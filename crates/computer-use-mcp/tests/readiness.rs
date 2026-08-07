@@ -7,17 +7,17 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use image::{ColorType, GenericImageView, ImageEncoder, ImageFormat, codecs::png::PngEncoder};
-use open_computer_use::{
+use computer_use_mcp::{
     contract::TOOL_NAMES,
     errors::{RuntimeError, ToolOutcome},
     runtime::{DesktopRuntime, ToolOutput},
-    server::OpenComputerUseServer,
+    server::ComputerUseMcpServer,
     validation::{
         ApplicationScope, ElementAction, KeyboardAction, KeyboardFocus, ObservationView,
         PointerAction, ToolCall,
     },
 };
+use image::{ColorType, GenericImageView, ImageEncoder, ImageFormat, codecs::png::PngEncoder};
 use rmcp::{
     RoleClient, ServiceExt,
     model::{ClientJsonRpcMessage, ServerJsonRpcMessage},
@@ -114,7 +114,7 @@ async fn mcp_agent_path_dispatches_every_tool_and_preserves_error_boundaries() {
     let server_runtime = runtime.clone();
     let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
     let server = tokio::spawn(async move {
-        let service = OpenComputerUseServer::<FakeRuntime>::new(Arc::new(server_runtime.clone()))
+        let service = ComputerUseMcpServer::<FakeRuntime>::new(Arc::new(server_runtime.clone()))
             .serve(server_transport)
             .await
             .expect("initialize server");
@@ -142,7 +142,7 @@ async fn mcp_agent_path_dispatches_every_tool_and_preserves_error_boundaries() {
     assert_eq!(initialized["id"], 1);
     assert_eq!(
         initialized["result"]["serverInfo"]["name"],
-        "open-computer-use"
+        "computer-use-mcp"
     );
     client
         .send(message(json!({
@@ -238,18 +238,46 @@ async fn mcp_agent_path_dispatches_every_tool_and_preserves_error_boundaries() {
     );
     assert_eq!(runtime.calls(), expected_tool_calls());
 
-    runtime.fail_next();
     client
         .send(message(json!({
             "jsonrpc": "2.0",
             "id": 32,
+            "method": "tools/call",
+            "params": {
+                "name": "keyboard",
+                "arguments": {
+                    "state_id": "s-0123456789abcdef",
+                    "focus": {"x": 1, "y": 2},
+                    "action": {"type": "press", "key": "Alt+Tab"},
+                },
+            },
+        })))
+        .await
+        .expect("send unsupported action");
+    let unsupported = response_value(client.receive().await.expect("unsupported action response"));
+    assert_eq!(unsupported["id"], 32);
+    let result = &unsupported["result"];
+    assert_eq!(result["isError"], true);
+    assert_eq!(result["structuredContent"]["code"], "unsupported_action");
+    assert_eq!(result["structuredContent"]["outcome"], "not_started");
+    assert_eq!(result["structuredContent"]["retryable"], false);
+    let recovery = result["structuredContent"]["recovery"].as_str().unwrap();
+    assert!(recovery.contains("No input was dispatched"));
+    assert!(recovery.contains("launch_application"));
+    assert_eq!(runtime.calls(), expected_tool_calls());
+
+    runtime.fail_next();
+    client
+        .send(message(json!({
+            "jsonrpc": "2.0",
+            "id": 33,
             "method": "tools/call",
             "params": {"name": "list_applications", "arguments": {"scope": "running"}},
         })))
         .await
         .expect("send runtime failure call");
     let runtime_error = response_value(client.receive().await.expect("runtime error response"));
-    assert_eq!(runtime_error["id"], 32);
+    assert_eq!(runtime_error["id"], 33);
     assert_eq!(
         runtime_error["result"],
         json!({
@@ -312,7 +340,7 @@ async fn results_for_protocol(requested: &str, negotiated: &str) -> (Value, Valu
     let server_runtime = runtime.clone();
     let (server_transport, client_transport) = tokio::io::duplex(8 * 1024);
     let server = tokio::spawn(async move {
-        let service = OpenComputerUseServer::<FakeRuntime>::new(Arc::new(server_runtime.clone()))
+        let service = ComputerUseMcpServer::<FakeRuntime>::new(Arc::new(server_runtime.clone()))
             .serve(server_transport)
             .await
             .expect("initialize server");
@@ -433,7 +461,7 @@ fn valid_tool_calls() -> Vec<(&'static str, Value)> {
             json!({
                 "state_id": "s-0123456789abcdef",
                 "element_id": "007",
-                "action": {"type": "named", "name": " show menu "},
+                "action": {"type": "named", "name": "menu"},
             }),
         ),
         (
@@ -473,7 +501,7 @@ fn expected_tool_calls() -> Vec<ToolCall> {
         ToolCall::ActOnElement {
             state_id: "s-0123456789abcdef".to_owned(),
             element_id: "007".to_owned(),
-            action: ElementAction::Named("show menu".to_owned()),
+            action: ElementAction::Named("menu".to_owned()),
         },
         ToolCall::Pointer {
             state_id: "s-0123456789abcdef".to_owned(),

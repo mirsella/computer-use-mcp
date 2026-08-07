@@ -1,13 +1,13 @@
 use std::process::{Command, Output};
 
-use open_computer_use::VERSION;
+use computer_use_mcp::VERSION;
 
 #[test]
 fn cli_help_version_and_errors_are_truthful() {
     let help = run(&["help"]);
     assert!(help.status.success());
     let help_text = text(&help.stdout);
-    assert!(help_text.contains("Open Computer Use for Linux Wayland"));
+    assert!(help_text.contains("Computer Use MCP for Linux Wayland"));
     assert!(help_text.contains("list-apps"));
     assert!(help_text.contains("snapshot APP"));
     assert!(help_text.contains("init"));
@@ -28,10 +28,10 @@ fn cli_help_version_and_errors_are_truthful() {
 }
 
 fn run(arguments: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_open-computer-use"))
+    Command::new(env!("CARGO_BIN_EXE_computer-use-mcp"))
         .args(arguments)
         .output()
-        .expect("run open-computer-use")
+        .expect("run computer-use-mcp")
 }
 
 fn text(bytes: &[u8]) -> String {

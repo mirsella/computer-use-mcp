@@ -8,7 +8,7 @@ pub struct KeyChord {
 
 pub fn parse_chord(value: &str) -> Result<KeyChord, String> {
     let parts = value.split('+').map(str::trim).collect::<Vec<_>>();
-    if parts.is_empty() || parts.iter().any(|part| part.is_empty()) {
+    if parts.iter().any(|part| part.is_empty()) {
         return Err("key chord contains an empty key name".into());
     }
     let mut tokens = parts
@@ -17,7 +17,7 @@ pub fn parse_chord(value: &str) -> Result<KeyChord, String> {
         .collect::<Result<Vec<_>, _>>()?;
     let (key, key_is_modifier) = tokens
         .pop()
-        .ok_or_else(|| "key chord is empty".to_owned())?;
+        .expect("split always yields at least one nonempty token");
     if key_is_modifier {
         return Err("key chord must end with a non-modifier key".into());
     }
@@ -69,10 +69,10 @@ fn parse_token(value: &str) -> Result<(u32, bool), String> {
         "end" => ("End", false),
         "pageup" | "page_up" | "prior" => ("Page_Up", false),
         "pagedown" | "page_down" | "next" => ("Page_Down", false),
-        "left" => ("Left", false),
-        "right" => ("Right", false),
-        "up" => ("Up", false),
-        "down" => ("Down", false),
+        "left" | "arrowleft" => ("Left", false),
+        "right" | "arrowright" => ("Right", false),
+        "up" | "arrowup" => ("Up", false),
+        "down" | "arrowdown" => ("Down", false),
         "kp_0" | "kp0" => ("KP_0", false),
         "kp_1" | "kp1" => ("KP_1", false),
         "kp_2" | "kp2" => ("KP_2", false),
@@ -141,6 +141,13 @@ mod tests {
         assert_eq!(chord.key, xkb::Keysym::KP_0.raw());
         assert!(parse_chord("ctrl+wat").unwrap_err().contains("unknown"));
         assert_eq!(parse_chord("Ctrl+L").unwrap().key, xkb::Keysym::l.raw());
+        for direction in ["Left", "Right", "Up", "Down"] {
+            let alias = format!("Arrow{direction}");
+            assert_eq!(
+                parse_chord(&alias).unwrap(),
+                parse_chord(direction).unwrap()
+            );
+        }
         assert!(parse_chord("a+ctrl").is_err());
         for name in [
             "Return",

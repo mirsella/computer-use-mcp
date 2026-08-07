@@ -27,7 +27,7 @@ for another desktop from a successful headless CI build.
 If the host Cargo config injects nightly-only flags, use an isolated Cargo home:
 
 ```sh
-export CARGO_HOME=/tmp/opencode/open-computer-use-cargo-home
+export CARGO_HOME=/tmp/opencode/computer-use-mcp-cargo-home
 ```
 
 ## Required checks
@@ -63,10 +63,10 @@ post-snapshot frames, post-keyboard synchronization, and bounded shutdown.
 An ignored, non-mutating live discovery test is available:
 
 ```sh
-cargo test -p open-computer-use live_discovery_is_non_mutating -- --ignored
+cargo test -p computer-use-mcp live_discovery_is_non_mutating -- --ignored
 ```
 
-You can also run `open-computer-use list-apps` and an MCP `observe` call
+You can also run `computer-use-mcp list-apps` and an MCP `observe` call
 against a non-sensitive visible app. The portal chooser needs real user consent.
 Do not automate live click, typing, or any other generated input.
 

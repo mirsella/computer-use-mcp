@@ -1,16 +1,5 @@
 use std::fmt::{self, Display, Formatter};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValidationError(pub String);
-
-impl Display for ValidationError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for ValidationError {}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolOutcome {
     NotStarted,
@@ -38,6 +27,26 @@ pub struct RuntimeError {
 }
 
 impl RuntimeError {
+    pub(crate) fn invalid_arguments(message: impl Into<String>) -> Self {
+        Self::new(
+            "invalid_arguments",
+            message,
+            ToolOutcome::NotStarted,
+            true,
+            "Correct the arguments using the tool input schema, then retry.",
+        )
+    }
+
+    pub(crate) fn unsupported_desktop_focus_switch() -> Self {
+        Self::new(
+            "unsupported_action",
+            "desktop focus-switch shortcut Alt+Tab is not supported",
+            ToolOutcome::NotStarted,
+            false,
+            "No input was dispatched. Do not retry Alt+Tab or alternate spellings. Use an advertised semantic focus target or launch_application; otherwise stop.",
+        )
+    }
+
     pub fn new(
         code: &'static str,
         message: impl Into<String>,

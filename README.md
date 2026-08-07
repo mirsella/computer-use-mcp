@@ -1,6 +1,6 @@
-# Open Computer Use for Wayland
+# Computer Use MCP for Linux Wayland
 
-[![CI](https://github.com/mirsella/open-computer-use-wayland/actions/workflows/ci.yml/badge.svg)](https://github.com/mirsella/open-computer-use-wayland/actions/workflows/ci.yml)
+[![CI](https://github.com/mirsella/computer-use-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/mirsella/computer-use-mcp/actions/workflows/ci.yml)
 
 A local [Model Context Protocol](https://modelcontextprotocol.io/) server for
 computer use on Linux Wayland. It is built for KDE Plasma and OpenCode.
@@ -40,8 +40,8 @@ sudo apt-get install build-essential clang libclang-dev libdbus-1-dev \
 Build and install the binary from the repository:
 
 ```sh
-cargo install --locked --git https://github.com/mirsella/open-computer-use-wayland open-computer-use
-open-computer-use version
+cargo install --locked --git https://github.com/mirsella/computer-use-mcp computer-use-mcp
+computer-use-mcp version
 ```
 
 The package name is explicit because this repository is a virtual Cargo
@@ -50,14 +50,14 @@ workspace.
 ## OpenCode setup
 
 The transport is stdio only. Configure the MCP host to execute
-`open-computer-use mcp`; do not run it interactively or add wrappers that write
+`computer-use-mcp mcp`; do not run it interactively or add wrappers that write
 to stdout. The host owns stdin and stdout. Stdout contains one UTF-8 JSON-RPC
 message per line, while diagnostics go to stderr.
 
 You may request a reusable KDE portal grant before registration:
 
 ```sh
-open-computer-use init
+computer-use-mcp init
 ```
 
 This step is optional. It closes the temporary session and succeeds only if KDE
@@ -66,7 +66,7 @@ returns a reusable restore token.
 Register the binary with OpenCode:
 
 ```sh
-opencode mcp add computer_use -- "$(command -v open-computer-use)" mcp
+opencode mcp add computer_use -- "$(command -v computer-use-mcp)" mcp
 ```
 
 Edit the config path printed by that command. Keep the absolute executable
@@ -88,17 +88,17 @@ a new portal session.
 
 ## Direct commands
 
-Use `open-computer-use help` for all commands. Common diagnostics are:
+Use `computer-use-mcp help` for all commands. Common diagnostics are:
 
 ```sh
-open-computer-use doctor
-open-computer-use init
-open-computer-use list-apps
-open-computer-use snapshot APP
+computer-use-mcp doctor
+computer-use-mcp init
+computer-use-mcp list-apps
+computer-use-mcp snapshot APP
 ```
 
 `doctor`, `list-apps`, and `snapshot` do not open the portal chooser. The
-diagnostic `open-computer-use call FILE` batch interface is documented in
+diagnostic `computer-use-mcp call FILE` batch interface is documented in
 [MCP.md](MCP.md#direct-call-command); it is not an MCP transport.
 
 ## Security and support

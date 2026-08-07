@@ -62,7 +62,7 @@ impl Default for PortalConfig {
 impl PortalConfig {
     pub fn from_env() -> Self {
         Self::from_persistence_value(
-            std::env::var("OPEN_COMPUTER_USE_PERSIST_PORTAL")
+            std::env::var("COMPUTER_USE_MCP_PERSIST_PORTAL")
                 .ok()
                 .as_deref(),
         )
@@ -74,7 +74,7 @@ impl PortalConfig {
             Some("0" | "false") => false,
             Some(value) => {
                 eprintln!(
-                    "open-computer-use: invalid OPEN_COMPUTER_USE_PERSIST_PORTAL={value:?}; persistence remains enabled"
+                    "computer-use-mcp: invalid COMPUTER_USE_MCP_PERSIST_PORTAL={value:?}; persistence remains enabled"
                 );
                 true
             }
@@ -145,7 +145,7 @@ impl XdgPortalBackend {
             match RestoreTokenStore::xdg() {
                 Ok(store) => Some(store),
                 Err(error) => {
-                    eprintln!("open-computer-use: restore-token persistence disabled: {error}");
+                    eprintln!("computer-use-mcp: restore-token persistence disabled: {error}");
                     None
                 }
             }
@@ -196,10 +196,10 @@ impl XdgPortalBackend {
             let signalled = stream.next().await.is_some();
             monitor_closed_sender.send_replace(true);
             if signalled {
-                eprintln!("open-computer-use: XDG portal RemoteDesktop session closed");
+                eprintln!("computer-use-mcp: XDG portal RemoteDesktop session closed");
             } else {
                 eprintln!(
-                    "open-computer-use: XDG portal session close monitor ended; invalidating the session"
+                    "computer-use-mcp: XDG portal session close monitor ended; invalidating the session"
                 );
             }
         })));
@@ -218,7 +218,7 @@ impl XdgPortalBackend {
         let returned_session = take_string(&mut response, "session_handle")?;
         if returned_session != session_path {
             eprintln!(
-                "open-computer-use: portal returned unexpected session path: expected={session_path} returned={returned_session}"
+                "computer-use-mcp: portal returned unexpected session path: expected={session_path} returned={returned_session}"
             );
             if let Ok(returned_proxy) = Proxy::new_owned(
                 connection.clone(),
@@ -238,13 +238,13 @@ impl XdgPortalBackend {
         let restore_token = if let Some(store) = &self.token_store {
             match store.take() {
                 Ok(Some(token)) => {
-                    eprintln!("open-computer-use: using a private one-shot portal restore token");
+                    eprintln!("computer-use-mcp: using a private one-shot portal restore token");
                     Some(token)
                 }
                 Ok(None) => None,
                 Err(error) => {
                     eprintln!(
-                        "open-computer-use: restore token unavailable; continuing without restoration: {error}"
+                        "computer-use-mcp: restore token unavailable; continuing without restoration: {error}"
                     );
                     None
                 }
@@ -281,7 +281,7 @@ impl XdgPortalBackend {
                 match session_proxy.call::<_, _, ()>("Close", &()).await {
                     Ok(()) => session_guard.disarm(),
                     Err(close_error) => eprintln!(
-                        "open-computer-use: failed to close rejected portal grant: {close_error}"
+                        "computer-use-mcp: failed to close rejected portal grant: {close_error}"
                     ),
                 }
                 return Err(error);
@@ -297,7 +297,7 @@ impl XdgPortalBackend {
                 Ok(token) => token,
                 Err(error) => {
                     eprintln!(
-                        "open-computer-use: portal session is usable, but its replacement restore token had the wrong type: {error}"
+                        "computer-use-mcp: portal session is usable, but its replacement restore token had the wrong type: {error}"
                     );
                     None
                 }
@@ -307,15 +307,15 @@ impl XdgPortalBackend {
                     Ok(()) => {
                         restore_token_saved = true;
                         eprintln!(
-                            "open-computer-use: saved a private one-shot portal restore token"
+                            "computer-use-mcp: saved a private one-shot portal restore token"
                         );
                     }
                     Err(error) => eprintln!(
-                        "open-computer-use: portal session is usable, but its replacement restore token could not be saved: {error}"
+                        "computer-use-mcp: portal session is usable, but its replacement restore token could not be saved: {error}"
                     ),
                 },
                 None => eprintln!(
-                    "open-computer-use: portal granted the session without a restore token; persistence is unavailable for this backend/choice"
+                    "computer-use-mcp: portal granted the session without a restore token; persistence is unavailable for this backend/choice"
                 ),
             }
         }
@@ -369,7 +369,7 @@ impl XdgPortalBackend {
                 .await
                 .unwrap_or_else(|_| Err("timed out closing failed portal startup".into()))
                 {
-                    eprintln!("open-computer-use: portal startup cleanup also failed: {close}");
+                    eprintln!("computer-use-mcp: portal startup cleanup also failed: {close}");
                 }
                 Err(error)
             }
@@ -525,17 +525,17 @@ impl PortalSessionLease {
             Ok(mut guard) => {
                 guard.close_now("invalid EIS portal session", self.connection.as_ref())
             }
-            Err(_) => eprintln!("open-computer-use: portal session close mutex poisoned"),
+            Err(_) => eprintln!("computer-use-mcp: portal session close mutex poisoned"),
         }
     }
 
     pub(crate) fn invalidate_eis(&self, reason: &str) {
         match self.input_state.lock() {
             Ok(mut state) => *state = EisConnectionState::Invalid,
-            Err(_) => eprintln!("open-computer-use: portal EIS state mutex poisoned"),
+            Err(_) => eprintln!("computer-use-mcp: portal EIS state mutex poisoned"),
         }
         self.closed_sender.send_replace(true);
-        eprintln!("open-computer-use: invalidating portal session: {reason}");
+        eprintln!("computer-use-mcp: invalidating portal session: {reason}");
     }
 
     pub(crate) async fn close(&self, reason: &str) -> Result<(), String> {
@@ -544,7 +544,7 @@ impl PortalSessionLease {
             Err(_) => return Err("portal EIS state mutex poisoned".into()),
         }
         self.closed_sender.send_replace(true);
-        eprintln!("open-computer-use: closing portal session: {reason}");
+        eprintln!("computer-use-mcp: closing portal session: {reason}");
         let proxy = {
             let guard = self
                 ._close_guard
@@ -777,7 +777,7 @@ impl RawRequest {
     ) -> Result<HashMap<String, OwnedValue>, String> {
         if returned.as_str() != self.expected_path {
             eprintln!(
-                "open-computer-use: portal request path changed for {operation}: expected={} returned={returned}",
+                "computer-use-mcp: portal request path changed for {operation}: expected={} returned={returned}",
                 self.expected_path
             );
             self.proxy = Proxy::new_owned(
@@ -946,7 +946,7 @@ impl Drop for CloseMonitor {
 
 fn close_proxy(proxy: Proxy<'static>, label: &'static str, connection: Option<Connection>) {
     let result = std::thread::Builder::new()
-        .name("open-computer-use-portal-close".into())
+        .name("computer-use-mcp-portal-close".into())
         .spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_io()
@@ -954,17 +954,17 @@ fn close_proxy(proxy: Proxy<'static>, label: &'static str, connection: Option<Co
             match runtime {
                 Ok(runtime) => runtime.block_on(async move {
                     if let Err(error) = proxy.call::<_, _, ()>("Close", &()).await {
-                        eprintln!("open-computer-use: failed to close {label}: {error}");
+                        eprintln!("computer-use-mcp: failed to close {label}: {error}");
                     }
                     drop(connection);
                 }),
                 Err(error) => eprintln!(
-                    "open-computer-use: cannot create cleanup runtime for {label}: {error}"
+                    "computer-use-mcp: cannot create cleanup runtime for {label}: {error}"
                 ),
             }
         });
     if let Err(error) = result {
-        eprintln!("open-computer-use: cannot start cleanup thread for {label}: {error}");
+        eprintln!("computer-use-mcp: cannot start cleanup thread for {label}: {error}");
     }
 }
 
@@ -993,7 +993,7 @@ fn random_token(prefix: &str) -> Result<String, String> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    Ok(format!("ocu_{prefix}_{hex}"))
+    Ok(format!("computer_use_mcp_{prefix}_{hex}"))
 }
 
 fn parse_streams(value: OwnedValue, screencast_version: u32) -> Result<PortalStream, String> {
@@ -1037,13 +1037,13 @@ fn parse_stream(
     }
     if screencast_version < 6 {
         eprintln!(
-            "open-computer-use: ScreenCast v{screencast_version} lacks stable pipewire-serial targeting; using session-scoped node ID {node_id}"
+            "computer-use-mcp: ScreenCast v{screencast_version} lacks stable pipewire-serial targeting; using session-scoped node ID {node_id}"
         );
     }
     if !properties.is_empty() {
         let names = properties.keys().cloned().collect::<Vec<_>>().join(", ");
         eprintln!(
-            "open-computer-use: ignoring unsupported portal stream properties for stream {stream_index}: {names}"
+            "computer-use-mcp: ignoring unsupported portal stream properties for stream {stream_index}: {names}"
         );
     }
     Ok(PortalStream {
@@ -1104,7 +1104,7 @@ impl RestoreTokenStore {
                     .map(|home| home.join(".local/state"))
             })
             .ok_or_else(|| "neither XDG_STATE_HOME nor HOME is an absolute path".to_owned())?;
-        Ok(Self::at(state.join("open-computer-use")))
+        Ok(Self::at(state.join("computer-use-mcp")))
     }
 
     pub fn at(directory: PathBuf) -> Self {
@@ -1218,7 +1218,7 @@ impl RestoreTokenStore {
                 directory
                     .sync_all()
                     .map_err(|error| format!("cannot sync restore-token invalidation: {error}"))?;
-                eprintln!("open-computer-use: invalidated stored one-shot portal restore token");
+                eprintln!("computer-use-mcp: invalidated stored one-shot portal restore token");
                 Ok(())
             }
             Err(rustix::io::Errno::NOENT) => Ok(()),
@@ -1297,7 +1297,7 @@ mod tests {
 
     fn temp_directory(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "ocu-{name}-{}-{}",
+            "computer-use-mcp-{name}-{}-{}",
             std::process::id(),
             TEST_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
         ))

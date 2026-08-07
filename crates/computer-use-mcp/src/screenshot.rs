@@ -201,7 +201,7 @@ where
             CaptureState::Fresh => None,
         };
         if let Some(reason) = unavailable {
-            eprintln!("open-computer-use: desktop session became unavailable: {reason}");
+            eprintln!("computer-use-mcp: desktop session became unavailable: {reason}");
             exhaust_capture(&mut state, "desktop session became unavailable").await;
             return Err(session_unavailable());
         }
@@ -261,7 +261,7 @@ where
             .ok_or_else(|| ScreenshotError("portal capture session is not established".into()))?;
         if active.session.is_closed() {
             eprintln!(
-                "open-computer-use: capture requested after portal Session.Closed: session={} generation={}",
+                "computer-use-mcp: capture requested after portal Session.Closed: session={} generation={}",
                 active.session.identity(),
                 active.session.generation()
             );
@@ -338,11 +338,7 @@ where
         let keyboard_required = matches!(action, GeneratedInputAction::Keyboard { .. });
         let connected_now = active.input.is_none();
         if connected_now {
-            let mapping_id = mapping.stream.mapping_id.clone().ok_or_else(|| {
-                "monitor stream omitted mapping_id; generated input cannot be bound to the approved monitor"
-                    .to_owned()
-            })?;
-            match ReisInputBackend::connect(Arc::clone(&active.session), mapping_id).await {
+            match ReisInputBackend::connect(Arc::clone(&active.session), &mapping.stream).await {
                 Ok(input) => active.input = Some(input),
                 Err(error) => {
                     exhaust_capture(&mut state, "EIS setup failed").await;
@@ -384,7 +380,6 @@ where
             exhaust_capture(&mut state, "portal session closed before generated input").await;
             return Err(SESSION_UNAVAILABLE.into());
         }
-        ValidatedMapping::new(snapshot, mapping, &active.session, &active.stream)?;
         let semantic_keyboard = matches!(
             &action,
             GeneratedInputAction::Keyboard {
@@ -392,10 +387,13 @@ where
                 ..
             }
         );
-        if !semantic_keyboard && let Err(error) = validate_current_capture(active, mapping).await {
-            eprintln!("open-computer-use: invalidating capture before input: {error}");
-            exhaust_capture(&mut state, "capture validation failed before input").await;
-            return Err(error);
+        if !semantic_keyboard {
+            ValidatedMapping::new(snapshot, mapping, &active.session, &active.stream)?;
+            if let Err(error) = validate_current_capture(active, mapping).await {
+                eprintln!("computer-use-mcp: invalidating capture before input: {error}");
+                exhaust_capture(&mut state, "capture validation failed before input").await;
+                return Err(error);
+            }
         }
         let active = state
             .active_mut()
@@ -489,7 +487,7 @@ async fn exhaust_capture(state: &mut CaptureState, reason: &str) {
     if let Some(active) = take_active(state)
         && let Err(error) = close_active(active, reason).await
     {
-        eprintln!("open-computer-use: exhausted session cleanup failed: {error}");
+        eprintln!("computer-use-mcp: exhausted session cleanup failed: {error}");
     }
 }
 
@@ -523,11 +521,11 @@ async fn close_startup_session(session: &PortalSessionLease, reason: &str) -> bo
     match tokio::time::timeout(Duration::from_secs(2), session.close(reason)).await {
         Ok(Ok(())) => true,
         Ok(Err(error)) => {
-            eprintln!("open-computer-use: failed to close partial startup session: {error}");
+            eprintln!("computer-use-mcp: failed to close partial startup session: {error}");
             false
         }
         Err(_) => {
-            eprintln!("open-computer-use: timed out closing partial startup session");
+            eprintln!("computer-use-mcp: timed out closing partial startup session");
             false
         }
     }
@@ -897,9 +895,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generated_input_requires_monitor_mapping_id() {
+    async fn generated_input_without_mapping_id_requires_exact_geometry() {
         let (mut connection, _) = test_connection(9, 44);
         connection.stream.mapping_id = None;
+        connection.stream.position = None;
         let coordinator = test_coordinator([connection], Arc::new(FakeCaptureState::default()));
         coordinator.prepare().await.unwrap();
         let snapshot = test_snapshot();
@@ -912,6 +911,6 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.contains("omitted mapping_id"));
+        assert!(error.contains("omitted mapping_id and position"));
     }
 }

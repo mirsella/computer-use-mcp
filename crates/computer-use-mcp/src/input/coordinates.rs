@@ -21,11 +21,9 @@ impl<'a> ValidatedMapping<'a> {
     }
 
     pub fn eis_mapper(self, region: EisRegion) -> Result<AbsoluteMapper, String> {
-        let mapping_id = self.mapping.stream.mapping_id.as_deref().ok_or(
-            "monitor stream omitted mapping_id; generated input cannot be bound to the approved monitor",
-        )?;
-        if region.mapping_id.as_deref() != Some(mapping_id) {
-            return Err("selected EIS region mapping_id does not match the monitor stream".into());
+        let route = EisRoute::from_stream(&self.mapping.stream)?;
+        if !route.matches(&region) {
+            return Err("selected EIS region does not match the monitor stream route".into());
         }
         if region.size.0 == 0 || region.size.1 == 0 {
             return Err("selected EIS region has invalid zero size".into());
@@ -34,6 +32,58 @@ impl<'a> ValidatedMapping<'a> {
             output_size: self.mapping.output_size,
             region,
         })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum EisRoute {
+    MappingId(String),
+    ExactGeometry {
+        position: (u32, u32),
+        size: (u32, u32),
+    },
+}
+
+impl EisRoute {
+    pub(crate) fn from_stream(stream: &PortalStream) -> Result<Self, String> {
+        if let Some(mapping_id) = &stream.mapping_id {
+            return Ok(Self::MappingId(mapping_id.clone()));
+        }
+        let position = stream.position.ok_or(
+            "monitor stream omitted mapping_id and position; generated input cannot be bound to the approved monitor",
+        )?;
+        let size = stream.logical_size.ok_or(
+            "monitor stream omitted mapping_id and logical size; generated input cannot be bound to the approved monitor",
+        )?;
+        let nonnegative = |(first, second), error: &str| {
+            Ok::<_, String>((
+                u32::try_from(first).map_err(|_| error.to_owned())?,
+                u32::try_from(second).map_err(|_| error.to_owned())?,
+            ))
+        };
+        let position = nonnegative(
+            position,
+            "monitor stream omitted mapping_id and has a negative position; generated input cannot be bound by exact geometry",
+        )?;
+        let size = nonnegative(
+            size,
+            "monitor stream omitted mapping_id and has a negative logical size",
+        )?;
+        if size.0 == 0 || size.1 == 0 {
+            return Err(
+                "monitor stream omitted mapping_id and has an invalid zero logical size".into(),
+            );
+        }
+        Ok(Self::ExactGeometry { position, size })
+    }
+
+    pub(crate) fn matches(&self, region: &EisRegion) -> bool {
+        match self {
+            Self::MappingId(mapping_id) => region.mapping_id.as_deref() == Some(mapping_id),
+            Self::ExactGeometry { position, size } => {
+                region.position == *position && region.size == *size
+            }
+        }
     }
 }
 
@@ -187,15 +237,7 @@ mod tests {
             },
             output_size: (600, 450),
         };
-        let stream = PortalStream {
-            stream_index: 0,
-            node_id: 22,
-            pipewire_serial: Some(33),
-            id: Some("stream".into()),
-            mapping_id: Some("map".into()),
-            position: Some((-1600, 0)),
-            logical_size: Some((400, 300)),
-        };
+        let stream = mapping.stream.clone();
         (snapshot, mapping, stream)
     }
 
@@ -268,6 +310,39 @@ mod tests {
             map_png_point(&snapshot, &mapping, &session, &stream, 1.0, 1.0)
                 .unwrap_err()
                 .contains("closed")
+        );
+    }
+
+    #[test]
+    fn maps_kde_stream_without_mapping_id_by_exact_geometry() {
+        let (snapshot, mut mapping, _) = fixture();
+        mapping.stream.mapping_id = None;
+        mapping.stream.position = Some((800, 200));
+        mapping.stream.logical_size = Some((1200, 900));
+        let stream = mapping.stream.clone();
+        let (session, _) = PortalSessionLease::for_test("/session/test", 4);
+
+        let point = map_png_point(&snapshot, &mapping, &session, &stream, 75.0, 30.0).unwrap();
+
+        assert_eq!(point, (950.0, 260.0));
+    }
+
+    #[test]
+    fn missing_mapping_id_requires_usable_exact_geometry() {
+        let (_, mut mapping, _) = fixture();
+        mapping.stream.mapping_id = None;
+        mapping.stream.position = None;
+        assert!(
+            EisRoute::from_stream(&mapping.stream)
+                .unwrap_err()
+                .contains("omitted mapping_id and position")
+        );
+
+        mapping.stream.position = Some((-1, 0));
+        assert!(
+            EisRoute::from_stream(&mapping.stream)
+                .unwrap_err()
+                .contains("negative position")
         );
     }
 }

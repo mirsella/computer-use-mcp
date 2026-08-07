@@ -89,14 +89,14 @@ impl HeldInputGuard {
         let mut first_error = None;
         while let Some(held) = self.held.last().copied() {
             if let Err(error) = self.backend.emit(held.release_event()).await {
-                eprintln!("open-computer-use: failed to release held input: {error}");
+                eprintln!("computer-use-mcp: failed to release held input: {error}");
                 first_error.get_or_insert(error);
                 self.backend.queue_release(vec![held]);
             }
             self.held.pop();
         }
         if let Err(error) = self.backend.cleanup_barrier().await {
-            eprintln!("open-computer-use: cleanup barrier failed: {error}");
+            eprintln!("computer-use-mcp: cleanup barrier failed: {error}");
             first_error.get_or_insert(error);
         }
         self.cleanup_needed = false;
@@ -126,7 +126,7 @@ pub async fn finish_with_cleanup<T>(
         Err(original) => {
             if let Err(cleanup) = guard.release_all().await {
                 eprintln!(
-                    "open-computer-use: held-input cleanup also failed after {original}: {cleanup}"
+                    "computer-use-mcp: held-input cleanup also failed after {original}: {cleanup}"
                 );
                 return Err(format!(
                     "{original}; held-input cleanup also failed and the input session was invalidated: {cleanup}"

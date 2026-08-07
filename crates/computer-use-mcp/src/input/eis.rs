@@ -22,7 +22,7 @@ use crate::portal::PortalSessionLease;
 
 use super::{
     backend::{HeldInput, InputBackend, InputEvent, InputFuture, KeyboardKey},
-    coordinates::EisRegion,
+    coordinates::{EisRegion, EisRoute},
 };
 
 const READY_TIMEOUT: Duration = Duration::from_secs(3);
@@ -46,6 +46,12 @@ struct DeviceState {
     emulating: bool,
 }
 
+impl DeviceState {
+    fn is_usable_keyboard(&self) -> bool {
+        self.keymap.is_some() && self.device.interface::<ei::Keyboard>().is_some()
+    }
+}
+
 struct EisState {
     connection: Option<reis::event::Connection>,
     devices: HashMap<u64, DeviceState>,
@@ -63,22 +69,23 @@ impl EisState {
         }
     }
 
-    fn pointer_device(&self, mapping_id: &str) -> Result<Option<EisBinding>, String> {
+    fn pointer_device(&self, route: &EisRoute) -> Result<Option<EisBinding>, String> {
         let mut matched = None;
         for (&id, state) in &self.devices {
             if !state.resumed || state.device.interface::<ei::PointerAbsolute>().is_none() {
                 continue;
             }
             for region in state.device.regions() {
-                if region.mapping_id.as_deref() == Some(mapping_id) {
+                let region = EisRegion {
+                    position: (region.x, region.y),
+                    size: (region.width, region.height),
+                    mapping_id: region.mapping_id.clone(),
+                };
+                if route.matches(&region) {
                     let candidate = EisBinding {
                         pointer_id: id,
                         resume_generation: state.resume_generation,
-                        region: EisRegion {
-                            position: (region.x, region.y),
-                            size: (region.width, region.height),
-                            mapping_id: region.mapping_id.clone(),
-                        },
+                        region,
                     };
                     if matched.replace(candidate).is_some() {
                         return Err("multiple resumed EIS regions match the selected monitor stream; refusing ambiguous input".into());
@@ -131,8 +138,7 @@ impl EisState {
                 state.resumed
                     && state.modifiers_synced
                     && state.modifiers.is_some()
-                    && state.keymap.is_some()
-                    && state.device.interface::<ei::Keyboard>().is_some()
+                    && state.is_usable_keyboard()
                     && state.device.seat() == pointer_seat
             })
             .map(|(&id, _)| id)
@@ -145,6 +151,37 @@ impl EisState {
                 many.len()
             )),
         }
+    }
+
+    fn keyboard_diagnostics(&self, route: &EisRoute) -> Result<String, String> {
+        let pointer_id = self
+            .pointer_device(route)?
+            .ok_or("exact EIS pointer region is not resumed")?
+            .pointer_id;
+        let pointer = self
+            .devices
+            .get(&pointer_id)
+            .ok_or("selected EIS pointer disappeared")?;
+        let details = self
+            .devices
+            .iter()
+            .filter(|(_, state)| state.device.interface::<ei::Keyboard>().is_some())
+            .map(|(id, state)| {
+                format!(
+                    "device {id}: same_seat={}, resumed={}, keymap={}, modifiers={}, synchronized={}",
+                    state.device.seat() == pointer.device.seat(),
+                    state.resumed,
+                    state.keymap.is_some(),
+                    state.modifiers.is_some(),
+                    state.modifiers_synced
+                )
+            })
+            .collect::<Vec<_>>();
+        Ok(if details.is_empty() {
+            "no EIS keyboard device was advertised".into()
+        } else {
+            details.join("; ")
+        })
     }
 }
 
@@ -205,7 +242,7 @@ impl Drop for EisAttemptGuard {
 
 pub struct ReisInputBackend {
     session: Arc<PortalSessionLease>,
-    mapping_id: String,
+    route: EisRoute,
     state: Arc<Mutex<EisState>>,
     ready: Arc<Notify>,
     cleanup: Mutex<CleanupState>,
@@ -217,8 +254,15 @@ pub struct ReisInputBackend {
 impl ReisInputBackend {
     pub async fn connect(
         session: Arc<PortalSessionLease>,
-        mapping_id: String,
+        stream: &crate::portal::PortalStream,
     ) -> Result<Arc<Self>, String> {
+        let route = EisRoute::from_stream(stream)?;
+        if let EisRoute::ExactGeometry { position, size } = &route {
+            eprintln!(
+                "computer-use-mcp: ScreenCast stream has no mapping_id; binding EIS input by exact geometry at ({}, {}) with size {}x{}",
+                position.0, position.1, size.0, size.1
+            );
+        }
         let attempt = EisAttemptGuard::new(Arc::clone(&session))?;
         let socket = session.connect_to_eis().await?;
         let shutdown = socket
@@ -234,7 +278,7 @@ impl ReisInputBackend {
         let (sync_requests, sync_receiver) = mpsc::unbounded_channel();
         let (done_sender, thread_done) = std::sync::mpsc::channel();
         let thread = std::thread::Builder::new()
-            .name("open-computer-use-eis".into())
+            .name("computer-use-mcp-eis".into())
             .spawn(move || {
                 run_eis(
                     socket,
@@ -249,7 +293,7 @@ impl ReisInputBackend {
             .map_err(|error| format!("cannot start EIS event thread: {error}"))?;
         let backend = Arc::new(Self {
             session,
-            mapping_id,
+            route,
             state,
             ready,
             cleanup: Mutex::new(CleanupState::default()),
@@ -279,7 +323,7 @@ impl ReisInputBackend {
                 if let Some(error) = &state.terminal {
                     return Err(error.clone());
                 }
-                if let Some(binding) = state.pointer_device(&self.mapping_id)? {
+                if let Some(binding) = state.pointer_device(&self.route)? {
                     let keyboard_ready =
                         !keyboard_required || state.keyboard_device(binding.pointer_id)?.is_some();
                     if keyboard_ready {
@@ -307,8 +351,15 @@ impl ReisInputBackend {
             .await
             .map_err(|_| {
                 if keyboard_required {
-                    "timed out waiting for a synchronized EIS keyboard on the monitor seat"
-                        .to_owned()
+                    let detail = self
+                        .state
+                        .lock()
+                        .map_err(|_| "EIS state mutex poisoned".to_owned())
+                        .and_then(|state| state.keyboard_diagnostics(&self.route))
+                        .unwrap_or_else(|error| error);
+                    format!(
+                        "timed out waiting for a synchronized EIS keyboard on the monitor seat ({detail})"
+                    )
                 } else {
                     "timed out waiting for the exact EIS monitor device".to_owned()
                 }
@@ -328,7 +379,7 @@ impl ReisInputBackend {
 
     fn pointer_device_for_action(&self, state: &EisState) -> Result<EisBinding, String> {
         let current = state
-            .pointer_device(&self.mapping_id)?
+            .pointer_device(&self.route)?
             .ok_or_else(|| "exact EIS pointer region is no longer resumed".to_owned())?;
         let bound = state
             .binding
@@ -690,7 +741,7 @@ impl InputBackend for ReisInputBackend {
         match self.cleanup.lock() {
             Ok(mut cleanup) => cleanup.held.extend(held),
             Err(_) => {
-                eprintln!("open-computer-use: EIS cleanup mutex poisoned; invalidating session");
+                eprintln!("computer-use-mcp: EIS cleanup mutex poisoned; invalidating session");
                 self.session.invalidate("EIS cleanup mutex poisoned");
             }
         }
@@ -760,7 +811,7 @@ impl InputBackend for ReisInputBackend {
 impl Drop for ReisInputBackend {
     fn drop(&mut self) {
         let Ok(mut thread) = self.thread.lock() else {
-            eprintln!("open-computer-use: EIS thread mutex poisoned during shutdown");
+            eprintln!("computer-use-mcp: EIS thread mutex poisoned during shutdown");
             self.session.invalidate("EIS thread mutex poisoned");
             return;
         };
@@ -775,7 +826,7 @@ impl Drop for ReisInputBackend {
             let _ = handle.join();
         } else {
             eprintln!(
-                "open-computer-use: EIS event thread did not stop within one second; detaching it"
+                "computer-use-mcp: EIS event thread did not stop within one second; detaching it"
             );
         }
     }
@@ -803,7 +854,7 @@ fn run_eis(
     }
     ready.notify_one();
     if !stopping.load(Ordering::Acquire) {
-        eprintln!("open-computer-use: {error}");
+        eprintln!("computer-use-mcp: {error}");
         session.invalidate("EIS connection terminated");
     }
 }
@@ -825,7 +876,7 @@ fn run_eis_inner(
             .map_err(|error| format!("cannot monitor EIS socket: {error}"))?;
         let handshake = reis::tokio::ei_handshake(
             &mut wire_events,
-            "open-computer-use",
+            "computer-use-mcp",
             ei::handshake::ContextType::Sender,
         )
         .await
@@ -922,9 +973,7 @@ fn handle_event(
                 {
                     Ok(text) => Some(text),
                     Err(error) => {
-                        eprintln!(
-                            "open-computer-use: ignoring unusable EIS keyboard {id}: {error}"
-                        );
+                        eprintln!("computer-use-mcp: ignoring unusable EIS keyboard {id}: {error}");
                         None
                     }
                 }
@@ -962,10 +1011,12 @@ fn handle_event(
                     Some(device) => {
                         device.resumed = true;
                         device.resume_generation = device.resume_generation.wrapping_add(1);
-                        device.modifiers = None;
                         device.modifiers_synced = false;
-                        device.keymap.is_some()
-                            && device.device.interface::<ei::Keyboard>().is_some()
+                        let usable_keyboard = device.is_usable_keyboard();
+                        // The EI protocol requires senders to assume all modifiers are
+                        // lifted after resume; only nonzero state must be reported.
+                        device.modifiers = usable_keyboard.then_some((0, 0, 0, 0));
+                        usable_keyboard
                     }
                     None => false,
                 }
@@ -1055,7 +1106,7 @@ fn queue_sync(
             .devices
             .get_mut(&device_id)
             .ok_or("EIS keyboard disappeared before synchronization")?;
-        if !device.resumed || device.device.interface::<ei::Keyboard>().is_none() {
+        if !device.resumed || !device.is_usable_keyboard() {
             return Err("EIS keyboard paused before synchronization".into());
         }
         device.modifiers_synced = false;

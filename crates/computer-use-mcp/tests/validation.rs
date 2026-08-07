@@ -1,4 +1,4 @@
-use open_computer_use::validation::{
+use computer_use_mcp::validation::{
     ApplicationScope, ElementAction, KeyboardAction, KeyboardFocus, MAX_CLICK_COUNT,
     MAX_QUERY_LENGTH, MAX_SCROLL_STEPS, MAX_TEXT_LIMIT, MAX_TREE_DEPTH, MAX_TREE_NODES,
     MouseButton, ObservationView, PointerAction, TextLimit, ToolCall, validate_call,
@@ -80,7 +80,7 @@ fn parses_nested_discriminated_actions_and_defaults() {
     );
     assert_eq!(
         element_action(json!({"type": "named", "name": " activate "})),
-        ElementAction::Named("activate".into())
+        ElementAction::Named(" activate ".into())
     );
     assert_eq!(
         element_action(json!({"type": "set_value", "value": "value"})),
@@ -500,9 +500,26 @@ fn rejects_invalid_observation_views_and_queries() {
 
 #[test]
 fn rejects_alt_tab_shortcuts() {
-    for key in ["Alt+Tab", "alt + shift + tab"] {
+    for key in ["Alt+Tab", "alt + shift + tab", "Ctrl+ALT+TAB"] {
         assert!(invalid("keyboard", json!({"state_id": STATE_ID, "focus": {"x": 1, "y": 2}, "action": {"type": "press", "key": key}})).contains("Alt+Tab"));
     }
+    for key in ["Tab", "Alt+F4"] {
+        assert_eq!(
+            keyboard_action(json!({"type": "press", "key": key})),
+            KeyboardAction::Press(key.into())
+        );
+    }
+    assert!(
+        invalid(
+            "keyboard",
+            json!({
+                "state_id": STATE_ID,
+                "focus": {"x": 1, "y": 2},
+                "action": {"type": "press", "key": "Alt+Tab", "extra": true},
+            })
+        )
+        .contains("unknown argument")
+    );
 }
 
 fn element_action(action: Value) -> ElementAction {

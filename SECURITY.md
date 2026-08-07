@@ -26,7 +26,7 @@ Current safeguards:
 - diagnostics go to stderr and do not include typed text or assigned values;
 - portal restore-token values are never logged and are stored only with private
   XDG state permissions. Persistent restoration is requested by default and can
-  be disabled for a run with `OPEN_COMPUTER_USE_PERSIST_PORTAL=0`; this does not
+  be disabled for a run with `COMPUTER_USE_MCP_PERSIST_PORTAL=0`; this does not
   erase an existing token or revoke the portal-side grant;
 - the portal chooser, not the client, selects the one shared monitor;
 - screenshots contain the complete monitor selected by the user; no AT-SPI

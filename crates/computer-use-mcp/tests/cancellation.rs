@@ -6,10 +6,10 @@ use std::{
     },
 };
 
-use open_computer_use::{
+use computer_use_mcp::{
     errors::RuntimeError,
     runtime::{DesktopRuntime, ToolOutput},
-    server::OpenComputerUseServer,
+    server::ComputerUseMcpServer,
     validation::ToolCall,
 };
 use rmcp::{
@@ -123,7 +123,7 @@ async fn cancelled_runtime_call_emits_no_response_and_server_continues() {
     let calls = Arc::new(AtomicUsize::new(0));
     let server_calls = Arc::clone(&calls);
     let server = tokio::spawn(async move {
-        let service = OpenComputerUseServer::new(Arc::new(BlockingRuntime {
+        let service = ComputerUseMcpServer::new(Arc::new(BlockingRuntime {
             calls: server_calls,
             cleanup_complete: server_cleanup,
         }))
@@ -202,7 +202,7 @@ async fn failed_cancellation_cleanup_forces_shutdown_before_next_call() {
     let server_calls = Arc::clone(&calls);
     let server_shutdowns = Arc::clone(&shutdowns);
     let server = tokio::spawn(async move {
-        let service = OpenComputerUseServer::new(Arc::new(CleanupFailureRuntime {
+        let service = ComputerUseMcpServer::new(Arc::new(CleanupFailureRuntime {
             calls: server_calls,
             shutdowns: server_shutdowns,
         }))
@@ -269,7 +269,7 @@ async fn read_only_call_cancelled_while_queued_never_executes() {
     let server_calls = Arc::clone(&calls);
     let server_release = Arc::clone(&release_first);
     let server = tokio::spawn(async move {
-        let service = OpenComputerUseServer::new(Arc::new(QueuedRuntime {
+        let service = ComputerUseMcpServer::new(Arc::new(QueuedRuntime {
             calls: server_calls,
             release_first: server_release,
         }))

@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{Map as JsonObject, Value};
 
-use crate::errors::ValidationError;
+use crate::errors::RuntimeError;
 
 pub const MAX_CLICK_COUNT: usize = 3;
 pub const MAX_SCROLL_STEPS: u32 = 100;
@@ -93,6 +93,25 @@ pub enum KeyboardAction {
     Type(String),
 }
 
+impl ToolCall {
+    pub(crate) fn validate_policy(&self) -> Result<(), RuntimeError> {
+        let Self::Keyboard {
+            action: KeyboardAction::Press(key),
+            ..
+        } = self
+        else {
+            return Ok(());
+        };
+        let mut parts = key.split('+').map(str::trim);
+        let has_alt = parts.clone().any(|part| part.eq_ignore_ascii_case("alt"));
+        let has_tab = parts.any(|part| part.eq_ignore_ascii_case("tab"));
+        if has_alt && has_tab {
+            return Err(RuntimeError::unsupported_desktop_focus_switch());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum KeyboardFocus {
     Point((f64, f64)),
@@ -134,7 +153,7 @@ pub enum ToolCall {
 pub fn validate_call(
     name: &str,
     mut arguments: JsonObject<String, Value>,
-) -> Result<ToolCall, ValidationError> {
+) -> Result<ToolCall, RuntimeError> {
     let call = match name {
         "list_applications" => {
             let scope = match required_string(&mut arguments, "scope")?.as_str() {
@@ -172,13 +191,20 @@ pub fn validate_call(
         _ => return invalid(format!("unknown tool {name:?}")),
     };
     reject_unknown(arguments)?;
+    call.validate_policy()?;
     Ok(call)
 }
 
-fn element_action(mut object: JsonObject<String, Value>) -> Result<ElementAction, ValidationError> {
+fn element_action(mut object: JsonObject<String, Value>) -> Result<ElementAction, RuntimeError> {
     let action = match required_string(&mut object, "type")?.as_str() {
         "invoke" => ElementAction::Invoke,
-        "named" => ElementAction::Named(required_nonblank(&mut object, "name")?),
+        "named" => {
+            let name = required_string(&mut object, "name")?;
+            if name.trim().is_empty() {
+                return invalid("argument \"name\" must not be blank");
+            }
+            ElementAction::Named(name)
+        }
         "focus" => ElementAction::Focus,
         "set_value" => ElementAction::SetValue(required_string(&mut object, "value")?),
         _ => return invalid("element action type must be invoke, named, focus, or set_value"),
@@ -187,7 +213,7 @@ fn element_action(mut object: JsonObject<String, Value>) -> Result<ElementAction
     Ok(action)
 }
 
-fn pointer_action(mut object: JsonObject<String, Value>) -> Result<PointerAction, ValidationError> {
+fn pointer_action(mut object: JsonObject<String, Value>) -> Result<PointerAction, RuntimeError> {
     let action = match required_string(&mut object, "type")?.as_str() {
         "move" => {
             let (x, y) = coordinate_pair(&mut object, "x", "y")?;
@@ -212,7 +238,7 @@ fn pointer_action(mut object: JsonObject<String, Value>) -> Result<PointerAction
             let amount = i32::try_from(steps)
                 .ok()
                 .and_then(|steps| steps.checked_mul(120))
-                .ok_or_else(|| ValidationError("scroll steps are too large".into()))?;
+                .ok_or_else(|| RuntimeError::invalid_arguments("scroll steps are too large"))?;
             let (delta_x, delta_y) = match direction.as_str() {
                 "up" => (0, -amount),
                 "down" => (0, amount),
@@ -234,23 +260,9 @@ fn pointer_action(mut object: JsonObject<String, Value>) -> Result<PointerAction
     Ok(action)
 }
 
-fn keyboard_action(
-    mut object: JsonObject<String, Value>,
-) -> Result<KeyboardAction, ValidationError> {
+fn keyboard_action(mut object: JsonObject<String, Value>) -> Result<KeyboardAction, RuntimeError> {
     let action = match required_string(&mut object, "type")?.as_str() {
-        "press" => {
-            let key = required_nonblank(&mut object, "key")?;
-            if key
-                .split('+')
-                .any(|part| part.trim().eq_ignore_ascii_case("alt"))
-                && key
-                    .split('+')
-                    .any(|part| part.trim().eq_ignore_ascii_case("tab"))
-            {
-                return invalid("desktop focus-switch shortcut Alt+Tab is not allowed");
-            }
-            KeyboardAction::Press(key)
-        }
+        "press" => KeyboardAction::Press(required_nonblank(&mut object, "key")?),
         "type" => KeyboardAction::Type(required_string(&mut object, "text")?),
         _ => return invalid("keyboard action type must be press or type"),
     };
@@ -258,7 +270,7 @@ fn keyboard_action(
     Ok(action)
 }
 
-fn keyboard_focus(mut object: JsonObject<String, Value>) -> Result<KeyboardFocus, ValidationError> {
+fn keyboard_focus(mut object: JsonObject<String, Value>) -> Result<KeyboardFocus, RuntimeError> {
     let focus = if object.contains_key("element_id") {
         KeyboardFocus::Element(required_element_id(&mut object, "element_id")?)
     } else {
@@ -268,39 +280,40 @@ fn keyboard_focus(mut object: JsonObject<String, Value>) -> Result<KeyboardFocus
     Ok(focus)
 }
 
-fn required(
-    arguments: &mut JsonObject<String, Value>,
-    key: &str,
-) -> Result<Value, ValidationError> {
-    arguments
-        .remove(key)
-        .ok_or_else(|| ValidationError(format!("missing required argument {key:?}")))
+fn required(arguments: &mut JsonObject<String, Value>, key: &str) -> Result<Value, RuntimeError> {
+    arguments.remove(key).ok_or_else(|| {
+        RuntimeError::invalid_arguments(format!("missing required argument {key:?}"))
+    })
 }
 
 fn required_object(
     arguments: &mut JsonObject<String, Value>,
     key: &str,
-) -> Result<JsonObject<String, Value>, ValidationError> {
+) -> Result<JsonObject<String, Value>, RuntimeError> {
     required(arguments, key)?
         .as_object()
         .cloned()
-        .ok_or_else(|| ValidationError(format!("argument {key:?} must be an object")))
+        .ok_or_else(|| {
+            RuntimeError::invalid_arguments(format!("argument {key:?} must be an object"))
+        })
 }
 
 fn required_string(
     arguments: &mut JsonObject<String, Value>,
     key: &str,
-) -> Result<String, ValidationError> {
+) -> Result<String, RuntimeError> {
     required(arguments, key)?
         .as_str()
         .map(str::to_owned)
-        .ok_or_else(|| ValidationError(format!("argument {key:?} must be a string")))
+        .ok_or_else(|| {
+            RuntimeError::invalid_arguments(format!("argument {key:?} must be a string"))
+        })
 }
 
 fn required_nonblank(
     arguments: &mut JsonObject<String, Value>,
     key: &str,
-) -> Result<String, ValidationError> {
+) -> Result<String, RuntimeError> {
     let value = required_string(arguments, key)?;
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -312,7 +325,7 @@ fn required_nonblank(
 fn required_desktop_id(
     arguments: &mut JsonObject<String, Value>,
     key: &str,
-) -> Result<String, ValidationError> {
+) -> Result<String, RuntimeError> {
     let value = required_string(arguments, key)?;
     if value.len() == ".desktop".len()
         || !value.ends_with(".desktop")
@@ -328,7 +341,7 @@ fn required_desktop_id(
 fn required_state_id(
     arguments: &mut JsonObject<String, Value>,
     key: &str,
-) -> Result<String, ValidationError> {
+) -> Result<String, RuntimeError> {
     let value = required_string(arguments, key)?;
     let valid = value.len() == 18
         && value.starts_with("s-")
@@ -346,7 +359,7 @@ fn required_state_id(
 fn required_element_id(
     arguments: &mut JsonObject<String, Value>,
     key: &str,
-) -> Result<String, ValidationError> {
+) -> Result<String, RuntimeError> {
     match required(arguments, key)? {
         Value::String(value)
             if value.len() <= 4
@@ -383,10 +396,10 @@ fn required_element_id(
 fn required_finite(
     arguments: &mut JsonObject<String, Value>,
     key: &str,
-) -> Result<f64, ValidationError> {
-    let value = required(arguments, key)?
-        .as_f64()
-        .ok_or_else(|| ValidationError(format!("argument {key:?} must be a number")))?;
+) -> Result<f64, RuntimeError> {
+    let value = required(arguments, key)?.as_f64().ok_or_else(|| {
+        RuntimeError::invalid_arguments(format!("argument {key:?} must be a number"))
+    })?;
     if !value.is_finite() {
         return invalid(format!("argument {key:?} must be finite"));
     }
@@ -396,7 +409,7 @@ fn required_finite(
 fn required_coordinate(
     arguments: &mut JsonObject<String, Value>,
     key: &str,
-) -> Result<f64, ValidationError> {
+) -> Result<f64, RuntimeError> {
     let value = required_finite(arguments, key)?;
     if value < 0.0 {
         return invalid(format!("argument {key:?} must be non-negative"));
@@ -408,7 +421,7 @@ fn coordinate_pair(
     arguments: &mut JsonObject<String, Value>,
     x: &str,
     y: &str,
-) -> Result<(f64, f64), ValidationError> {
+) -> Result<(f64, f64), RuntimeError> {
     Ok((
         required_coordinate(arguments, x)?,
         required_coordinate(arguments, y)?,
@@ -418,7 +431,7 @@ fn coordinate_pair(
 fn optional_button(
     arguments: &mut JsonObject<String, Value>,
     key: &str,
-) -> Result<Option<MouseButton>, ValidationError> {
+) -> Result<Option<MouseButton>, RuntimeError> {
     let Some(value) = arguments.remove(key) else {
         return Ok(None);
     };
@@ -433,7 +446,7 @@ fn optional_button(
 fn optional_observation_view(
     arguments: &mut JsonObject<String, Value>,
     key: &str,
-) -> Result<ObservationView, ValidationError> {
+) -> Result<ObservationView, RuntimeError> {
     let Some(value) = arguments.remove(key) else {
         return Ok(ObservationView::default());
     };
@@ -441,7 +454,7 @@ fn optional_observation_view(
         .as_str()
         .and_then(ObservationView::parse)
         .ok_or_else(|| {
-            ValidationError(format!(
+            RuntimeError::invalid_arguments(format!(
                 "argument {key:?} must be full, visible, or interactive"
             ))
         })
@@ -450,13 +463,13 @@ fn optional_observation_view(
 fn optional_query(
     arguments: &mut JsonObject<String, Value>,
     key: &str,
-) -> Result<Option<String>, ValidationError> {
+) -> Result<Option<String>, RuntimeError> {
     let Some(value) = arguments.remove(key) else {
         return Ok(None);
     };
-    let query = value
-        .as_str()
-        .ok_or_else(|| ValidationError(format!("argument {key:?} must be a string")))?;
+    let query = value.as_str().ok_or_else(|| {
+        RuntimeError::invalid_arguments(format!("argument {key:?} must be a string"))
+    })?;
     if query.chars().count() > MAX_QUERY_LENGTH {
         return invalid(format!(
             "argument {key:?} must contain at most {MAX_QUERY_LENGTH} characters"
@@ -473,7 +486,7 @@ fn optional_bounded<T>(
     arguments: &mut JsonObject<String, Value>,
     key: &str,
     maximum: T,
-) -> Result<Option<T>, ValidationError>
+) -> Result<Option<T>, RuntimeError>
 where
     T: Copy + From<u8> + PartialOrd + std::fmt::Display + TryFrom<u64>,
 {
@@ -484,7 +497,7 @@ where
         .and_then(|value| T::try_from(value).ok())
         .filter(|value| (T::from(1)..=maximum).contains(value))
         .ok_or_else(|| {
-            ValidationError(format!(
+            RuntimeError::invalid_arguments(format!(
                 "argument {key:?} must be an integer from 1 through {maximum}"
             ))
         })?;
@@ -494,7 +507,7 @@ where
 fn optional_text_limit(
     arguments: &mut JsonObject<String, Value>,
     key: &str,
-) -> Result<Option<TextLimit>, ValidationError> {
+) -> Result<Option<TextLimit>, RuntimeError> {
     let Some(value) = arguments.remove(key) else {
         return Ok(None);
     };
@@ -504,7 +517,9 @@ fn optional_text_limit(
     let count = json_integer(&value)
         .and_then(|value| usize::try_from(value).ok())
         .ok_or_else(|| {
-            ValidationError(format!("argument {key:?} must be an integer or \"max\""))
+            RuntimeError::invalid_arguments(format!(
+                "argument {key:?} must be an integer or \"max\""
+            ))
         })?;
     if count > MAX_TEXT_LIMIT {
         return invalid(format!("argument {key:?} must not exceed {MAX_TEXT_LIMIT}"));
@@ -520,7 +535,7 @@ fn json_integer(value: &Value) -> Option<u64> {
     })
 }
 
-fn reject_unknown(arguments: JsonObject<String, Value>) -> Result<(), ValidationError> {
+fn reject_unknown(arguments: JsonObject<String, Value>) -> Result<(), RuntimeError> {
     if arguments.is_empty() {
         return Ok(());
     }
@@ -531,6 +546,6 @@ fn reject_unknown(arguments: JsonObject<String, Value>) -> Result<(), Validation
     ))
 }
 
-fn invalid<T>(message: impl Into<String>) -> Result<T, ValidationError> {
-    Err(ValidationError(message.into()))
+fn invalid<T>(message: impl Into<String>) -> Result<T, RuntimeError> {
+    Err(RuntimeError::invalid_arguments(message))
 }

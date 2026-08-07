@@ -28,14 +28,14 @@ use crate::{
 };
 
 #[derive(Debug)]
-pub struct OpenComputerUseServer<R = SemanticRuntime<AtspiAdapter, ProductionScreenshotCoordinator>>
+pub struct ComputerUseMcpServer<R = SemanticRuntime<AtspiAdapter, ProductionScreenshotCoordinator>>
 {
     runtime: Arc<R>,
     execution_barrier: tokio::sync::Mutex<()>,
     unavailable: AtomicBool,
 }
 
-impl<R> OpenComputerUseServer<R> {
+impl<R> ComputerUseMcpServer<R> {
     pub fn new(runtime: Arc<R>) -> Self {
         Self {
             runtime,
@@ -45,7 +45,7 @@ impl<R> OpenComputerUseServer<R> {
     }
 }
 
-impl<R: DesktopRuntime> ServerHandler for OpenComputerUseServer<R> {
+impl<R: DesktopRuntime> ServerHandler for ComputerUseMcpServer<R> {
     fn get_info(&self) -> ServerInfo {
         let mut tools = ToolsCapability::default();
         tools.list_changed = Some(false);
@@ -54,7 +54,7 @@ impl<R: DesktopRuntime> ServerHandler for OpenComputerUseServer<R> {
                 .enable_tools_with(tools)
                 .build(),
         )
-        .with_server_info(Implementation::new("open-computer-use", VERSION))
+        .with_server_info(Implementation::new("computer-use-mcp", VERSION))
         .with_protocol_version(ProtocolVersion::V_2025_11_25)
         .with_instructions(SERVER_INSTRUCTIONS)
     }
@@ -94,13 +94,6 @@ impl<R: DesktopRuntime> ServerHandler for OpenComputerUseServer<R> {
         let call = match validate_call(&request.name, arguments) {
             Ok(call) => call,
             Err(error) => {
-                let error = RuntimeError::new(
-                    "invalid_arguments",
-                    error.to_string(),
-                    ToolOutcome::NotStarted,
-                    true,
-                    "Correct the arguments using the tool input schema, then retry.",
-                );
                 return Ok(for_protocol(
                     tool_error_result(&error),
                     supports_structured_content(&context),
@@ -117,7 +110,7 @@ impl<R: DesktopRuntime> ServerHandler for OpenComputerUseServer<R> {
                 "Disable and re-enable the MCP before issuing more computer-use calls.",
             ))
         } else if context.ct.is_cancelled() {
-            eprintln!("open-computer-use: queued tool call cancelled before execution");
+            eprintln!("computer-use-mcp: queued tool call cancelled before execution");
             tool_error_result(&RuntimeError::new(
                 "cancelled",
                 "tool call cancelled before execution",
@@ -130,21 +123,21 @@ impl<R: DesktopRuntime> ServerHandler for OpenComputerUseServer<R> {
                 result = self.runtime.execute(call) => match result {
                     Ok(output) => output.into_mcp_result(),
                     Err(error) => {
-                        eprintln!("open-computer-use: {error}");
+                        eprintln!("computer-use-mcp: {error}");
                         tool_error_result(&error)
                     }
                 },
                 () = context.ct.cancelled() => {
-                    eprintln!("open-computer-use: tool call cancelled");
+                    eprintln!("computer-use-mcp: tool call cancelled");
                     match tokio::time::timeout(Duration::from_secs(2), self.runtime.cleanup()).await {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => {
-                            eprintln!("open-computer-use: cancellation cleanup failed: {error}; shutting down the desktop session");
+                            eprintln!("computer-use-mcp: cancellation cleanup failed: {error}; shutting down the desktop session");
                             self.unavailable.store(true, Ordering::Release);
                             shutdown_after_cleanup_failure(self.runtime.as_ref()).await;
                         }
                         Err(_) => {
-                            eprintln!("open-computer-use: cancellation cleanup timed out; shutting down the desktop session");
+                            eprintln!("computer-use-mcp: cancellation cleanup timed out; shutting down the desktop session");
                             self.unavailable.store(true, Ordering::Release);
                             shutdown_after_cleanup_failure(self.runtime.as_ref()).await;
                         }
@@ -167,22 +160,22 @@ impl<R: DesktopRuntime> ServerHandler for OpenComputerUseServer<R> {
 async fn shutdown_after_cleanup_failure<R: DesktopRuntime>(runtime: &R) {
     match tokio::time::timeout(Duration::from_secs(2), runtime.shutdown()).await {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => eprintln!("open-computer-use: cancellation shutdown failed: {error}"),
-        Err(_) => eprintln!("open-computer-use: cancellation shutdown timed out"),
+        Ok(Err(error)) => eprintln!("computer-use-mcp: cancellation shutdown failed: {error}"),
+        Err(_) => eprintln!("computer-use-mcp: cancellation shutdown timed out"),
     }
 }
 
 pub async fn serve_stdio() -> Result<(), CliError> {
     let runtime = production_runtime();
     eprintln!(
-        "open-computer-use: restoring or requesting KDE monitor, pointer, and keyboard approval"
+        "computer-use-mcp: restoring or requesting KDE monitor, pointer, and keyboard approval"
     );
     let result = async {
         runtime
             .prepare_desktop_session()
             .await
             .map_err(|error| CliError::Mcp(error.to_string()))?;
-        let service = match OpenComputerUseServer::new(Arc::clone(&runtime))
+        let service = match ComputerUseMcpServer::new(Arc::clone(&runtime))
             .serve(rmcp::transport::stdio())
             .await
         {
@@ -207,7 +200,7 @@ pub async fn serve_stdio() -> Result<(), CliError> {
         .map_err(|error| CliError::Mcp(format!("shutdown cleanup failed: {error}")));
     match (result, shutdown) {
         (Err(error), Err(shutdown)) => {
-            eprintln!("open-computer-use: shutdown also failed after server error: {shutdown}");
+            eprintln!("computer-use-mcp: shutdown also failed after server error: {shutdown}");
             Err(error)
         }
         (Err(error), Ok(())) => Err(error),

@@ -94,13 +94,7 @@ enum SetValueKind {
 
 impl NodeCapabilities {
     fn actions(&self) -> &[ActionInfo] {
-        match self {
-            Self::Inspected(InspectedCapabilities {
-                actions: ActionCapabilities::Inspected(actions),
-                ..
-            }) => actions,
-            _ => &[],
-        }
+        self.inspected_actions().unwrap_or_default()
     }
 
     fn inspected_actions(&self) -> Result<&[ActionInfo], ()> {
@@ -123,16 +117,6 @@ impl NodeCapabilities {
 
     fn inspection_complete(&self) -> bool {
         self.inspected_actions().is_ok()
-    }
-
-    fn supports_focus(&self) -> bool {
-        matches!(
-            self,
-            Self::Inspected(InspectedCapabilities {
-                component: true,
-                ..
-            })
-        )
     }
 
     fn set_value_kind(&self) -> Option<SetValueKind> {
@@ -170,6 +154,17 @@ pub struct NodeInfo {
 impl NodeInfo {
     pub fn is_defunct(&self) -> bool {
         self.states.contains("defunct") || self.states.contains("stale")
+    }
+
+    fn supports_focus(&self) -> bool {
+        self.states.contains("focusable")
+            && matches!(
+                &self.capabilities,
+                NodeCapabilities::Inspected(InspectedCapabilities {
+                    component: true,
+                    ..
+                })
+            )
     }
 }
 
@@ -500,6 +495,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
     }
 
     async fn execute_call(&self, call: ToolCall) -> Result<ToolOutput, RuntimeError> {
+        call.validate_policy()?;
         match call {
             ToolCall::ListApplications { .. } => self.execute_call_inner(call).await,
             ToolCall::LaunchApplication { desktop_id } => {
@@ -554,7 +550,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 Ok(self.observe(snapshot).await)
             }
             ToolCall::LaunchApplication { .. } => {
-                eprintln!("open-computer-use: launch bypassed its mutation fence");
+                eprintln!("computer-use-mcp: launch bypassed its mutation fence");
                 Err(internal_error("launch mutation invariant failed"))
             }
             ToolCall::ActOnElement {
@@ -719,7 +715,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 Ok(node) => node,
                 Err(error) if depth > 0 => {
                     eprintln!(
-                        "open-computer-use: skipping stale AT-SPI child: object={}{} error={error}",
+                        "computer-use-mcp: skipping stale AT-SPI child: object={}{} error={error}",
                         object.bus_name, object.path
                     );
                     continue;
@@ -727,7 +723,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 Err(error) => return Err(error),
             };
             if node.object != object {
-                eprintln!("open-computer-use: AT-SPI adapter returned mismatched object identity");
+                eprintln!("computer-use-mcp: AT-SPI adapter returned mismatched object identity");
                 return Err(operational_error(
                     "AT-SPI object identity changed while reading",
                 ));
@@ -740,7 +736,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                     )));
                 }
                 eprintln!(
-                    "open-computer-use: skipping defunct AT-SPI child: object={}{}",
+                    "computer-use-mcp: skipping defunct AT-SPI child: object={}{}",
                     object.bus_name, object.path
                 );
                 continue;
@@ -793,7 +789,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             }
             Ok(_) => {}
             Err(error) => eprintln!(
-                "open-computer-use: cached AT-SPI object is stale; attempting strict relocation: {error}"
+                "computer-use-mcp: cached AT-SPI object is stale; attempting strict relocation: {error}"
             ),
         }
         let current = self.fresh_for_action(&cached).await?;
@@ -898,7 +894,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         if let Err(error) = preparation {
             if let Err(cleanup) = cleanup {
                 eprintln!(
-                    "open-computer-use: cleanup also failed after input preparation error: {cleanup}"
+                    "computer-use-mcp: cleanup also failed after input preparation error: {cleanup}"
                 );
                 return Err(operational_error(format!(
                     "{error}; generated input cleanup also failed and the input session was invalidated: {cleanup}"
@@ -944,7 +940,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         if let Err(error) = result {
             if let Err(cleanup) = cleanup {
                 eprintln!(
-                    "open-computer-use: cleanup also failed after generated input error: {cleanup}"
+                    "computer-use-mcp: cleanup also failed after generated input error: {cleanup}"
                 );
                 return Err(uncertain_action(operational_error(format!(
                     "{error}; generated input cleanup also failed and the input session was invalidated: {cleanup}"
@@ -985,7 +981,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             Ok(Ok(preparation)) => preparation,
             Ok(Err(error)) => {
                 eprintln!(
-                    "open-computer-use: screenshot preparation failed for pid={} window={}{} generation={}: {error}",
+                    "computer-use-mcp: screenshot preparation failed for pid={} window={}{} generation={}: {error}",
                     snapshot.app.pid,
                     snapshot.window.object.bus_name,
                     snapshot.window.object.path,
@@ -995,7 +991,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             }
             Err(_) => {
                 eprintln!(
-                    "open-computer-use: screenshot preparation timed out for pid={} generation={}",
+                    "computer-use-mcp: screenshot preparation timed out for pid={} generation={}",
                     snapshot.app.pid, snapshot.generation
                 );
                 return screenshot_unavailable(&snapshot, "screenshot preparation timed out");
@@ -1016,7 +1012,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 Ok(refreshed) => refreshed,
                 Err(error) => {
                     eprintln!(
-                        "open-computer-use: AT-SPI refresh after portal consent failed for pid={}: {error}",
+                        "computer-use-mcp: AT-SPI refresh after portal consent failed for pid={}: {error}",
                         snapshot.app.pid
                     );
                     return screenshot_unavailable(
@@ -1039,7 +1035,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                     || observation.mapping.accessibility_generation != snapshot.generation
                 {
                     eprintln!(
-                        "open-computer-use: screenshot mapping identity invariant failed: snapshot_pid={} mapping_pid={} snapshot_generation={} mapping_generation={}",
+                        "computer-use-mcp: screenshot mapping identity invariant failed: snapshot_pid={} mapping_pid={} snapshot_generation={} mapping_generation={}",
                         snapshot.app.pid,
                         observation.mapping.app_pid,
                         snapshot.generation,
@@ -1052,14 +1048,14 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 }
                 if let Err(error) = self.revalidate_screenshot_target(&snapshot).await {
                     eprintln!(
-                        "open-computer-use: screenshot target changed after frame acquisition for pid={}: {error}",
+                        "computer-use-mcp: screenshot target changed after frame acquisition for pid={}: {error}",
                         snapshot.app.pid
                     );
                     return screenshot_unavailable(&snapshot, &error.to_string());
                 }
                 if let Err(error) = self.cache_screenshot(&snapshot, observation.mapping.clone()) {
                     eprintln!(
-                        "open-computer-use: screenshot cache update failed for pid={}: {error}",
+                        "computer-use-mcp: screenshot cache update failed for pid={}: {error}",
                         snapshot.app.pid
                     );
                     return screenshot_unavailable(&snapshot, &error.to_string());
@@ -1075,7 +1071,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             }
             Ok(Err(error)) => {
                 eprintln!(
-                    "open-computer-use: screenshot unavailable for pid={} window={}{} generation={}: {error}",
+                    "computer-use-mcp: screenshot unavailable for pid={} window={}{} generation={}: {error}",
                     snapshot.app.pid,
                     snapshot.window.object.bus_name,
                     snapshot.window.object.path,
@@ -1085,7 +1081,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             }
             Err(_) => {
                 eprintln!(
-                    "open-computer-use: screenshot capture timed out for pid={} generation={}",
+                    "computer-use-mcp: screenshot capture timed out for pid={} generation={}",
                     snapshot.app.pid, snapshot.generation
                 );
                 screenshot_unavailable(&snapshot, "screenshot capture timed out")
@@ -1124,7 +1120,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
     ) -> Result<(), RuntimeError> {
         let mut cache = self.lock_cache()?;
         let position = cache.position(snapshot).map_err(|error| {
-            eprintln!("open-computer-use: refusing stale screenshot cache write: {error}");
+            eprintln!("computer-use-mcp: refusing stale screenshot cache write: {error}");
             error
         })?;
         cache.observations[position].screenshot_mapping = Some(mapping);
@@ -1184,7 +1180,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
 
     fn lock_cache(&self) -> Result<std::sync::MutexGuard<'_, Cache>, RuntimeError> {
         self.cache.lock().map_err(|_| {
-            eprintln!("open-computer-use: state cache mutex poisoned");
+            eprintln!("computer-use-mcp: state cache mutex poisoned");
             operational_error("state cache invariant failed")
         })
     }
@@ -1244,7 +1240,7 @@ fn resolve_app(
         }
         return unique_app(query, "cached expected PID", matches);
     }
-    if let Ok(pid) = query.parse::<u32>() {
+    if let Ok(pid) = query.strip_prefix("PID=").unwrap_or(query).parse::<u32>() {
         let matches: Vec<_> = apps.iter().filter(|app| app.pid == pid).collect();
         return unique_app(query, "exact numeric PID", matches);
     }
@@ -1417,13 +1413,8 @@ fn semantic_action(
                         "AT-SPI action capability inspection failed for the target element",
                     )
                 })?;
-            let matches: Vec<_> = actions
-                .iter()
-                .enumerate()
-                .filter(|(_, action)| {
-                    action.name.eq_ignore_ascii_case(&requested)
-                        || action.description.eq_ignore_ascii_case(&requested)
-                })
+            let matches: Vec<_> = named_actions(actions)
+                .filter(|(_, action)| action.name == requested)
                 .collect();
             match matches.as_slice() {
                 [(index, _)] => i32::try_from(*index)
@@ -1438,9 +1429,9 @@ fn semantic_action(
             }
         }
         ElementAction::Focus => {
-            if !element.node.capabilities.supports_focus() {
+            if !element.node.supports_focus() {
                 return Err(capability_error(
-                    "element does not expose a proven AT-SPI Component focus capability",
+                    "element does not expose AT-SPI Component with the focusable state",
                 ));
             }
             Ok(SemanticAction::GrabFocus)
@@ -1492,6 +1483,13 @@ fn primary_action_index(actions: &[ActionInfo]) -> Option<usize> {
         })
 }
 
+fn named_actions(actions: &[ActionInfo]) -> impl Iterator<Item = (usize, &ActionInfo)> {
+    actions
+        .iter()
+        .enumerate()
+        .filter(|(_, action)| !action.name.trim().is_empty())
+}
+
 pub fn format_snapshot(snapshot: &Snapshot) -> String {
     let mut output = format!(
         "State ID: {}\nApp: {} (PID: {})\nWindow: {}\nElement frames: atspi_window_coordinates\n",
@@ -1530,22 +1528,22 @@ pub fn format_snapshot(snapshot: &Snapshot) -> String {
             output.push_str(&capabilities.join(", "));
             output.push(']');
         }
-        let actions = element.node.capabilities.actions();
+        let actions = named_actions(element.node.capabilities.actions())
+            .map(|(_, action)| {
+                if action.description.is_empty() {
+                    format!("{{name=\"{}\"}}", escape(&action.name))
+                } else {
+                    format!(
+                        "{{name=\"{}\", description=\"{}\"}}",
+                        escape(&action.name),
+                        escape(&action.description)
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
         if !actions.is_empty() {
-            output.push_str(" actions=[");
-            output.push_str(
-                &actions
-                    .iter()
-                    .map(|action| {
-                        if action.description.is_empty() {
-                            escape(&action.name)
-                        } else {
-                            format!("{} ({})", escape(&action.name), escape(&action.description))
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            );
+            output.push_str(" named_actions=[");
+            output.push_str(&actions.join(", "));
             output.push(']');
         }
         if let Some(frame) = element.node.window_frame {
@@ -1650,7 +1648,7 @@ fn text_capabilities(element: &ElementSnapshot) -> Vec<String> {
     {
         capabilities.push("invoke".into());
     }
-    if element.node.capabilities.supports_focus() {
+    if element.node.supports_focus() {
         capabilities.push("focus".into());
     }
     match element.node.capabilities.set_value_kind() {
@@ -1680,8 +1678,8 @@ fn element_capabilities(index: usize, element: &ElementSnapshot) -> serde_json::
         }),
         "inspection_complete": inspection_complete,
         "invoke": inspection_complete && primary_action_index(actions).is_some(),
-        "focus": element.node.capabilities.supports_focus(),
-        "named_actions": actions.iter().map(|action| json!({
+        "focus": element.node.supports_focus(),
+        "named_actions": named_actions(actions).map(|(_, action)| json!({
             "name": action.name,
             "description": action.description
         })).collect::<Vec<_>>(),
@@ -1737,7 +1735,13 @@ fn observation_output(
             element_capabilities(index, element)
         }).collect::<Vec<_>>()
     });
-    let mut text = format_snapshot(snapshot);
+    let snapshot_text = format_snapshot(snapshot);
+    let mut text = match dimensions {
+        Some((width, height)) => format!(
+            "Screenshot PNG bounds: 0 <= x < {width}, 0 <= y < {height}. Use these bounds for generated input; ignore frame_atspi_window dimensions.\n{snapshot_text}"
+        ),
+        None => snapshot_text,
+    };
     if !screenshot_ready {
         text.push_str(&format!(
             "Screenshot unavailable: {}",
@@ -1994,6 +1998,7 @@ mod tests {
     fn all_resolution_tiers_and_ambiguities_are_strict() {
         let apps = apps();
         assert_eq!(resolve_app("20", None, &apps).unwrap().app.pid, 20);
+        assert_eq!(resolve_app("PID=20", None, &apps).unwrap().app.pid, 20);
         assert_eq!(resolve_app("EDITOR", None, &apps).unwrap().app.pid, 10);
         assert_eq!(
             resolve_app("Preferences", None, &apps)
@@ -2077,7 +2082,7 @@ mod tests {
         });
         node.capabilities = inspected(ActionCapabilities::Inspected(vec![
             ActionInfo {
-                name: "click".into(),
+                name: String::new(),
                 description: String::new(),
             },
             ActionInfo {
@@ -2104,12 +2109,21 @@ mod tests {
         let text = format_snapshot(&snapshot);
         assert!(text.contains("line\\r\\n\\\"name"));
         assert!(text.contains("value=\"é🙂…\""));
-        assert!(text.contains("actions=[click, menu (Show\\nmenu)]"));
+        assert!(text.contains("named_actions=[{name=\"menu\", description=\"Show\\nmenu\"}]"));
         assert!(text.contains("Focused element: 0"));
         assert!(text.contains("Selected text: \"a\\n…\""));
         assert!(text.contains("node limit"));
         assert!(text.contains("depth limit"));
         assert!(!text.contains("Screenshot unavailable"));
+    }
+
+    #[test]
+    fn observation_puts_png_bounds_before_accessibility_frames() {
+        let snapshot = snapshot_for_target(1, "content");
+        let output = observation_output(&snapshot, true, None, Some((1280, 853)), None);
+        assert!(output.text.starts_with(
+            "Screenshot PNG bounds: 0 <= x < 1280, 0 <= y < 853. Use these bounds for generated input; ignore frame_atspi_window dimensions.\n"
+        ));
     }
 
     #[test]
@@ -2161,6 +2175,10 @@ mod tests {
             editable_text: false,
             value: false,
         });
+        assert!(semantic_action(ElementAction::Focus, &target).is_err());
+        assert!(!text_capabilities(&target).contains(&"focus".into()));
+        assert_eq!(element_capabilities(0, &target)["focus"], false);
+        target.node.states.insert("focusable".into());
         assert_eq!(
             semantic_action(ElementAction::Focus, &target).unwrap(),
             SemanticAction::GrabFocus
@@ -2538,12 +2556,19 @@ mod tests {
             .await
             .unwrap();
         let initial_generation = current_snapshot(&runtime).generation;
+        assert!(
+            semantic_action(
+                ElementAction::Named("Show Menu".into()),
+                &current_snapshot(&runtime).elements[1],
+            )
+            .is_err()
+        );
 
         let mut outputs = Vec::new();
         let mut previous_state_id = current_state_id(&runtime);
         for (element_id, action) in [
             ("1", ElementAction::Invoke),
-            ("1", ElementAction::Named("SHOW MENU".into())),
+            ("1", ElementAction::Named("menu".into())),
             ("2", ElementAction::SetValue("  λ\n".into())),
             ("3", ElementAction::SetValue("42.5".into())),
         ] {
@@ -2872,6 +2897,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_alt_tab_is_rejected_before_state_consumption() {
+        let fake = FakeAdapter::tree();
+        let runtime = fake_runtime(fake.clone());
+        runtime.execute_call(observe_call()).await.unwrap();
+        let state_id = current_state_id(&runtime);
+
+        let error = runtime
+            .execute_call(ToolCall::Keyboard {
+                state_id: state_id.clone(),
+                focus: KeyboardFocus::Point((10.0, 10.0)),
+                action: KeyboardAction::Press("Alt+Tab".into()),
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "unsupported_action");
+        assert_eq!(error.outcome, ToolOutcome::NotStarted);
+        assert!(!error.retryable);
+        assert_eq!(current_state_id(&runtime), state_id);
+        assert!(fake.state.lock().unwrap().actions.is_empty());
+    }
+
+    #[tokio::test]
     async fn semantic_keyboard_focus_is_confirmed_before_no_click_input() {
         use crate::{
             input::GeneratedInputAction,
@@ -2912,16 +2960,14 @@ mod tests {
         }
 
         let fake = FakeAdapter::tree();
-        if let NodeCapabilities::Inspected(capabilities) = &mut fake
-            .state
-            .lock()
-            .unwrap()
-            .nodes
-            .get_mut(&id("button"))
-            .unwrap()
-            .capabilities
         {
+            let mut state = fake.state.lock().unwrap();
+            let button = state.nodes.get_mut(&id("button")).unwrap();
+            let NodeCapabilities::Inspected(capabilities) = &mut button.capabilities else {
+                panic!("button capabilities should be inspected");
+            };
             capabilities.component = true;
+            button.states.insert("focusable".into());
         }
         let runtime = SemanticRuntime::with_screenshot_provider(
             fake.clone(),
@@ -2959,12 +3005,12 @@ mod tests {
         {
             let mut state = failed_focus.state.lock().unwrap();
             state.semantic_focus_succeeds = false;
-            let NodeCapabilities::Inspected(capabilities) =
-                &mut state.nodes.get_mut(&id("button")).unwrap().capabilities
-            else {
+            let button = state.nodes.get_mut(&id("button")).unwrap();
+            let NodeCapabilities::Inspected(capabilities) = &mut button.capabilities else {
                 panic!("button capabilities should be inspected");
             };
             capabilities.component = true;
+            button.states.insert("focusable".into());
         }
         let failed_runtime = SemanticRuntime::with_screenshot_provider(
             failed_focus.clone(),

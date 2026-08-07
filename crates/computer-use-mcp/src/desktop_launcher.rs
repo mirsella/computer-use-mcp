@@ -69,7 +69,7 @@ pub async fn launch(
     let desktop_id = desktop_id.to_owned();
     let (sender, receiver) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
-        .name("open-computer-use-launch".into())
+        .name("computer-use-mcp-launch".into())
         .spawn(move || {
             let result = launch_blocking(&desktop_id);
             drop(reset);

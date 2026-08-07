@@ -103,11 +103,11 @@ impl CaptureHandle {
         let thread_stop = Arc::clone(&stop);
         let (done_sender, thread_done) = std::sync::mpsc::channel();
         let thread = std::thread::Builder::new()
-            .name("ocu-pipewire".into())
+            .name("computer-use-mcp-pipewire".into())
             .spawn(move || {
                 let result = run_pipewire(fd, target, sender, &thread_stop);
                 if let Err(error) = &result {
-                    eprintln!("open-computer-use: PipeWire capture stopped: {error}");
+                    eprintln!("computer-use-mcp: PipeWire capture stopped: {error}");
                 }
                 status_sender.send_replace(Some(result));
                 let _ = done_sender.send(());
@@ -204,11 +204,11 @@ impl Drop for CaptureHandle {
             if let Some(thread) = self.thread.take()
                 && thread.join().is_err()
             {
-                eprintln!("open-computer-use: PipeWire capture thread panicked during cleanup");
+                eprintln!("computer-use-mcp: PipeWire capture thread panicked during cleanup");
             }
         } else if self.thread.take().is_some() {
             eprintln!(
-                "open-computer-use: PipeWire capture thread did not stop within one second; detaching it"
+                "computer-use-mcp: PipeWire capture thread did not stop within one second; detaching it"
             );
         }
     }
@@ -254,7 +254,7 @@ fn run_pipewire(
     }
     let stream = pw::stream::StreamBox::new(
         &core,
-        &format!("open-computer-use-{}", target.stream_index),
+        &format!("computer-use-mcp-{}", target.stream_index),
         props,
     )
     .map_err(pw_error)?;
@@ -353,7 +353,7 @@ fn run_pipewire(
         }
     }
     if let Err(error) = stream.disconnect() {
-        eprintln!("open-computer-use: failed to disconnect PipeWire stream: {error}");
+        eprintln!("computer-use-mcp: failed to disconnect PipeWire stream: {error}");
     }
     drop(listener);
     Ok(())
@@ -396,11 +396,11 @@ fn invalidate_format(data: &mut StreamUserData) {
 
 fn report_failure(failure: &Mutex<Option<String>>, error: String) {
     let Ok(mut failure) = failure.lock() else {
-        eprintln!("open-computer-use: PipeWire failure state mutex poisoned");
+        eprintln!("computer-use-mcp: PipeWire failure state mutex poisoned");
         return;
     };
     if failure.is_none() {
-        eprintln!("open-computer-use: {error}");
+        eprintln!("computer-use-mcp: {error}");
         *failure = Some(error);
     }
 }
@@ -587,7 +587,7 @@ fn process_frame(stream: &pw::stream::Stream, user_data: &mut StreamUserData) {
     };
     if !header_is_usable(buffer.find_meta::<MetaHeader>().map(MetaHeader::flags)) {
         eprintln!(
-            "open-computer-use: stream {} frame header marks the frame corrupted or empty",
+            "computer-use-mcp: stream {} frame header marks the frame corrupted or empty",
             user_data.stream_index
         );
         return;
@@ -596,7 +596,7 @@ fn process_frame(stream: &pw::stream::Stream, user_data: &mut StreamUserData) {
         Ok(crop) => crop,
         Err(error) => {
             eprintln!(
-                "open-computer-use: stream {} frame has invalid crop metadata: {error}",
+                "computer-use-mcp: stream {} frame has invalid crop metadata: {error}",
                 user_data.stream_index
             );
             return;
@@ -607,7 +607,7 @@ fn process_frame(stream: &pw::stream::Stream, user_data: &mut StreamUserData) {
             Some(transform) => transform,
             None => {
                 eprintln!(
-                    "open-computer-use: stream {} frame has an unknown video transform",
+                    "computer-use-mcp: stream {} frame has an unknown video transform",
                     user_data.stream_index
                 );
                 return;
@@ -619,7 +619,7 @@ fn process_frame(stream: &pw::stream::Stream, user_data: &mut StreamUserData) {
     let datas = buffer.datas_mut();
     if datas.len() != 1 {
         eprintln!(
-            "open-computer-use: stream {} frame has {} data planes; expected one",
+            "computer-use-mcp: stream {} frame has {} data planes; expected one",
             user_data.stream_index,
             datas.len()
         );
@@ -638,7 +638,7 @@ fn process_frame(stream: &pw::stream::Stream, user_data: &mut StreamUserData) {
     }
     if !matches!(data.type_(), DataType::MemFd | DataType::MemPtr) {
         eprintln!(
-            "open-computer-use: stream {} offered unsupported SPA data type {:?}",
+            "computer-use-mcp: stream {} offered unsupported SPA data type {:?}",
             user_data.stream_index,
             data.type_()
         );
@@ -646,7 +646,7 @@ fn process_frame(stream: &pw::stream::Stream, user_data: &mut StreamUserData) {
     }
     if !data.flags().contains(DataFlags::READABLE) {
         eprintln!(
-            "open-computer-use: stream {} shared-memory frame is not marked readable",
+            "computer-use-mcp: stream {} shared-memory frame is not marked readable",
             user_data.stream_index
         );
         return;
@@ -657,7 +657,7 @@ fn process_frame(stream: &pw::stream::Stream, user_data: &mut StreamUserData) {
     }
     if chunk.size() == 0 {
         eprintln!(
-            "open-computer-use: stream {} supplied an empty SPA chunk",
+            "computer-use-mcp: stream {} supplied an empty SPA chunk",
             user_data.stream_index
         );
         return;
@@ -672,7 +672,7 @@ fn process_frame(stream: &pw::stream::Stream, user_data: &mut StreamUserData) {
     };
     let Some(bytes) = data.data() else {
         eprintln!(
-            "open-computer-use: stream {} shared-memory frame was not mapped",
+            "computer-use-mcp: stream {} shared-memory frame was not mapped",
             user_data.stream_index
         );
         return;
@@ -681,7 +681,7 @@ fn process_frame(stream: &pw::stream::Stream, user_data: &mut StreamUserData) {
         Ok(rgba) => rgba,
         Err(error) => {
             eprintln!(
-                "open-computer-use: rejecting incomplete frame for stream {}: {error}",
+                "computer-use-mcp: rejecting incomplete frame for stream {}: {error}",
                 user_data.stream_index
             );
             return;
@@ -691,7 +691,7 @@ fn process_frame(stream: &pw::stream::Stream, user_data: &mut StreamUserData) {
         Some(generation) => generation,
         None => {
             eprintln!(
-                "open-computer-use: frame generation overflow for stream {}",
+                "computer-use-mcp: frame generation overflow for stream {}",
                 user_data.stream_index
             );
             return;

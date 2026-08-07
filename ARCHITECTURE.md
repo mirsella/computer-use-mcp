@@ -5,7 +5,7 @@ describes the implementation boundaries and invariants behind that contract.
 
 ## Boundaries
 
-The `open-computer-use` crate keeps protocol, policy, and desktop access apart:
+The `computer-use-mcp` crate keeps protocol, policy, and desktop access apart:
 
 - `contract` owns the six ordered MCP tools and closed JSON Schemas:
   `list_applications`, `launch_application`, `observe`, `act_on_element`,
@@ -40,9 +40,9 @@ bus address, then opens that address with zbus. It enumerates application roots
 from the AT-SPI registry and obtains each PID from the accessibility bus daemon.
 It neither runs shell helpers nor changes the process environment.
 
-App queries resolve in this order: cached PID, numeric PID, full case-insensitive
-app name, full case-insensitive window title, then case-insensitive app/window
-substring. A tier must have one match.
+App queries resolve in this order: cached PID, a bare numeric PID or emitted
+`PID=<digits>` token, full case-insensitive app name, full case-insensitive window
+title, then case-insensitive app/window substring. A tier must have one match.
 Window selection prefers active, then showing, then the first viable top-level
 window. Later safety checks use exact window identity rather than requiring an
 AT-SPI active flag or global window position, neither of which KDE exposes
@@ -64,8 +64,9 @@ prior state. Any mutation invalidates every retained screenshot mapping because
 the monitor pixels may have changed. Semantic actions require the exact opaque `state_id` and the same
 current accessible object, role, and name; replacement objects or replaced IDs
 require `observe`.
-Explicit element focus targets the freshly revalidated accessible object through
-AT-SPI `Component.GrabFocus`; invoke never falls back to focus.
+Explicit element focus requires both the AT-SPI Component interface and
+`focusable` state, then targets the freshly revalidated object through
+`Component.GrabFocus`; invoke never falls back to focus.
 
 ## Action flow
 
@@ -93,8 +94,8 @@ GIO launch; it clears the observation cache and returns an acknowledgement, not 
 observation. Element `invoke` uses a recognized primary AT-SPI action. If and
 only if the element exposes one action with an empty name and description, it
 invokes index zero; multiple anonymous or named but unrecognized actions fail closed.
-`named`, `focus`, and `set_value` are semantic-only; focus uses
-`Component.GrabFocus` on the exact current object.
+`named`, `focus`, and `set_value` are semantic-only and target the exact current
+object.
 Structured observations report each element's inspected invoke, focus,
 named-action, and text-or-number set-value capabilities. Coordinate pointer movement,
 click, drag, discrete scroll, key chords, and literal text use EIS only. Scroll takes full-monitor
@@ -123,7 +124,7 @@ One RemoteDesktop session owns one monitor ScreenCast selection, requests
 keyboard and pointer devices, and records the exact `Start` grant. The server
 requests persistence mode `2` by default and stores each replacement restore
 token privately for KDE to reuse; the portal can still reject restoration or
-prompt again. The environment variable `OPEN_COMPUTER_USE_PERSIST_PORTAL=0`
+prompt again. The environment variable `COMPUTER_USE_MCP_PERSIST_PORTAL=0`
 disables persistence. The server
 subscribes generically to portal Request responses before each method call,
 filters by the returned path, closes dropped requests, distinguishes user cancel
@@ -167,20 +168,18 @@ PNG cannot predate the accessibility snapshot it accompanies.
 The mapper normalizes each PNG axis directly into the selected private EIS
 region, so differing dimensions need no guessed desktop-wide scale. The cache
 records PID, app/window identity, AT-SPI and portal generations, session and
-stream identity, PipeWire serial and frame metadata, PNG size, and mapping ID.
+stream identity, PipeWire serial and frame metadata, PNG size, and stream route.
 After frame acquisition, AT-SPI discovery must
 still report the exact PID, app object, and window object before cache binding.
 
-Before generated input, the portal `mapping_id` must match exactly one resumed
-EIS absolute region. EIS coordinates are compositor-private and are not compared
-to portal desktop positions or dimensions. Streams without `mapping_id` remain
-observable but cannot safely authorize generated input.
-The first selected device, resume generation, origin, and dimensions remain
-bound for the portal session; later changes fail closed.
-Ambiguous or missing regions fail
-closed. EIS frame timestamps use the
-system `CLOCK_MONOTONIC` microsecond epoch. Keyboard state remains unavailable
-until a post-resume connection sync callback confirms the latest modifier state.
+Generated input routes by `mapping_id` when present. If KDE omits it, the
+stream's nonnegative, nonzero position and logical size must match exactly one
+resumed EIS absolute region. Missing or ambiguous routes and later changes to the
+selected device, resume generation, origin, dimensions, or mapping ID fail
+closed. EIS coordinates remain compositor-private outside this exact-geometry
+fallback. EIS frame timestamps use the system `CLOCK_MONOTONIC` microsecond
+epoch. On keyboard resume, the sender assumes zero modifiers until a connection
+sync confirms any directly resulting modifier events.
 One emulation transaction spans each complete pointer or keyboard action. A
 point-focused keyboard transaction includes its focus click and a short
 compositor settle delay before key emission; an element-focused transaction

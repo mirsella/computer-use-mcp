@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use open_computer_use::{
+use computer_use_mcp::{
     contract::{TOOL_NAMES, tool_definitions},
     runtime::ToolOutput,
 };
@@ -129,14 +129,6 @@ fn tools_have_exact_order_and_schemas() {
         pointer["properties"]["action"]["oneOf"][3]["properties"]["direction"]["enum"],
         json!(["up", "down", "left", "right"])
     );
-    for action in pointer["properties"]["action"]["oneOf"].as_array().unwrap() {
-        for coordinate in ["x", "y", "from_x", "from_y", "to_x", "to_y"] {
-            if !action["properties"][coordinate].is_null() {
-                assert_eq!(action["properties"][coordinate]["minimum"], 0);
-            }
-        }
-    }
-
     let keyboard = schema("keyboard");
     assert_object(
         &keyboard,
@@ -159,10 +151,6 @@ fn tools_have_exact_order_and_schemas() {
             ("type", &["type", "text"], &["type", "text"]),
         ],
     );
-    let key_pattern = keyboard["properties"]["action"]["oneOf"][0]["properties"]["key"]["pattern"]
-        .as_str()
-        .unwrap();
-    assert!(key_pattern.contains("[Aa][Ll][Tt]") && key_pattern.contains("[Tt][Aa][Bb]"));
 }
 
 #[test]

@@ -1,6 +1,6 @@
 # MCP guide
 
-This document is the user-facing contract for the `open-computer-use mcp`
+This document is the user-facing contract for the `computer-use-mcp mcp`
 server. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and
 [SECURITY.md](SECURITY.md) for the threat model.
 
@@ -25,7 +25,7 @@ approval for each later tool call.
 The MCP transport is stdio only. Configure the host to execute:
 
 ```text
-open-computer-use mcp
+computer-use-mcp mcp
 ```
 
 The host owns the child process's stdin and stdout. Do not run `mcp`
@@ -44,7 +44,7 @@ functionality; retrying a tool does not open another chooser.
 ### OpenCode configuration
 
 ```sh
-opencode mcp add computer_use -- "$(command -v open-computer-use)" mcp
+opencode mcp add computer_use -- "$(command -v computer-use-mcp)" mcp
 ```
 
 Before testing the connection, edit the configuration file path printed by
@@ -57,7 +57,7 @@ from this server:
   "mcp": {
     "computer_use": {
       "type": "local",
-      "command": ["/absolute/path/to/open-computer-use", "mcp"],
+      "command": ["/absolute/path/to/computer-use-mcp", "mcp"],
       "enabled": true,
       "timeout": 90000
     }
@@ -68,7 +68,7 @@ from this server:
 }
 ```
 
-Use the path printed by `command -v open-computer-use`. OpenCode's default MCP
+Use the path printed by `command -v computer-use-mcp`. OpenCode's default MCP
 timeout is shorter than the server's 60-second portal approval deadline. The
 longer timeout also covers initial tool discovery and normal requests that wait
 for a fresh screenshot.
@@ -94,19 +94,19 @@ a broader wildcard rule, place `computer_use_*` after it.
 
 ## Portal restore token
 
-`open-computer-use init` opens a temporary portal session and closes it after
+`computer-use-mcp init` opens a temporary portal session and closes it after
 approval. It succeeds only if KDE returns a reusable restore token. KDE may
 still show the chooser after revocation, expiration, or a display change.
 
 The private token file is
-`$XDG_STATE_HOME/open-computer-use/portal-restore-token`, or
-`~/.local/state/open-computer-use/portal-restore-token` when `XDG_STATE_HOME` is
+`$XDG_STATE_HOME/computer-use-mcp/portal-restore-token`, or
+`~/.local/state/computer-use-mcp/portal-restore-token` when `XDG_STATE_HOME` is
 unset. The process claims and removes the file before reuse, then saves the
 replacement token returned by a successful portal start.
 
-Set `OPEN_COMPUTER_USE_PERSIST_PORTAL=0` before MCP startup to avoid reading or
+Set `COMPUTER_USE_MCP_PERSIST_PORTAL=0` before MCP startup to avoid reading or
 storing a token for that run. This setting does not delete an existing file or
-revoke a portal-side grant. `open-computer-use init` deliberately forces
+revoke a portal-side grant. `computer-use-mcp init` deliberately forces
 persistence and does not honor this opt-out.
 
 ## Request rules
@@ -120,7 +120,8 @@ nested action and focus variant. Unknown fields are rejected.
 - An `element_id` may be a JSON integer or a decimal string. It is scoped to the
   observation that returned it. Results always encode it as a string.
 - App and action names are case-sensitive where the schema or tool description
-  says they are.
+  says they are. For `named`, pass the exact `named_actions[].name`; do not append
+  its description or copy combined display text.
 
 The examples below show tool arguments, not full JSON-RPC request envelopes.
 
@@ -154,7 +155,8 @@ accepts no command, path, or arguments, clears the observation cache, and return
 ### `observe`
 
 Observe by PID, full case-insensitive app name or window title, or a unique
-case-insensitive substring. A PID is also a JSON string. Only `target` is
+case-insensitive substring. A PID is also a JSON string, and the `PID=<digits>`
+token emitted by `list_applications` is accepted unchanged. Only `target` is
 required.
 
 ```json
@@ -202,7 +204,7 @@ common fields are `state_id`, `element_id`, and one of these action objects:
 | --- | --- |
 | Primary action | `{"type":"invoke"}` |
 | AT-SPI focus | `{"type":"focus"}` |
-| Advertised named action | `{"type":"named","name":"show menu"}` |
+| Advertised named action | `{"type":"named","name":"menu"}` |
 | Editable text or numeric value | `{"type":"set_value","value":"42"}` |
 
 Semantic element actions can work when `screenshot.ready` is `false`. They
@@ -234,7 +236,11 @@ Point focus left-clicks the PNG coordinate before sending the key action:
 {"state_id":"s-0000000000000001","focus":{"x":320,"y":180},"action":{"type":"press","key":"Ctrl+L"}}
 ```
 
-Element focus uses AT-SPI and sends no pointer click:
+Arrow keys accept `Left`, `Right`, `Up`, and `Down` as well as the common
+`ArrowLeft`, `ArrowRight`, `ArrowUp`, and `ArrowDown` aliases.
+
+Element focus is advertised only for elements with both the AT-SPI Component
+interface and `focusable` state, and sends no pointer click:
 
 ```json
 {"state_id":"s-0000000000000001","focus":{"element_id":"18"},"action":{"type":"type","text":"hello"}}
@@ -244,7 +250,9 @@ Both modes require a ready screenshot mapping and live generated input. Element
 focus freshly relocates the object, calls `Component.GrabFocus`, and proceeds
 only if the element reports focused and its exact window reports active. This
 cannot prove compositor seat focus without a race. Do not type concurrently or
-use focus-switch shortcuts. Chords containing both Alt and Tab are rejected.
+use focus-switch shortcuts. Chords containing both Alt and Tab return a
+non-retryable `unsupported_action`; use an advertised focus target or
+`launch_application` instead.
 
 ## Observation results
 
@@ -316,19 +324,21 @@ visual target may have moved or become occluded.
 
 Element frames use `atspi_window_coordinates`. They are for semantic inspection
 only and cannot be converted into PNG points. The server maps PNG fractions into
-the compositor-private EIS region associated with the approved stream. If the
-portal does not supply a `mapping_id`, observation can continue but generated
-input is unavailable.
+the compositor-private EIS region associated with the approved stream. If KDE
+does not supply a `mapping_id`, the server requires the stream position and size
+to match exactly one EIS region; otherwise observation can continue but
+generated input is unavailable.
 
 ## Errors and outcomes
 
 There are two MCP failure channels:
 
 - An unknown tool or malformed `tools/call` envelope produces a JSON-RPC error.
-- Invalid arguments for a known tool and runtime failures produce a normal
+- Invalid or unsupported actions for a known tool and runtime failures produce a normal
   response containing a tool result with `isError: true`. It includes text and,
   on supported versions, structured `code`, `message`, `outcome`, `retryable`,
-  and `recovery` fields. Invalid arguments use outcome `not_started`.
+  and `recovery` fields. Invalid and unsupported actions use outcome `not_started`;
+  unsupported actions are non-retryable policy rejections.
 
 Treat `outcome` as follows:
 
@@ -344,7 +354,7 @@ re-enable the MCP instead of repeating the same state.
 
 ## Direct call command
 
-`open-computer-use call FILE` is a diagnostic batch interface, not a JSON-RPC
+`computer-use-mcp call FILE` is a diagnostic batch interface, not a JSON-RPC
 MCP transport. Use `-` for stdin. The input is one call object or a static array:
 
 ```json
@@ -366,10 +376,10 @@ MCP host for observe-then-act workflows.
 ## Troubleshooting
 
 ```sh
-open-computer-use doctor
-open-computer-use list-apps
-open-computer-use snapshot APP
-open-computer-use init
+computer-use-mcp doctor
+computer-use-mcp list-apps
+computer-use-mcp snapshot APP
+computer-use-mcp init
 opencode mcp list
 ```
 

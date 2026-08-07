@@ -17,7 +17,7 @@ pub const TOOL_NAMES: [&str; 6] = [
     "keyboard",
 ];
 
-pub const SERVER_INSTRUCTIONS: &str = "Discover targets with `list_applications`, then call `observe` before acting. Pass returned `state_id` and element IDs unchanged; successful actions return a replacement observation. Use only advertised element capabilities. Pointer and point-focused keyboard coordinates use the returned PNG, not AT-SPI frames, and are not confined to the target window. Both keyboard focus modes require `screenshot.ready` and live generated input; `act_on_element` may work without capture. Stop if the target is not visibly reachable. Portal approval is not authorization for a specific action; honor the host's user confirmation.";
+pub const SERVER_INSTRUCTIONS: &str = "Discover targets with `list_applications`, then call `observe` before acting. Pass returned `state_id` and element IDs unchanged; successful actions return a replacement observation. Use only advertised element capabilities and exact `named_actions[].name` values. Pointer and point-focused keyboard coordinates use the returned PNG bounds, never AT-SPI frames, and are not confined to the target window. Both keyboard focus modes require `screenshot.ready` and live generated input; `act_on_element` may work without capture. Keyboard does not switch desktop windows: never use or retry Alt+Tab; use an advertised focus capability or `launch_application`. Stop if the target is not visibly reachable. Portal approval is not authorization for a specific action; honor the host's user confirmation.";
 
 pub fn tool_definitions() -> Vec<Tool> {
     vec![
@@ -43,7 +43,7 @@ pub fn tool_definitions() -> Vec<Tool> {
         ),
         tool(
             "observe",
-            "Observe one running target by PID, app name, window title, or unique substring. Optionally select a full, visible, or interactive view and narrow the tree with a nonblank query.",
+            "Observe one running target by a bare PID or emitted PID=<digits> token, app name, window title, or unique substring. Optionally select a full, visible, or interactive view and narrow the tree with a nonblank query.",
             object(
                 json!({
                     "target": {"type": "string", "pattern": ".*\\S.*"},
@@ -65,7 +65,7 @@ pub fn tool_definitions() -> Vec<Tool> {
                 json!({
                     "state_id": state_id(),
                     "element_id": element_id(),
-                    "action": {"description": "Object, never a string. Use {\"type\":\"invoke\"}, {\"type\":\"focus\"}, {\"type\":\"named\",\"name\":\"...\"}, or {\"type\":\"set_value\",\"value\":\"...\"}.", "oneOf": [
+                    "action": {"description": "Object, never a string. Use {\"type\":\"invoke\"}, {\"type\":\"focus\"}, {\"type\":\"named\",\"name\":\"...\"}, or {\"type\":\"set_value\",\"value\":\"...\"}. A named action's name must be the exact advertised named_actions[].name, without its description.", "oneOf": [
                         action_object("invoke", json!({}), &[]),
                         action_object("focus", json!({}), &[]),
                         action_object("named", json!({"name": {"type": "string", "pattern": ".*\\S.*"}}), &["name"]),
@@ -103,7 +103,7 @@ pub fn tool_definitions() -> Vec<Tool> {
         ),
         tool(
             "keyboard",
-            "Focus a visible screenshot point by left-clicking it, or semantically focus an observed element_id, then press a key/chord or type literal text.",
+            "Focus a visible screenshot point by left-clicking it, or semantically focus an observed element_id, then press a key/chord or type literal text. Desktop window switching with Alt+Tab is unsupported; use an advertised focus capability or launch_application instead.",
             object(
                 json!({
                     "state_id": state_id(),
@@ -112,7 +112,7 @@ pub fn tool_definitions() -> Vec<Tool> {
                         object(json!({"element_id": element_id()}), &["element_id"])
                     ]},
                     "action": {"description": "Object: {\"type\":\"press\",\"key\":\"Ctrl+L\"} or {\"type\":\"type\",\"text\":\"...\"}.", "oneOf": [
-                        action_object("press", json!({"key": {"type": "string", "pattern": "^(?!(?=.*(?:^|\\+)\\s*[Aa][Ll][Tt]\\s*(?:\\+|$))(?=.*(?:^|\\+)\\s*[Tt][Aa][Bb]\\s*(?:\\+|$))).*\\S.*$", "description": "Examples: Ctrl+L, Enter, F5, é. Chords containing both Alt and Tab are rejected."}}), &["key"]),
+                        action_object("press", json!({"key": {"type": "string", "pattern": ".*\\S.*", "description": "Examples: Ctrl+L, Enter, ArrowDown, F5, é. ArrowLeft, ArrowRight, ArrowUp, and ArrowDown are aliases for Left, Right, Up, and Down. Chords containing both Alt and Tab return a non-retryable unsupported_action."}}), &["key"]),
                         action_object("type", json!({"text": {"type": "string"}}), &["text"])
                     ]}
                 }),
@@ -218,7 +218,17 @@ fn observation_view_names() -> [&'static str; 3] {
 fn coordinates(names: &[&str]) -> Value {
     let properties = names
         .iter()
-        .map(|name| ((*name).to_owned(), json!({"type": "number", "minimum": 0})))
+        .map(|name| {
+            let axis = if name.ends_with('x') { "width" } else { "height" };
+            (
+                (*name).to_owned(),
+                json!({
+                    "type": "number",
+                    "minimum": 0,
+                    "description": format!("Screenshot PNG coordinate; must be less than screenshot.{axis} from the same observation.")
+                }),
+            )
+        })
         .collect();
     Value::Object(properties)
 }

@@ -16,7 +16,7 @@ use crate::{
     validation::validate_call,
 };
 
-const HELP: &str = "Open Computer Use for Linux Wayland\n\nUsage:\n  open-computer-use [command]\n\nCommands:\n  init          Ask KDE to approve one monitor and save its restore token.\n  mcp           Restore or request KDE approval, then start the stdio MCP server.\n  call FILE     Execute one call object or an array of calls in one stateful runtime; use - for stdin.\n  list-apps     List live apps with accessible top-level windows.\n  snapshot APP  Print a bounded text-only AT-SPI snapshot.\n  doctor        Report Wayland, portal, PipeWire, AT-SPI, and input prerequisites without prompting.\n  help          Show this help.\n  version       Print the CLI version.\n\nCall input uses {\"name\":\"list_applications\",\"arguments\":{\"scope\":\"running\"}} objects and prints one standard MCP result per line. The MCP command requests KDE approval at startup. Run init only to approve it separately before enabling the MCP. KDE may ask again after revocation or display changes.\n";
+const HELP: &str = "Computer Use MCP for Linux Wayland\n\nUsage:\n  computer-use-mcp [command]\n\nCommands:\n  init          Ask KDE to approve one monitor and save its restore token.\n  mcp           Restore or request KDE approval, then start the stdio MCP server.\n  call FILE     Execute one call object or an array of calls in one stateful runtime; use - for stdin.\n  list-apps     List live apps with accessible top-level windows.\n  snapshot APP  Print a bounded text-only AT-SPI snapshot.\n  doctor        Report Wayland, portal, PipeWire, AT-SPI, and input prerequisites without prompting.\n  help          Show this help.\n  version       Print the CLI version.\n\nCall input uses {\"name\":\"list_applications\",\"arguments\":{\"scope\":\"running\"}} objects and prints one standard MCP result per line. The MCP command requests KDE approval at startup. Run init only to approve it separately before enabling the MCP. KDE may ask again after revocation or display changes.\n";
 
 pub async fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), CliError> {
     let arguments: Vec<_> = arguments.into_iter().collect();
@@ -40,7 +40,7 @@ pub async fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), CliE
         "init" => {
             require_no_extra_arguments(&arguments)?;
             eprintln!(
-                "open-computer-use: KDE will ask you to approve exactly one monitor plus keyboard and pointer access"
+                "computer-use-mcp: KDE will ask you to approve exactly one monitor plus keyboard and pointer access"
             );
             let PortalApproval {
                 session,
@@ -159,7 +159,7 @@ async fn run_calls(source: &str) -> Result<(), CliError> {
         (Ok(()), shutdown) => shutdown,
         (Err(error), Ok(())) => Err(error),
         (Err(error), Err(shutdown)) => {
-            eprintln!("open-computer-use: {shutdown}");
+            eprintln!("computer-use-mcp: {shutdown}");
             Err(error)
         }
     }
@@ -230,7 +230,7 @@ fn parse_call(value: Value, index: usize) -> Result<(String, JsonObject<String, 
 }
 
 async fn doctor() {
-    println!("Open Computer Use doctor");
+    println!("Computer Use MCP doctor");
     println!("This check never opens a portal session or prompts for consent.");
 
     let session_type = std::env::var("XDG_SESSION_TYPE").ok();
@@ -298,7 +298,7 @@ async fn doctor() {
     println!("\n[Portal approval and EIS input]");
     println!("Status: NOT TESTED");
     println!("Reason: verifying monitor approval and EIS routing would require consent.");
-    println!("Action: run `open-computer-use init`, then use the MCP server.");
+    println!("Action: run `computer-use-mcp init`, then use the MCP server.");
 }
 
 fn print_doctor_result<T, E: std::fmt::Display>(result: Result<T, E>) {

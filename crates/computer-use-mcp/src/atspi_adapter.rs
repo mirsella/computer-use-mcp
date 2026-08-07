@@ -111,14 +111,14 @@ impl AtspiAdapter {
         for root in roots {
             if root.is_null() {
                 eprintln!(
-                    "open-computer-use: AT-SPI registry returned a null application root; skipping it"
+                    "computer-use-mcp: AT-SPI registry returned a null application root; skipping it"
                 );
                 continue;
             }
             let object = match object_id(&root) {
                 Ok(object) => object,
                 Err(error) => {
-                    eprintln!("open-computer-use: invalid AT-SPI application identity: {error}");
+                    eprintln!("computer-use-mcp: invalid AT-SPI application identity: {error}");
                     continue;
                 }
             };
@@ -127,7 +127,7 @@ impl AtspiAdapter {
                 Ok(None) => {}
                 Err(error) => {
                     eprintln!(
-                        "open-computer-use: accessible application vanished or is invalid; skipping it: {error}"
+                        "computer-use-mcp: accessible application vanished or is invalid; skipping it: {error}"
                     );
                 }
             }
@@ -159,7 +159,7 @@ impl AtspiAdapter {
         for child in children {
             if child.is_null() {
                 eprintln!(
-                    "open-computer-use: application returned a null top-level child; skipping it"
+                    "computer-use-mcp: application returned a null top-level child; skipping it"
                 );
                 continue;
             }
@@ -169,7 +169,7 @@ impl AtspiAdapter {
                 Ok(None) => {}
                 Err(error) => {
                     eprintln!(
-                        "open-computer-use: top-level AT-SPI object became stale; skipping it: {error}"
+                        "computer-use-mcp: top-level AT-SPI object became stale; skipping it: {error}"
                     );
                 }
             }
@@ -356,9 +356,7 @@ impl AtspiAdapter {
             SemanticAction::GrabFocus => {
                 let proxy = component_proxy(connection, object).await?;
                 if !proxy.grab_focus().await.map_err(atspi_call_error)? {
-                    return Err(runtime_error(
-                        "AT-SPI window focus request reported failure",
-                    ));
+                    return Err(runtime_error("AT-SPI Component.GrabFocus reported failure"));
                 }
             }
             SemanticAction::ReplaceText(value) => {
@@ -508,7 +506,7 @@ async fn read_text_metadata(
         }
         Some(count) => {
             eprintln!(
-                "open-computer-use: optional AT-SPI metadata unavailable: object={}{} interface=Text member=CharacterCount error=negative character count {count}",
+                "computer-use-mcp: optional AT-SPI metadata unavailable: object={}{} interface=Text member=CharacterCount error=negative character count {count}",
                 object.bus_name, object.path
             );
             None
@@ -565,7 +563,7 @@ fn optional<T, E: std::fmt::Display>(
         Ok(value) => Some(value),
         Err(error) => {
             eprintln!(
-                "open-computer-use: optional AT-SPI metadata unavailable: object={}{} interface={interface} member={member} error={error}",
+                "computer-use-mcp: optional AT-SPI metadata unavailable: object={}{} interface={interface} member={member} error={error}",
                 object.bus_name, object.path
             );
             None

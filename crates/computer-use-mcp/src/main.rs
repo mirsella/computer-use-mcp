@@ -1,4 +1,4 @@
-use open_computer_use::cli;
+use computer_use_mcp::cli;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
