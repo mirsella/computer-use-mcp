@@ -94,6 +94,13 @@ pub enum KeyboardAction {
 }
 
 impl ToolCall {
+    pub(crate) fn waits_for_desktop_session(&self) -> bool {
+        !matches!(
+            self,
+            Self::ListApplications { .. } | Self::LaunchApplication { .. }
+        )
+    }
+
     pub(crate) fn validate_policy(&self) -> Result<(), RuntimeError> {
         let Self::Keyboard {
             action: KeyboardAction::Press(key),

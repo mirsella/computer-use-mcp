@@ -3,10 +3,12 @@ members = ["crates/computer-use-mcp"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/mirsella/computer-use-mcp"
 
 [workspace.dependencies]
 ashpd = { version = "=0.13.13", default-features = false, features = ["remote_desktop", "screencast", "tokio"] }

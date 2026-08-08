@@ -81,10 +81,10 @@ opencode mcp list
 ```
 
 The status check starts enabled servers temporarily and may open the portal
-chooser. Normal OpenCode use starts another process. Portal approval happens
-before MCP initialization, so the 90-second timeout is required. Restart or
-re-enable the MCP after revocation or stream loss; retrying a tool cannot create
-a new portal session.
+chooser. Normal OpenCode use starts another process. The MCP protocol becomes
+available immediately while portal approval and capture setup continue in the
+background. Restart or re-enable the MCP after denial, timeout, revocation, or
+stream loss; retrying a tool cannot create a new portal session.
 
 ## Direct commands
 

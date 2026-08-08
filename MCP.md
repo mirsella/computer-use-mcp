@@ -33,13 +33,13 @@ interactively or wrap it with a command that writes to stdout. Stdout carries
 newline-delimited UTF-8 JSON-RPC messages, one message per line with no embedded
 newlines. Startup messages and diagnostics go to stderr.
 
-Before starting the MCP protocol, the process asks KDE to restore or approve
-one monitor plus pointer and keyboard access. Tools are not available until the
-portal session and PipeWire capture are ready. If the chooser is denied or
-times out, startup fails. If the grant is revoked or the stream dies later,
-screenshots and generated input become unavailable. AT-SPI reads and semantic
-actions are not revoked. Restart the MCP process to restore portal-backed
-functionality; retrying a tool does not open another chooser.
+The MCP protocol starts immediately while one background task asks KDE to
+restore or approve one monitor plus pointer and keyboard access and prepares
+PipeWire capture. Tool discovery, application listing, and launching do not
+wait for it. Observe and action calls wait for that same task without blocking
+those independent calls. Denial, timeout, revocation, or stream loss makes the
+portal-backed functionality unavailable for the process lifetime; retrying a
+tool does not open another chooser. Restart the MCP process to try again.
 
 ### OpenCode configuration
 
@@ -48,8 +48,7 @@ opencode mcp add computer_use -- "$(command -v computer-use-mcp)" mcp
 ```
 
 Before testing the connection, edit the configuration file path printed by
-`opencode mcp add`. Set a 90-second timeout and require approval for every tool
-from this server:
+`opencode mcp add` and require approval for every tool from this server:
 
 ```jsonc
 {
@@ -68,10 +67,9 @@ from this server:
 }
 ```
 
-Use the path printed by `command -v computer-use-mcp`. OpenCode's default MCP
-timeout is shorter than the server's 60-second portal approval deadline. The
-longer timeout also covers initial tool discovery and normal requests that wait
-for a fresh screenshot.
+Use the path printed by `command -v computer-use-mcp`. The handshake is
+immediate, but the 90-second request timeout covers the first screenshot-backed
+call while portal initialization has its 60-second deadline.
 
 Then test the connection and inspect status:
 
@@ -386,7 +384,7 @@ opencode mcp list
 `doctor`, `list-apps`, and `snapshot` do not request portal consent. `doctor`
 checks prerequisites, not portal approval, capture, routing, or target access.
 `init` has no deadline; cancel and retry it from the graphical session if the
-portal stalls. MCP startup has a 60-second approval deadline.
+portal stalls. Background portal initialization has a 60-second approval deadline.
 
 | Symptom | Check or recovery |
 | --- | --- |

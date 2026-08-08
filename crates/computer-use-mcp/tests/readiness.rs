@@ -24,6 +24,7 @@ use rmcp::{
     transport::{IntoTransport, Transport},
 };
 use serde_json::{Value, json};
+use tokio::sync::watch;
 
 const RUNTIME_ERROR_TEXT: &str = "fake runtime unavailable\nCode: fake_runtime_unavailable\nOutcome: not_started\nRetryable: true\nRecovery: Call observe for current state, then retry only if the requested action is still needed.";
 const INVALID_ARGUMENTS_TEXT: &str = "missing required argument \"type\"\nCode: invalid_arguments\nOutcome: not_started\nRetryable: true\nRecovery: Correct the arguments using the tool input schema, then retry.";
@@ -37,19 +38,30 @@ struct FakeRuntimeState {
     calls: Mutex<Vec<ToolCall>>,
     fail_next: AtomicBool,
     png_base64: String,
+    starts: AtomicUsize,
+    ready: watch::Sender<bool>,
     shutdowns: AtomicUsize,
 }
 
 impl FakeRuntime {
     fn new(png_base64: String) -> Self {
+        let (ready, _) = watch::channel(true);
         Self {
             state: Arc::new(FakeRuntimeState {
                 calls: Mutex::new(Vec::new()),
                 fail_next: AtomicBool::new(false),
                 png_base64,
+                starts: AtomicUsize::new(0),
+                ready,
                 shutdowns: AtomicUsize::new(0),
             }),
         }
+    }
+
+    fn gated() -> Self {
+        let runtime = Self::new(String::new());
+        runtime.state.ready.send_replace(false);
+        runtime
     }
 
     fn calls(&self) -> Vec<ToolCall> {
@@ -66,6 +78,19 @@ impl FakeRuntime {
 }
 
 impl DesktopRuntime for FakeRuntime {
+    fn start(&self) {
+        self.state.starts.fetch_add(1, Ordering::AcqRel);
+    }
+
+    async fn wait_for_desktop_session(&self) {
+        self.state
+            .ready
+            .subscribe()
+            .wait_for(|ready| *ready)
+            .await
+            .expect("fake readiness sender is retained");
+    }
+
     fn execute(
         &self,
         call: ToolCall,
@@ -108,59 +133,111 @@ impl DesktopRuntime for FakeRuntime {
 }
 
 #[tokio::test]
+async fn handshake_and_independent_calls_bypass_desktop_session_waiters() {
+    let runtime = FakeRuntime::gated();
+    let (client_transport, server) = spawn_server(&runtime);
+    let mut client = IntoTransport::<RoleClient, _, _>::into_transport(client_transport);
+
+    let initialized = tokio::time::timeout(
+        Duration::from_secs(1),
+        initialize(&mut client, "2025-11-25", "background-startup-test"),
+    )
+    .await
+    .expect("handshake must not wait for desktop session");
+    assert_eq!(initialized["id"], 1);
+
+    send_json(
+        &mut client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "observe", "arguments": {"target": "Editor"}},
+        }),
+    )
+    .await;
+    send_json(
+        &mut client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {"name": "observe", "arguments": {"target": "Cancelled"}},
+        }),
+    )
+    .await;
+    send_json(
+        &mut client,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": 4, "reason": "test readiness cancellation"},
+        }),
+    )
+    .await;
+
+    for request in [
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "list_applications", "arguments": {"scope": "running"}},
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {"name": "launch_application", "arguments": {"desktop_id": "org.example.Editor.desktop"}},
+        }),
+    ] {
+        send_json(&mut client, request).await;
+    }
+
+    let mut independent = Vec::new();
+    for _ in 0..2 {
+        let response = tokio::time::timeout(Duration::from_secs(1), receive_json(&mut client))
+            .await
+            .expect("list and launch must bypass desktop initialization");
+        independent.push(response["id"].as_u64().unwrap());
+    }
+    independent.sort_unstable();
+    assert_eq!(independent, [3, 5]);
+    assert_eq!(runtime.state.starts.load(Ordering::Acquire), 1);
+    assert_eq!(runtime.state.calls.lock().unwrap().len(), 2);
+
+    runtime.state.ready.send_replace(true);
+    let observed = tokio::time::timeout(Duration::from_secs(1), receive_json(&mut client))
+        .await
+        .expect("observe should continue after desktop initialization");
+    assert_eq!(observed["id"], 2);
+    assert_eq!(runtime.state.calls.lock().unwrap().len(), 3);
+
+    stop_server(client, server, &runtime).await;
+}
+
+#[tokio::test]
 async fn mcp_agent_path_dispatches_every_tool_and_preserves_error_boundaries() {
     let png = test_png();
     let runtime = FakeRuntime::new(STANDARD.encode(&png));
-    let server_runtime = runtime.clone();
-    let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
-    let server = tokio::spawn(async move {
-        let service = ComputerUseMcpServer::<FakeRuntime>::new(Arc::new(server_runtime.clone()))
-            .serve(server_transport)
-            .await
-            .expect("initialize server");
-        let waiting = service.waiting().await;
-        let shutdown = server_runtime.shutdown().await;
-        waiting.expect("wait for server");
-        shutdown.expect("shut down fake runtime");
-    });
+    let (client_transport, server) = spawn_server(&runtime);
     let mut client = IntoTransport::<RoleClient, _, _>::into_transport(client_transport);
 
-    client
-        .send(message(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-06-18",
-                "capabilities": {},
-                "clientInfo": {"name": "readiness-test", "version": "0.0.0"},
-            },
-        })))
-        .await
-        .expect("send initialize");
-    let initialized = response_value(client.receive().await.expect("initialize response"));
+    let initialized = initialize(&mut client, "2025-06-18", "readiness-test").await;
     assert_eq!(initialized["id"], 1);
     assert_eq!(
         initialized["result"]["serverInfo"]["name"],
         "computer-use-mcp"
     );
-    client
-        .send(message(json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized",
-        })))
-        .await
-        .expect("send initialized notification");
-
-    client
-        .send(message(json!({
+    send_json(
+        &mut client,
+        json!({
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/list",
-        })))
-        .await
-        .expect("send tools/list");
-    let listed = response_value(client.receive().await.expect("tools/list response"));
+        }),
+    )
+    .await;
+    let listed = receive_json(&mut client).await;
     let listed_names: Vec<_> = listed["result"]["tools"]
         .as_array()
         .expect("tools array")
@@ -173,16 +250,17 @@ async fn mcp_agent_path_dispatches_every_tool_and_preserves_error_boundaries() {
     let mut observe_response = None;
     for (offset, (name, arguments)) in calls.into_iter().enumerate() {
         let id = 10 + offset as u64;
-        client
-            .send(message(json!({
+        send_json(
+            &mut client,
+            json!({
                 "jsonrpc": "2.0",
                 "id": id,
                 "method": "tools/call",
                 "params": {"name": name, "arguments": arguments},
-            })))
-            .await
-            .expect("send valid tool call");
-        let response = response_value(client.receive().await.expect("valid tool response"));
+            }),
+        )
+        .await;
+        let response = receive_json(&mut client).await;
         assert_eq!(response["id"], id, "response for {name}");
         assert_success(&response, name);
         if name == "observe" {
@@ -198,22 +276,24 @@ async fn mcp_agent_path_dispatches_every_tool_and_preserves_error_boundaries() {
         &png,
     );
 
-    client
-        .send(message(json!({
+    send_json(
+        &mut client,
+        json!({
             "jsonrpc": "2.0",
             "id": 30,
             "method": "tools/call",
             "params": {"name": "not_a_tool", "arguments": {}},
-        })))
-        .await
-        .expect("send unknown tool call");
-    let unknown = response_value(client.receive().await.expect("unknown tool response"));
+        }),
+    )
+    .await;
+    let unknown = receive_json(&mut client).await;
     assert_eq!(unknown["id"], 30);
     assert_eq!(unknown["error"]["code"], -32602);
     assert!(unknown.get("result").is_none());
 
-    client
-        .send(message(json!({
+    send_json(
+        &mut client,
+        json!({
             "jsonrpc": "2.0",
             "id": 31,
             "method": "tools/call",
@@ -221,10 +301,10 @@ async fn mcp_agent_path_dispatches_every_tool_and_preserves_error_boundaries() {
                 "name": "pointer",
                 "arguments": {"state_id": "s-0123456789abcdef", "action": {}},
             },
-        })))
-        .await
-        .expect("send invalid arguments");
-    let invalid = response_value(client.receive().await.expect("invalid arguments response"));
+        }),
+    )
+    .await;
+    let invalid = receive_json(&mut client).await;
     assert_eq!(invalid["id"], 31);
     assert!(invalid.get("error").is_none());
     assert_eq!(invalid["result"]["isError"], true);
@@ -238,8 +318,9 @@ async fn mcp_agent_path_dispatches_every_tool_and_preserves_error_boundaries() {
     );
     assert_eq!(runtime.calls(), expected_tool_calls());
 
-    client
-        .send(message(json!({
+    send_json(
+        &mut client,
+        json!({
             "jsonrpc": "2.0",
             "id": 32,
             "method": "tools/call",
@@ -251,10 +332,10 @@ async fn mcp_agent_path_dispatches_every_tool_and_preserves_error_boundaries() {
                     "action": {"type": "press", "key": "Alt+Tab"},
                 },
             },
-        })))
-        .await
-        .expect("send unsupported action");
-    let unsupported = response_value(client.receive().await.expect("unsupported action response"));
+        }),
+    )
+    .await;
+    let unsupported = receive_json(&mut client).await;
     assert_eq!(unsupported["id"], 32);
     let result = &unsupported["result"];
     assert_eq!(result["isError"], true);
@@ -267,16 +348,17 @@ async fn mcp_agent_path_dispatches_every_tool_and_preserves_error_boundaries() {
     assert_eq!(runtime.calls(), expected_tool_calls());
 
     runtime.fail_next();
-    client
-        .send(message(json!({
+    send_json(
+        &mut client,
+        json!({
             "jsonrpc": "2.0",
             "id": 33,
             "method": "tools/call",
             "params": {"name": "list_applications", "arguments": {"scope": "running"}},
-        })))
-        .await
-        .expect("send runtime failure call");
-    let runtime_error = response_value(client.receive().await.expect("runtime error response"));
+        }),
+    )
+    .await;
+    let runtime_error = receive_json(&mut client).await;
     assert_eq!(runtime_error["id"], 33);
     assert_eq!(
         runtime_error["result"],
@@ -288,12 +370,7 @@ async fn mcp_agent_path_dispatches_every_tool_and_preserves_error_boundaries() {
     );
     assert!(runtime_error.get("error").is_none());
 
-    drop(client);
-    tokio::time::timeout(Duration::from_secs(2), server)
-        .await
-        .expect("server should stop when the transport closes")
-        .expect("join server");
-    assert_eq!(runtime.shutdowns(), 1);
+    stop_server(client, server, &runtime).await;
 }
 
 #[tokio::test]
@@ -337,87 +414,53 @@ async fn structured_content_is_gated_by_protocol_version_at_one_return_point() {
 
 async fn results_for_protocol(requested: &str, negotiated: &str) -> (Value, Value, Value) {
     let runtime = FakeRuntime::new(STANDARD.encode(test_png()));
-    let server_runtime = runtime.clone();
-    let (server_transport, client_transport) = tokio::io::duplex(8 * 1024);
-    let server = tokio::spawn(async move {
-        let service = ComputerUseMcpServer::<FakeRuntime>::new(Arc::new(server_runtime.clone()))
-            .serve(server_transport)
-            .await
-            .expect("initialize server");
-        let waiting = service.waiting().await;
-        let shutdown = server_runtime.shutdown().await;
-        waiting.expect("wait for server");
-        shutdown.expect("shut down fake runtime");
-    });
+    let (client_transport, server) = spawn_server(&runtime);
     let mut client = IntoTransport::<RoleClient, _, _>::into_transport(client_transport);
 
-    client
-        .send(message(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": requested,
-                "capabilities": {},
-                "clientInfo": {"name": "readiness-protocol-test", "version": "0.0.0"},
-            },
-        })))
-        .await
-        .expect("send initialize");
-    let initialized = response_value(client.receive().await.expect("initialize response"));
+    let initialized = initialize(&mut client, requested, "readiness-protocol-test").await;
     assert_eq!(
         initialized["result"]["protocolVersion"], negotiated,
         "protocol negotiation"
     );
-    client
-        .send(message(json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized",
-        })))
-        .await
-        .expect("send initialized notification");
-
-    client
-        .send(message(json!({
+    send_json(
+        &mut client,
+        json!({
             "jsonrpc": "2.0",
             "id": 10,
             "method": "tools/list",
-        })))
-        .await
-        .expect("send tools/list");
-    let listed = response_value(client.receive().await.expect("tools/list response"));
+        }),
+    )
+    .await;
+    let listed = receive_json(&mut client).await;
 
-    client
-        .send(message(json!({
+    send_json(
+        &mut client,
+        json!({
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/call",
             "params": {"name": "list_applications", "arguments": {"scope": "running"}},
-        })))
-        .await
-        .expect("send successful runtime call");
-    let success = response_value(client.receive().await.expect("runtime success response"));
+        }),
+    )
+    .await;
+    let success = receive_json(&mut client).await;
     assert_eq!(success["id"], 2);
 
     runtime.fail_next();
-    client
-        .send(message(json!({
+    send_json(
+        &mut client,
+        json!({
             "jsonrpc": "2.0",
             "id": 3,
             "method": "tools/call",
             "params": {"name": "list_applications", "arguments": {"scope": "running"}},
-        })))
-        .await
-        .expect("send runtime failure call");
-    let response = response_value(client.receive().await.expect("runtime error response"));
+        }),
+    )
+    .await;
+    let response = receive_json(&mut client).await;
     assert_eq!(response["id"], 3);
 
-    drop(client);
-    tokio::time::timeout(Duration::from_secs(2), server)
-        .await
-        .expect("server should stop when the transport closes")
-        .expect("join server");
-    assert_eq!(runtime.shutdowns(), 1);
+    stop_server(client, server, &runtime).await;
     (listed, success, response)
 }
 
@@ -564,6 +607,71 @@ fn test_png() -> Vec<u8> {
 
 fn message(value: Value) -> ClientJsonRpcMessage {
     serde_json::from_value(value).expect("valid client message")
+}
+
+fn spawn_server(runtime: &FakeRuntime) -> (tokio::io::DuplexStream, tokio::task::JoinHandle<()>) {
+    let runtime = runtime.clone();
+    let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
+    let server = tokio::spawn(async move {
+        let service = ComputerUseMcpServer::new(Arc::new(runtime.clone()))
+            .serve(server_transport)
+            .await
+            .expect("initialize server");
+        let waiting = service.waiting().await;
+        let shutdown = runtime.shutdown().await;
+        waiting.expect("wait for server");
+        shutdown.expect("shut down fake runtime");
+    });
+    (client_transport, server)
+}
+
+async fn stop_server(
+    client: impl Transport<RoleClient>,
+    server: tokio::task::JoinHandle<()>,
+    runtime: &FakeRuntime,
+) {
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("server should stop when transport closes")
+        .expect("join server");
+    assert_eq!(runtime.shutdowns(), 1);
+}
+
+async fn send_json(client: &mut impl Transport<RoleClient>, value: Value) {
+    client.send(message(value)).await.expect("send request");
+}
+
+async fn initialize(
+    client: &mut impl Transport<RoleClient>,
+    protocol_version: &str,
+    client_name: &str,
+) -> Value {
+    send_json(
+        client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": protocol_version,
+                "capabilities": {},
+                "clientInfo": {"name": client_name, "version": "0.0.0"},
+            },
+        }),
+    )
+    .await;
+    let response = receive_json(client).await;
+    send_json(
+        client,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    )
+    .await;
+    response
+}
+
+async fn receive_json(client: &mut impl Transport<RoleClient>) -> Value {
+    response_value(client.receive().await.expect("receive response"))
 }
 
 fn response_value(message: ServerJsonRpcMessage) -> Value {

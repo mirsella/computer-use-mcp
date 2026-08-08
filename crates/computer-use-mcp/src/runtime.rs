@@ -5,6 +5,10 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use crate::{errors::RuntimeError, validation::ToolCall};
 
 pub trait DesktopRuntime: Send + Sync + 'static {
+    fn start(&self) {}
+    fn wait_for_desktop_session(&self) -> impl Future<Output = ()> + Send + '_ {
+        async {}
+    }
     fn execute(
         &self,
         call: ToolCall,

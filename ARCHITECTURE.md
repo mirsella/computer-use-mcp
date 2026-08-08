@@ -70,20 +70,20 @@ Explicit element focus requires both the AT-SPI Component interface and
 
 ## Action flow
 
-The production MCP establishes its RemoteDesktop/ScreenCast session before the
-stdio protocol starts. KDE therefore restores or requests monitor, pointer, and
-keyboard approval as soon as the host enables the MCP. Startup fails if approval
-or capture setup fails. A failed or revoked established session is not recreated
-inside a tool call; the host must restart the MCP before KDE is prompted again.
+The stdio protocol starts immediately while one runtime task initializes portal
+approval and PipeWire capture. Listing and launching remain available; dependent
+calls join that task before the execution barrier. Its ready-or-failed result is
+stable for the process lifetime, and shutdown joins it before closing capture.
 
 An element, pointer, or keyboard action requires a cached state ID. Before acting,
 the service re-discovers the app, verifies the PID and exact window, traverses
 fresh state, and relocates any generation-scoped element. After a bounded settle
 delay it re-resolves the same app/window and returns a new observation.
 
-All tool calls share one server-side execution barrier so cancellation cleanup
-finishes before any queued call starts. Stateful actions recheck their cached
-generation after acquiring that barrier and cannot act on replaced state.
+Executed tool calls share one server-side execution barrier so cancellation
+cleanup finishes before any queued call starts. Waiting for desktop-session
+initialization happens before that barrier. Stateful actions recheck their
+cached generation after acquiring it and cannot act on replaced state.
 Cleanup has a bounded deadline; a failure or timeout closes the desktop session
 rather than blocking later work.
 
@@ -129,8 +129,9 @@ disables persistence. The server
 subscribes generically to portal Request responses before each method call,
 filters by the returned path, closes dropped requests, distinguishes user cancel
 from denial, watches `Session.Closed`, and closes the session on cleanup.
-Initial consent has a 60-second deadline; frame acquisition remains capped at 12
-seconds so a stalled PipeWire stream cannot hold an MCP call indefinitely.
+Desktop-session initialization has a 60-second deadline; frame acquisition
+remains capped at 12 seconds so a stalled PipeWire stream cannot hold an MCP
+call indefinitely.
 `ConnectToEIS` is one-shot. Setup requires the exact resumed monitor region;
 keyboard actions additionally wait for one synchronized keyboard on that pointer
 seat. EIS calls and queued held-input releases share an async lock. Cleanup is an awaited barrier.

@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeSet,
     future::Future,
+    panic::AssertUnwindSafe,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -8,8 +9,13 @@ use std::{
     time::Duration,
 };
 
+use futures_util::FutureExt;
 use serde_json::json;
-use tokio::time::{sleep, timeout};
+use tokio::{
+    sync::watch,
+    task::JoinHandle,
+    time::{sleep, timeout},
+};
 
 use crate::{
     errors::{RuntimeError, ToolOutcome},
@@ -201,6 +207,24 @@ pub struct RuntimeConfig {
     pub settle_interval: Duration,
 }
 
+struct DesktopSession {
+    status: watch::Sender<Option<Result<(), RuntimeError>>>,
+    task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for DesktopSession {
+    fn drop(&mut self) {
+        if let Some(task) = self
+            .task
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            task.abort();
+        }
+    }
+}
+
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
@@ -390,10 +414,11 @@ fn snapshot_string_bytes(snapshot: &Snapshot) -> usize {
 
 pub struct SemanticRuntime<A, S = NoScreenshots> {
     adapter: A,
-    screenshots: S,
+    screenshots: Arc<S>,
+    desktop_session: DesktopSession,
     config: RuntimeConfig,
     cache: Mutex<Cache>,
-    mutation: Arc<tokio::sync::Mutex<()>>,
+    mutation: tokio::sync::Mutex<()>,
     launch_in_progress: Arc<AtomicBool>,
 }
 
@@ -420,36 +445,97 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
     pub fn with_screenshot_provider(adapter: A, screenshots: S, config: RuntimeConfig) -> Self {
         Self {
             adapter,
-            screenshots,
+            screenshots: Arc::new(screenshots),
+            desktop_session: DesktopSession {
+                status: watch::channel(None).0,
+                task: Mutex::new(None),
+            },
             config,
             cache: Mutex::new(Cache::default()),
-            mutation: Arc::new(tokio::sync::Mutex::new(())),
+            mutation: tokio::sync::Mutex::new(()),
             launch_in_progress: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    pub(crate) async fn prepare_desktop_session(&self) -> Result<(), RuntimeError> {
-        timeout(self.config.portal_timeout, self.screenshots.prepare())
-            .await
-            .map_err(|_| {
-                RuntimeError::new(
-                    "backend_timeout",
-                    "KDE RemoteDesktop approval timed out during MCP startup",
-                    ToolOutcome::NotStarted,
-                    true,
-                    "Enable the MCP again and approve the KDE RemoteDesktop request.",
-                )
-            })?
-            .map(|_| ())
-            .map_err(|error| {
-                RuntimeError::new(
-                    "backend_failed",
-                    format!("KDE RemoteDesktop approval failed during MCP startup: {error}"),
-                    ToolOutcome::NotStarted,
-                    true,
-                    "Enable the MCP again and approve the KDE RemoteDesktop request.",
-                )
+    fn start_desktop_session(&self) {
+        let mut task = self
+            .desktop_session
+            .task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if task.is_some() || self.desktop_session.status.borrow().is_some() {
+            return;
+        }
+
+        let screenshots = Arc::clone(&self.screenshots);
+        let status = self.desktop_session.status.clone();
+        let portal_timeout = self.config.portal_timeout;
+        *task = Some(tokio::spawn(async move {
+            let result = AssertUnwindSafe(async {
+                timeout(portal_timeout, screenshots.prepare())
+                    .await
+                    .map_err(|_| {
+                        desktop_session_error(
+                            "backend_timeout",
+                            "desktop session initialization timed out",
+                        )
+                    })?
+                    .map_err(|error| {
+                        desktop_session_error(
+                            "backend_failed",
+                            format!("KDE RemoteDesktop approval failed: {error}"),
+                        )
+                    })
             })
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| {
+                eprintln!("computer-use-mcp: desktop session initializer panicked");
+                Err(desktop_session_error(
+                    "backend_failed",
+                    "desktop session initializer panicked",
+                ))
+            });
+            status.send_if_modified(|current| {
+                if current.is_some() {
+                    return false;
+                }
+                *current = Some(result);
+                true
+            });
+        }));
+    }
+
+    async fn desktop_session(&self) -> Result<(), RuntimeError> {
+        self.start_desktop_session();
+        let mut status = self.desktop_session.status.subscribe();
+        status
+            .wait_for(Option::is_some)
+            .await
+            .expect("desktop session status sender is retained by the runtime")
+            .clone()
+            .expect("desktop session status was checked as present")
+    }
+
+    async fn stop_desktop_session(&self) {
+        let task = {
+            let mut task = self
+                .desktop_session
+                .task
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.desktop_session
+                .status
+                .send_replace(Some(Err(desktop_session_error(
+                    "backend_failed",
+                    "desktop session has shut down",
+                ))));
+            task.take()
+        };
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
     }
 
     async fn list_running_apps(&self) -> Result<Vec<AppInfo>, RuntimeError> {
@@ -496,8 +582,13 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
 
     async fn execute_call(&self, call: ToolCall) -> Result<ToolOutput, RuntimeError> {
         call.validate_policy()?;
+        let desktop_session = if call.waits_for_desktop_session() {
+            self.desktop_session().await
+        } else {
+            Ok(())
+        };
         match call {
-            ToolCall::ListApplications { .. } => self.execute_call_inner(call).await,
+            ToolCall::ListApplications { scope } => self.list_applications(scope).await,
             ToolCall::LaunchApplication { desktop_id } => {
                 let _mutation = self.mutation.lock().await;
                 self.lock_cache()?.observations.clear();
@@ -521,57 +612,56 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 if self.launch_in_progress.load(Ordering::Acquire) {
                     return Err(launch_in_progress_error());
                 }
-                self.execute_call_inner(call).await
-            }
-        }
-    }
-
-    async fn execute_call_inner(&self, call: ToolCall) -> Result<ToolOutput, RuntimeError> {
-        match call {
-            ToolCall::ListApplications { scope } => self.list_applications(scope).await,
-            ToolCall::Observe {
-                target,
-                view,
-                query,
-                text_limit,
-                max_tree_nodes,
-                max_tree_depth,
-            } => {
-                let snapshot = self
-                    .requested_snapshot(
+                match call {
+                    ToolCall::Observe {
                         target,
                         view,
                         query,
                         text_limit,
                         max_tree_nodes,
                         max_tree_depth,
-                    )
-                    .await?;
-                Ok(self.observe(snapshot).await)
-            }
-            ToolCall::LaunchApplication { .. } => {
-                eprintln!("computer-use-mcp: launch bypassed its mutation fence");
-                Err(internal_error("launch mutation invariant failed"))
-            }
-            ToolCall::ActOnElement {
-                state_id,
-                element_id,
-                action,
-            } => {
-                let snapshot = self.element_action(&state_id, &element_id, action).await?;
-                Ok(self.observe(snapshot).await)
-            }
-            ToolCall::Pointer { state_id, action } => {
-                self.perform_generated(&state_id, GeneratedInputAction::Pointer(action))
-                    .await
-            }
-            ToolCall::Keyboard {
-                state_id,
-                focus,
-                action,
-            } => {
-                self.perform_generated(&state_id, GeneratedInputAction::Keyboard { focus, action })
-                    .await
+                    } => {
+                        let snapshot = self
+                            .requested_snapshot(
+                                target,
+                                view,
+                                query,
+                                text_limit,
+                                max_tree_nodes,
+                                max_tree_depth,
+                            )
+                            .await?;
+                        Ok(self.observe(snapshot, desktop_session).await)
+                    }
+                    ToolCall::ActOnElement {
+                        state_id,
+                        element_id,
+                        action,
+                    } => {
+                        let snapshot = self.element_action(&state_id, &element_id, action).await?;
+                        Ok(self.observe(snapshot, desktop_session).await)
+                    }
+                    ToolCall::Pointer { state_id, action } => {
+                        desktop_session?;
+                        self.perform_generated(&state_id, GeneratedInputAction::Pointer(action))
+                            .await
+                    }
+                    ToolCall::Keyboard {
+                        state_id,
+                        focus,
+                        action,
+                    } => {
+                        desktop_session?;
+                        self.perform_generated(
+                            &state_id,
+                            GeneratedInputAction::Keyboard { focus, action },
+                        )
+                        .await
+                    }
+                    ToolCall::ListApplications { .. } | ToolCall::LaunchApplication { .. } => {
+                        unreachable!("list and launch calls were handled before mutation locking")
+                    }
+                }
             }
         }
     }
@@ -957,7 +1047,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             .settle_and_refresh(cached)
             .await
             .map_err(completed_without_observation)?;
-        Ok(self.observe(refreshed).await)
+        Ok(self.observe(refreshed, Ok(())).await)
     }
 
     async fn settle_and_refresh(&self, old: Arc<Snapshot>) -> Result<Arc<Snapshot>, RuntimeError> {
@@ -974,53 +1064,20 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         self.commit_snapshot(refreshed)
     }
 
-    async fn observe(&self, mut snapshot: Arc<Snapshot>) -> ToolOutput {
-        let preparation = match timeout(self.config.portal_timeout, self.screenshots.prepare())
-            .await
-        {
-            Ok(Ok(preparation)) => preparation,
-            Ok(Err(error)) => {
-                eprintln!(
-                    "computer-use-mcp: screenshot preparation failed for pid={} window={}{} generation={}: {error}",
-                    snapshot.app.pid,
-                    snapshot.window.object.bus_name,
-                    snapshot.window.object.path,
-                    snapshot.generation
-                );
-                return screenshot_unavailable(&snapshot, &error.to_string());
-            }
-            Err(_) => {
-                eprintln!(
-                    "computer-use-mcp: screenshot preparation timed out for pid={} generation={}",
-                    snapshot.app.pid, snapshot.generation
-                );
-                return screenshot_unavailable(&snapshot, "screenshot preparation timed out");
-            }
-        };
-        if preparation.consent_interrupted_observation {
-            snapshot = match self
-                .requested_snapshot(
-                    snapshot.app_query.clone(),
-                    snapshot.view,
-                    snapshot.element_query.clone(),
-                    Some(TextLimit::Count(snapshot.limits.text)),
-                    Some(snapshot.limits.nodes),
-                    Some(snapshot.limits.depth),
-                )
-                .await
-            {
-                Ok(refreshed) => refreshed,
-                Err(error) => {
-                    eprintln!(
-                        "computer-use-mcp: AT-SPI refresh after portal consent failed for pid={}: {error}",
-                        snapshot.app.pid
-                    );
-                    return screenshot_unavailable(
-                        &snapshot,
-                        &format!("AT-SPI refresh after portal consent failed: {error}"),
-                    );
-                }
-            };
+    async fn observe(
+        &self,
+        snapshot: Arc<Snapshot>,
+        desktop_session: Result<(), RuntimeError>,
+    ) -> ToolOutput {
+        if let Err(error) = desktop_session {
+            eprintln!(
+                "computer-use-mcp: screenshot preparation failed for pid={} window={}{} generation={}: {error}",
+                snapshot.app.pid,
+                snapshot.window.object.bus_name,
+                snapshot.window.object.path,
+                snapshot.generation
+            );
+            return screenshot_unavailable(&snapshot, &error.to_string());
         }
         match timeout(
             self.config.snapshot_timeout,
@@ -1187,6 +1244,14 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
 }
 
 impl<A: AccessibilityAdapter, S: ScreenshotProvider> DesktopRuntime for SemanticRuntime<A, S> {
+    fn start(&self) {
+        self.start_desktop_session();
+    }
+
+    async fn wait_for_desktop_session(&self) {
+        let _ = self.desktop_session().await;
+    }
+
     fn execute(
         &self,
         call: ToolCall,
@@ -1205,6 +1270,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> DesktopRuntime for Semantic
     }
 
     async fn shutdown(&self) -> Result<(), RuntimeError> {
+        self.stop_desktop_session().await;
         let _mutation = self.mutation.lock().await;
         self.screenshots
             .shutdown_input()
@@ -1854,15 +1920,19 @@ fn operational_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::not_started("target_unavailable", message)
 }
 
+fn desktop_session_error(code: &'static str, message: impl Into<String>) -> RuntimeError {
+    RuntimeError::new(
+        code,
+        message,
+        ToolOutcome::NotStarted,
+        false,
+        "Disable and re-enable the MCP to request KDE approval again.",
+    )
+}
+
 fn generated_input_error(message: String) -> RuntimeError {
     if message.starts_with(SESSION_UNAVAILABLE) {
-        RuntimeError::new(
-            "backend_failed",
-            message,
-            ToolOutcome::NotStarted,
-            false,
-            "Disable and re-enable the MCP to request KDE approval again.",
-        )
+        desktop_session_error("backend_failed", message)
     } else {
         operational_error(message)
     }
@@ -1897,16 +1967,6 @@ fn launch_in_progress_error() -> RuntimeError {
         ToolOutcome::NotStarted,
         true,
         "Wait for launch completion, then call observe before retrying.",
-    )
-}
-
-fn internal_error(message: impl Into<String>) -> RuntimeError {
-    RuntimeError::new(
-        "internal",
-        message,
-        ToolOutcome::NotStarted,
-        false,
-        "Restart the server before issuing more computer-use actions.",
     )
 }
 
@@ -1986,11 +2046,15 @@ fn semantic_focus_plan<'a>(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, future, sync::Arc};
+    use std::{
+        collections::HashMap,
+        future,
+        sync::{Arc, atomic::AtomicUsize},
+    };
 
     use super::*;
     use crate::{
-        screenshot::ScreenshotError,
+        screenshot::{ScreenshotError, ScreenshotObservation},
         validation::{KeyboardAction, MouseButton, PointerAction},
     };
 
@@ -2803,28 +2867,125 @@ mod tests {
         assert!(error.message.contains("defunct"));
     }
 
+    #[derive(Clone, Copy)]
+    enum Preparation {
+        Fail,
+        Panic,
+        Pending,
+    }
+
+    struct LifecycleScreenshots {
+        preparation: Preparation,
+        prepares: AtomicUsize,
+        started: tokio::sync::Notify,
+        shutdowns: AtomicUsize,
+    }
+
+    impl LifecycleScreenshots {
+        fn new(preparation: Preparation) -> Self {
+            Self {
+                preparation,
+                prepares: AtomicUsize::new(0),
+                started: tokio::sync::Notify::new(),
+                shutdowns: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl ScreenshotProvider for LifecycleScreenshots {
+        async fn prepare(&self) -> Result<(), ScreenshotError> {
+            self.prepares.fetch_add(1, Ordering::AcqRel);
+            match self.preparation {
+                Preparation::Fail => Err(ScreenshotError("approval denied".into())),
+                Preparation::Panic => panic!("broken initializer"),
+                Preparation::Pending => {
+                    self.started.notify_one();
+                    future::pending().await
+                }
+            }
+        }
+
+        async fn capture<'a>(
+            &'a self,
+            _snapshot: &'a Snapshot,
+        ) -> Result<ScreenshotObservation, ScreenshotError> {
+            unreachable!()
+        }
+
+        async fn perform_input<'a>(
+            &'a self,
+            _snapshot: &'a Snapshot,
+            _mapping: &'a ScreenshotMapping,
+            _action: GeneratedInputAction,
+        ) -> Result<(), String> {
+            unreachable!()
+        }
+
+        async fn shutdown_input(&self) -> Result<(), String> {
+            self.shutdowns.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn desktop_session_initialization_failure_is_stable_and_one_shot() {
+        for (preparation, message) in [
+            (Preparation::Fail, "approval denied"),
+            (Preparation::Panic, "initializer panicked"),
+        ] {
+            let runtime = SemanticRuntime::with_screenshot_provider(
+                FakeAdapter::tree(),
+                LifecycleScreenshots::new(preparation),
+                test_config(),
+            );
+            runtime.start_desktop_session();
+            runtime.start_desktop_session();
+
+            for _ in 0..2 {
+                let error = tokio::time::timeout(Duration::from_secs(1), runtime.desktop_session())
+                    .await
+                    .expect("initializer failure must wake waiters")
+                    .unwrap_err();
+                assert_eq!(error.code, "backend_failed");
+                assert!(!error.retryable);
+                assert!(error.message.contains(message));
+            }
+            assert_eq!(runtime.screenshots.prepares.load(Ordering::Acquire), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_pending_desktop_session_initialization() {
+        let runtime = SemanticRuntime::with_screenshot_provider(
+            FakeAdapter::tree(),
+            LifecycleScreenshots::new(Preparation::Pending),
+            test_config(),
+        );
+        let started = runtime.screenshots.started.notified();
+        runtime.start_desktop_session();
+        tokio::time::timeout(Duration::from_secs(1), started)
+            .await
+            .expect("initializer must start");
+
+        tokio::time::timeout(Duration::from_secs(1), runtime.shutdown())
+            .await
+            .expect("shutdown must not wait for portal timeout")
+            .unwrap();
+        assert_eq!(runtime.screenshots.prepares.load(Ordering::Acquire), 1);
+        assert_eq!(runtime.screenshots.shutdowns.load(Ordering::Acquire), 1);
+    }
+
     #[tokio::test]
     async fn generated_input_failure_invalidates_state_before_dispatch() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-        use crate::screenshot::{PrepareCapture, ScreenshotObservation};
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct FakeScreenshots {
-            prepared: AtomicBool,
             generated: AtomicUsize,
         }
 
         impl ScreenshotProvider for FakeScreenshots {
-            fn prepare(
-                &self,
-            ) -> impl Future<Output = Result<PrepareCapture, ScreenshotError>> + Send + '_
-            {
-                let interrupted = !self.prepared.swap(true, Ordering::AcqRel);
-                async move {
-                    Ok(PrepareCapture {
-                        consent_interrupted_observation: interrupted,
-                    })
-                }
+            async fn prepare(&self) -> Result<(), ScreenshotError> {
+                Ok(())
             }
 
             async fn capture<'a>(
@@ -2852,7 +3013,6 @@ mod tests {
         let runtime = SemanticRuntime::with_screenshot_provider(
             fake.clone(),
             FakeScreenshots {
-                prepared: AtomicBool::new(false),
                 generated: AtomicUsize::new(0),
             },
             test_config(),
@@ -2869,8 +3029,7 @@ mod tests {
         assert_eq!(metadata["elements"][3]["set_value"], "number");
         let mapping = runtime.screenshot_mapping(&state_id).unwrap().unwrap();
         assert_eq!(mapping.stream.mapping_id.as_deref(), Some("mapping"));
-        assert_eq!(mapping.accessibility_generation, 2);
-        assert!(fake.state.lock().unwrap().discoveries >= 2);
+        assert_eq!(mapping.accessibility_generation, 1);
 
         let error = runtime
             .execute_call(ToolCall::Pointer {
@@ -2921,10 +3080,7 @@ mod tests {
 
     #[tokio::test]
     async fn semantic_keyboard_focus_is_confirmed_before_no_click_input() {
-        use crate::{
-            input::GeneratedInputAction,
-            screenshot::{PrepareCapture, ScreenshotObservation},
-        };
+        use crate::{input::GeneratedInputAction, screenshot::ScreenshotObservation};
 
         #[derive(Default)]
         struct RecordingScreenshots {
@@ -2932,10 +3088,8 @@ mod tests {
         }
 
         impl ScreenshotProvider for RecordingScreenshots {
-            async fn prepare(&self) -> Result<PrepareCapture, ScreenshotError> {
-                Ok(PrepareCapture {
-                    consent_interrupted_observation: false,
-                })
+            async fn prepare(&self) -> Result<(), ScreenshotError> {
+                Ok(())
             }
 
             async fn capture<'a>(
@@ -3065,39 +3219,28 @@ mod tests {
     async fn generated_mutation_serializes_state_refresh() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        use crate::{
-            input::GeneratedInputAction,
-            screenshot::{PrepareCapture, ScreenshotObservation},
-        };
+        use crate::{input::GeneratedInputAction, screenshot::ScreenshotObservation};
 
         struct ConcurrentScreenshots {
-            prepares: AtomicUsize,
+            captures: AtomicUsize,
             entered: tokio::sync::Notify,
             release: tokio::sync::Notify,
             generated: AtomicUsize,
         }
 
         impl ScreenshotProvider for ConcurrentScreenshots {
-            fn prepare(
-                &self,
-            ) -> impl Future<Output = Result<PrepareCapture, ScreenshotError>> + Send + '_
-            {
-                let call = self.prepares.fetch_add(1, Ordering::AcqRel);
-                async move {
-                    if call == 1 {
-                        self.entered.notify_one();
-                        self.release.notified().await;
-                    }
-                    Ok(PrepareCapture {
-                        consent_interrupted_observation: false,
-                    })
-                }
+            async fn prepare(&self) -> Result<(), ScreenshotError> {
+                Ok(())
             }
 
             async fn capture<'a>(
                 &'a self,
                 snapshot: &'a Snapshot,
             ) -> Result<ScreenshotObservation, ScreenshotError> {
+                if self.captures.fetch_add(1, Ordering::AcqRel) == 1 {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
                 Ok(ScreenshotObservation {
                     png_base64: "cG5n".into(),
                     mapping: test_screenshot_mapping(snapshot, "/session/concurrent", None),
@@ -3118,7 +3261,7 @@ mod tests {
         let runtime = Arc::new(SemanticRuntime::with_screenshot_provider(
             FakeAdapter::tree(),
             ConcurrentScreenshots {
-                prepares: AtomicUsize::new(0),
+                captures: AtomicUsize::new(0),
                 entered: tokio::sync::Notify::new(),
                 release: tokio::sync::Notify::new(),
                 generated: AtomicUsize::new(0),
@@ -3287,10 +3430,8 @@ mod tests {
     }
 
     impl ScreenshotProvider for MutatingScreenshots {
-        async fn prepare(&self) -> Result<crate::screenshot::PrepareCapture, ScreenshotError> {
-            Ok(crate::screenshot::PrepareCapture {
-                consent_interrupted_observation: false,
-            })
+        async fn prepare(&self) -> Result<(), ScreenshotError> {
+            Ok(())
         }
 
         async fn capture<'a>(

@@ -35,8 +35,9 @@ pub struct ComputerUseMcpServer<R = SemanticRuntime<AtspiAdapter, ProductionScre
     unavailable: AtomicBool,
 }
 
-impl<R> ComputerUseMcpServer<R> {
+impl<R: DesktopRuntime> ComputerUseMcpServer<R> {
     pub fn new(runtime: Arc<R>) -> Self {
+        runtime.start();
         Self {
             runtime,
             execution_barrier: tokio::sync::Mutex::new(()),
@@ -84,6 +85,7 @@ impl<R: DesktopRuntime> ServerHandler for ComputerUseMcpServer<R> {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        let structured = supports_structured_content(&context);
         if !TOOL_NAMES.contains(&request.name.as_ref()) {
             return Err(McpError::invalid_params(
                 format!("unknown tool {:?}", request.name),
@@ -94,13 +96,28 @@ impl<R: DesktopRuntime> ServerHandler for ComputerUseMcpServer<R> {
         let call = match validate_call(&request.name, arguments) {
             Ok(call) => call,
             Err(error) => {
-                return Ok(for_protocol(
-                    tool_error_result(&error),
-                    supports_structured_content(&context),
-                ));
+                return Ok(for_protocol(tool_error_result(&error), structured));
             }
         };
-        let _execution = self.execution_barrier.lock().await;
+        if call.waits_for_desktop_session() {
+            tokio::select! {
+                () = self.runtime.wait_for_desktop_session() => {}
+                () = context.ct.cancelled() => {
+                    eprintln!("computer-use-mcp: tool call cancelled while waiting for desktop session initialization");
+                    return Ok(for_protocol(
+                        tool_error_result(&cancelled_before_execution()),
+                        structured,
+                    ));
+                }
+            }
+        }
+        let _execution = tokio::select! {
+            guard = self.execution_barrier.lock() => guard,
+            () = context.ct.cancelled() => {
+                eprintln!("computer-use-mcp: queued tool call cancelled before execution");
+                return Ok(for_protocol(tool_error_result(&cancelled_before_execution()), structured));
+            }
+        };
         let result = if self.unavailable.load(Ordering::Acquire) {
             tool_error_result(&RuntimeError::new(
                 "backend_failed",
@@ -111,13 +128,7 @@ impl<R: DesktopRuntime> ServerHandler for ComputerUseMcpServer<R> {
             ))
         } else if context.ct.is_cancelled() {
             eprintln!("computer-use-mcp: queued tool call cancelled before execution");
-            tool_error_result(&RuntimeError::new(
-                "cancelled",
-                "tool call cancelled before execution",
-                ToolOutcome::NotStarted,
-                true,
-                "Retry the call if it is still needed.",
-            ))
+            tool_error_result(&cancelled_before_execution())
         } else {
             tokio::select! {
                 result = self.runtime.execute(call) => match result {
@@ -153,28 +164,32 @@ impl<R: DesktopRuntime> ServerHandler for ComputerUseMcpServer<R> {
                 }
             }
         };
-        Ok(for_protocol(result, supports_structured_content(&context)))
+        Ok(for_protocol(result, structured))
     }
 }
 
 async fn shutdown_after_cleanup_failure<R: DesktopRuntime>(runtime: &R) {
-    match tokio::time::timeout(Duration::from_secs(2), runtime.shutdown()).await {
+    match tokio::time::timeout(Duration::from_secs(6), runtime.shutdown()).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => eprintln!("computer-use-mcp: cancellation shutdown failed: {error}"),
         Err(_) => eprintln!("computer-use-mcp: cancellation shutdown timed out"),
     }
 }
 
+fn cancelled_before_execution() -> RuntimeError {
+    RuntimeError::new(
+        "cancelled",
+        "tool call cancelled before execution",
+        ToolOutcome::NotStarted,
+        true,
+        "Retry the call if it is still needed.",
+    )
+}
+
 pub async fn serve_stdio() -> Result<(), CliError> {
     let runtime = production_runtime();
-    eprintln!(
-        "computer-use-mcp: restoring or requesting KDE monitor, pointer, and keyboard approval"
-    );
+    eprintln!("computer-use-mcp: starting KDE desktop session initialization in the background");
     let result = async {
-        runtime
-            .prepare_desktop_session()
-            .await
-            .map_err(|error| CliError::Mcp(error.to_string()))?;
         let service = match ComputerUseMcpServer::new(Arc::clone(&runtime))
             .serve(rmcp::transport::stdio())
             .await

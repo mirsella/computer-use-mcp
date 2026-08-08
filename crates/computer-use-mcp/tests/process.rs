@@ -12,8 +12,6 @@ fn cli_help_version_and_errors_are_truthful() {
     assert!(help_text.contains("snapshot APP"));
     assert!(help_text.contains("init"));
     assert!(help_text.contains("call FILE"));
-    assert!(help_text.contains("requests KDE approval at startup"));
-
     let version = run(&["version"]);
     assert!(version.status.success());
     assert_eq!(text(&version.stdout).trim(), VERSION);

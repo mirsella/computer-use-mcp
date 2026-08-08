@@ -359,7 +359,6 @@ impl XdgPortalBackend {
                 fd: fd.into(),
                 session: approval.session,
                 stream: approval.stream,
-                consent_interrupted_observation: true,
             }),
             Err(error) => {
                 if let Err(close) = tokio::time::timeout(
@@ -413,7 +412,6 @@ pub struct PortalConnection {
     pub fd: OwnedFd,
     pub session: Arc<PortalSessionLease>,
     pub stream: PortalStream,
-    pub consent_interrupted_observation: bool,
 }
 
 pub struct PortalSessionLease {

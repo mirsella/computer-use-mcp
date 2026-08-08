@@ -98,6 +98,9 @@ spaces; and structured runtime error `outcome`, `retryable`, and `recovery`.
 desktop ID from the installed listing and must
 never grow an arbitrary command or argument escape hatch.
 
+Test the background lifecycle ordering and shutdown with deterministic gates,
+not live portal prompts.
+
 ## Generated input
 
 Generated input uses `SemanticRuntime::screenshot_mapping` and the existing
