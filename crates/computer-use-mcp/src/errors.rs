@@ -7,6 +7,25 @@ pub enum ToolOutcome {
     Completed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleAuthority {
+    Catalog,
+    Observation,
+}
+
+impl StaleAuthority {
+    const fn recovery(self) -> &'static str {
+        match self {
+            Self::Catalog => {
+                "Call list_desktop again, then retry only if the exact target or inventory entry is still available."
+            }
+            Self::Observation => {
+                "Call observe again for current state, then retry only if the requested action is still needed."
+            }
+        }
+    }
+}
+
 impl ToolOutcome {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -24,6 +43,7 @@ pub struct RuntimeError {
     pub outcome: ToolOutcome,
     pub retryable: bool,
     pub recovery: String,
+    pub action_progress: Option<serde_json::Value>,
 }
 
 impl RuntimeError {
@@ -60,6 +80,7 @@ impl RuntimeError {
             outcome,
             retryable,
             recovery: recovery.into(),
+            action_progress: None,
         }
     }
 
@@ -70,6 +91,16 @@ impl RuntimeError {
             ToolOutcome::NotStarted,
             true,
             "Call observe for current state, then retry only if the requested action is still needed.",
+        )
+    }
+
+    pub fn stale(authority: StaleAuthority, message: impl Into<String>) -> Self {
+        Self::new(
+            "stale_state",
+            message,
+            ToolOutcome::NotStarted,
+            true,
+            authority.recovery(),
         )
     }
 

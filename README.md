@@ -12,13 +12,8 @@ computer use on Linux Wayland. It is built for KDE Plasma and OpenCode.
 > the logged-in graphical session. A screenshot contains the complete selected
 > monitor, including unrelated windows and notifications.
 
-The server uses AT-SPI for semantic inspection and actions, XDG ScreenCast for
-one approved monitor, XDG RemoteDesktop with EIS for input, and GIO for app
-discovery and launch. It does not use X11, `/dev/uinput`, clipboard injection,
-compositor-private APIs, or guessed display geometry.
-
-See [MCP.md](MCP.md) for the six tools and their exact inputs, results, state
-lifecycle, coordinate rules, and error outcomes.
+See [MCP.md](MCP.md) for setup and the canonical six-tool contract, including
+state, coordinates, results, and recovery rules.
 
 ## Requirements
 
@@ -44,15 +39,10 @@ cargo install --locked --git https://github.com/mirsella/computer-use-mcp comput
 computer-use-mcp version
 ```
 
-The package name is explicit because this repository is a virtual Cargo
-workspace.
-
 ## OpenCode setup
 
-The transport is stdio only. Configure the MCP host to execute
-`computer-use-mcp mcp`; do not run it interactively or add wrappers that write
-to stdout. The host owns stdin and stdout. Stdout contains one UTF-8 JSON-RPC
-message per line, while diagnostics go to stderr.
+The transport is stdio only. Configure the host to execute
+`computer-use-mcp mcp`; stdout is reserved for JSON-RPC.
 
 You may request a reusable KDE portal grant before registration:
 
@@ -60,8 +50,7 @@ You may request a reusable KDE portal grant before registration:
 computer-use-mcp init
 ```
 
-This step is optional. It closes the temporary session and succeeds only if KDE
-returns a reusable restore token.
+This optional step requests a reusable KDE portal grant.
 
 Register the binary with OpenCode:
 
@@ -69,10 +58,8 @@ Register the binary with OpenCode:
 opencode mcp add computer_use -- "$(command -v computer-use-mcp)" mcp
 ```
 
-Edit the config path printed by that command. Keep the absolute executable
-path, set the local MCP `timeout` to `90000`, and set
-`"computer_use_*": "ask"`. The complete config and permission caveats are in
-[MCP.md](MCP.md#opencode-configuration).
+In the printed config, keep the absolute path, set `timeout` to `90000`, and set
+`"computer_use_*": "ask"`. See [MCP configuration](MCP.md#opencode-configuration).
 
 Test the connection:
 
@@ -80,11 +67,8 @@ Test the connection:
 opencode mcp list
 ```
 
-The status check starts enabled servers temporarily and may open the portal
-chooser. Normal OpenCode use starts another process. The MCP protocol becomes
-available immediately while portal approval and capture setup continue in the
-background. Restart or re-enable the MCP after denial, timeout, revocation, or
-stream loss; retrying a tool cannot create a new portal session.
+This may open the portal chooser. Restart or re-enable after portal denial,
+timeout, revocation, or stream loss.
 
 ## Direct commands
 
@@ -93,13 +77,10 @@ Use `computer-use-mcp help` for all commands. Common diagnostics are:
 ```sh
 computer-use-mcp doctor
 computer-use-mcp init
-computer-use-mcp list-apps
-computer-use-mcp snapshot APP
 ```
 
-`doctor`, `list-apps`, and `snapshot` do not open the portal chooser. The
-diagnostic `computer-use-mcp call FILE` batch interface is documented in
-[MCP.md](MCP.md#direct-call-command); it is not an MCP transport.
+The diagnostic `call FILE` batch interface is documented in
+[MCP.md](MCP.md#direct-commands-and-troubleshooting).
 
 ## Security and support
 

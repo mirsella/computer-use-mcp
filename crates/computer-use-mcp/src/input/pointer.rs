@@ -2,7 +2,9 @@ use std::{sync::Arc, time::Duration};
 
 use tokio::time::sleep;
 
-use super::backend::{HeldInput, HeldInputGuard, InputBackend, InputEvent, finish_with_cleanup};
+use super::backend::{
+    ActionProgress, HeldInput, HeldInputGuard, InputBackend, InputEvent, finish_with_cleanup,
+};
 
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(80);
 const DRAG_STEPS: usize = 16;
@@ -16,11 +18,20 @@ pub fn button_code(button: crate::validation::MouseButton) -> u32 {
     }
 }
 
-pub async fn move_pointer(backend: Arc<dyn InputBackend>, x: f64, y: f64) -> Result<(), String> {
+pub async fn move_pointer(
+    backend: Arc<dyn InputBackend>,
+    x: f64,
+    y: f64,
+    progress: Arc<ActionProgress>,
+) -> Result<(), String> {
     let mut guard = HeldInputGuard::new(Arc::clone(&backend));
     guard.begin().await?;
+    progress.mark_started();
     let result = backend.emit(InputEvent::Absolute { x, y }).await;
-    finish_with_cleanup(result, &mut guard).await
+    if result.is_ok() {
+        progress.mark_completed();
+    }
+    finish_with_cleanup(result, &mut guard, &progress).await
 }
 
 pub async fn click(
@@ -29,6 +40,7 @@ pub async fn click(
     y: f64,
     button: crate::validation::MouseButton,
     count: usize,
+    progress: Arc<ActionProgress>,
 ) -> Result<(), String> {
     if count == 0 {
         return Err("click count must be positive".into());
@@ -37,6 +49,7 @@ pub async fn click(
     let mut guard = HeldInputGuard::new(Arc::clone(&backend));
     guard.begin().await?;
     let result = async {
+        progress.mark_started();
         backend.emit(InputEvent::Absolute { x, y }).await?;
         for index in 0..count {
             guard.press(held).await?;
@@ -45,21 +58,27 @@ pub async fn click(
                 sleep(MULTI_CLICK_INTERVAL).await;
             }
         }
+        progress.mark_completed();
         Ok(())
     }
     .await;
-    finish_with_cleanup(result, &mut guard).await
+    finish_with_cleanup(result, &mut guard, &progress).await
 }
 
-pub async fn drag(
+pub async fn drag_path(
     backend: Arc<dyn InputBackend>,
-    from: (f64, f64),
-    to: (f64, f64),
+    path: Vec<(f64, f64)>,
+    progress: Arc<ActionProgress>,
 ) -> Result<(), String> {
+    if path.len() < 2 {
+        return Err("drag path must contain at least two points".into());
+    }
     let held = HeldInput::Button(272);
     let mut guard = HeldInputGuard::new(Arc::clone(&backend));
     guard.begin().await?;
-    let path = async {
+    let drag = async {
+        progress.mark_started();
+        let from = path[0];
         backend
             .emit(InputEvent::Absolute {
                 x: from.0,
@@ -67,22 +86,28 @@ pub async fn drag(
             })
             .await?;
         guard.press(held).await?;
-        for step in 1..=DRAG_STEPS {
-            let fraction = step as f64 / DRAG_STEPS as f64;
-            backend
-                .emit(InputEvent::Absolute {
-                    x: from.0 + (to.0 - from.0) * fraction,
-                    y: from.1 + (to.1 - from.1) * fraction,
-                })
-                .await?;
-            if step != DRAG_STEPS {
-                sleep(DRAG_STEP_INTERVAL).await;
+        for (segment, points) in path.windows(2).enumerate() {
+            let from = points[0];
+            let to = points[1];
+            for step in 1..=DRAG_STEPS {
+                let fraction = step as f64 / DRAG_STEPS as f64;
+                backend
+                    .emit(InputEvent::Absolute {
+                        x: from.0 + (to.0 - from.0) * fraction,
+                        y: from.1 + (to.1 - from.1) * fraction,
+                    })
+                    .await?;
+                if segment + 1 != path.len() - 1 || step != DRAG_STEPS {
+                    sleep(DRAG_STEP_INTERVAL).await;
+                }
             }
         }
-        guard.release(held).await
+        guard.release(held).await?;
+        progress.mark_completed();
+        Ok(())
     }
     .await;
-    finish_with_cleanup(path, &mut guard).await
+    finish_with_cleanup(drag, &mut guard, &progress).await
 }
 
 pub async fn scroll(
@@ -91,6 +116,7 @@ pub async fn scroll(
     y: f64,
     delta_x: i32,
     delta_y: i32,
+    progress: Arc<ActionProgress>,
 ) -> Result<(), String> {
     if delta_x == 0 && delta_y == 0 {
         return Err("scroll delta must not be zero".into());
@@ -98,16 +124,19 @@ pub async fn scroll(
     let mut guard = HeldInputGuard::new(Arc::clone(&backend));
     guard.begin().await?;
     let result = async {
+        progress.mark_started();
         backend.emit(InputEvent::Absolute { x, y }).await?;
         backend
             .emit(InputEvent::ScrollDiscrete {
                 x: delta_x,
                 y: delta_y,
             })
-            .await
+            .await?;
+        progress.mark_completed();
+        Ok(())
     }
     .await;
-    finish_with_cleanup(result, &mut guard).await
+    finish_with_cleanup(result, &mut guard, &progress).await
 }
 
 #[cfg(test)]
@@ -115,10 +144,16 @@ mod tests {
     use super::*;
     use crate::input::backend::{InputEvent, test_support::FakeBackend};
 
+    fn progress() -> Arc<ActionProgress> {
+        Arc::new(ActionProgress::default())
+    }
+
     #[tokio::test]
     async fn move_pointer_emits_no_button_event() {
         let fake = FakeBackend::new();
-        move_pointer(fake.clone(), 10.0, 20.0).await.unwrap();
+        move_pointer(fake.clone(), 10.0, 20.0, progress())
+            .await
+            .unwrap();
         assert_eq!(
             *fake.events.lock().unwrap(),
             [InputEvent::Absolute { x: 10.0, y: 20.0 }]
@@ -134,6 +169,7 @@ mod tests {
             20.0,
             crate::validation::MouseButton::Right,
             2,
+            progress(),
         )
         .await
         .unwrap();
@@ -164,7 +200,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn drag_ends_exactly_and_cleans_up_on_error_and_cancellation() {
         let fake = FakeBackend::new();
-        drag(fake.clone(), (1.0, 2.0), (17.0, 18.0)).await.unwrap();
+        drag_path(fake.clone(), vec![(1.0, 2.0), (17.0, 18.0)], progress())
+            .await
+            .unwrap();
         assert_eq!(
             fake.events.lock().unwrap().last(),
             Some(&InputEvent::Button {
@@ -182,7 +220,7 @@ mod tests {
             .fail_at
             .store(3, std::sync::atomic::Ordering::Release);
         assert!(
-            drag(failing.clone(), (0.0, 0.0), (2.0, 2.0),)
+            drag_path(failing.clone(), vec![(0.0, 0.0), (2.0, 2.0)], progress(),)
                 .await
                 .is_err()
         );
@@ -196,7 +234,11 @@ mod tests {
         );
 
         let cancelled = FakeBackend::new();
-        let task = tokio::spawn(drag(cancelled.clone(), (0.0, 0.0), (20.0, 20.0)));
+        let task = tokio::spawn(drag_path(
+            cancelled.clone(),
+            vec![(0.0, 0.0), (20.0, 20.0)],
+            progress(),
+        ));
         sleep(Duration::from_millis(20)).await;
         task.abort();
         let _ = task.await;
@@ -209,7 +251,9 @@ mod tests {
     #[tokio::test]
     async fn scroll_moves_then_emits_one_discrete_wheel_event() {
         let fake = FakeBackend::new();
-        scroll(fake.clone(), 10.0, 20.0, 0, 240).await.unwrap();
+        scroll(fake.clone(), 10.0, 20.0, 0, 240, progress())
+            .await
+            .unwrap();
         assert_eq!(
             *fake.events.lock().unwrap(),
             [
@@ -217,6 +261,6 @@ mod tests {
                 InputEvent::ScrollDiscrete { x: 0, y: 240 },
             ]
         );
-        assert!(scroll(fake, 10.0, 20.0, 0, 0).await.is_err());
+        assert!(scroll(fake, 10.0, 20.0, 0, 0, progress()).await.is_err());
     }
 }

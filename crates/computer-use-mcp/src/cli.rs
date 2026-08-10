@@ -1,5 +1,6 @@
 use std::{
     io::{Read, Write},
+    sync::Arc,
     time::Duration,
 };
 
@@ -7,16 +8,16 @@ use serde_json::{Map as JsonObject, Value};
 
 use crate::{
     VERSION,
-    accessibility::SemanticRuntime,
+    accessibility::AccessibilityAdapter,
     atspi_adapter::AtspiAdapter,
     errors::CliError,
     portal::{PortalApproval, PortalBackend, XdgPortalBackend, validate_capabilities},
-    runtime::{DesktopRuntime, tool_error_result},
+    runtime::{ActionProgress, DesktopRuntime, tool_error_result, with_action_progress},
     server,
     validation::validate_call,
 };
 
-const HELP: &str = "Computer Use MCP for Linux Wayland\n\nUsage:\n  computer-use-mcp [command]\n\nCommands:\n  init          Ask KDE to approve one monitor and save its restore token.\n  mcp           Start stdio immediately and initialize KDE capture in the background.\n  call FILE     Execute one call object or an array of calls in one stateful runtime; use - for stdin.\n  list-apps     List live apps with accessible top-level windows.\n  snapshot APP  Print a bounded text-only AT-SPI snapshot.\n  doctor        Report Wayland, portal, PipeWire, AT-SPI, and input prerequisites without prompting.\n  help          Show this help.\n  version       Print the CLI version.\n\nCall input uses {\"name\":\"list_applications\",\"arguments\":{\"scope\":\"running\"}} objects and prints one standard MCP result per line. Run init only to approve KDE access separately before enabling the MCP. KDE may ask again after revocation or display changes.\n";
+const HELP: &str = "Computer Use MCP for Linux Wayland\n\nUsage:\n  computer-use-mcp [command]\n\nCommands:\n  init          Ask KDE to approve one monitor and save its restore token.\n  mcp           Start stdio immediately and initialize KDE capture in the background.\n  call FILE     Execute one call object or an array of calls in one stateful runtime; use - for stdin.\n  doctor        Report Wayland, portal, PipeWire, AT-SPI, and input prerequisites without prompting.\n  help          Show this help.\n  version       Print the CLI version.\n\nCall input uses {\"name\":\"list_desktop\",\"arguments\":{\"scope\":\"windows\"}} objects and prints one standard MCP result per line. Run init only to approve KDE access separately before enabling the MCP. KDE may ask again after revocation or display changes.\n";
 
 pub async fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), CliError> {
     let arguments: Vec<_> = arguments.into_iter().collect();
@@ -66,34 +67,6 @@ pub async fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), CliE
             }
             println!(
                 "Portal approval initialized. Future computer-use sessions will ask KDE to restore it."
-            );
-            Ok(())
-        }
-        "list-apps" => {
-            require_no_extra_arguments(&arguments)?;
-            let runtime = SemanticRuntime::new(AtspiAdapter::default());
-            println!(
-                "{}",
-                runtime
-                    .list_apps_text()
-                    .await
-                    .map_err(|error| CliError::Mcp(error.to_string()))?
-            );
-            Ok(())
-        }
-        "snapshot" => {
-            if arguments.len() != 2 || arguments[1].trim().is_empty() {
-                return Err(CliError::InvalidArguments(
-                    "snapshot requires exactly one non-empty APP argument".to_owned(),
-                ));
-            }
-            let runtime = SemanticRuntime::new(AtspiAdapter::default());
-            println!(
-                "{}",
-                runtime
-                    .snapshot_text(arguments[1].clone(), None, None, None)
-                    .await
-                    .map_err(|error| CliError::Mcp(error.to_string()))?
             );
             Ok(())
         }
@@ -176,9 +149,25 @@ async fn execute_calls<R: DesktopRuntime, W: Write>(
         let call = validate_call(&name, arguments).map_err(|error| {
             CliError::InvalidArguments(format!("call {number} ({name}) is invalid: {error}"))
         })?;
-        let (result, failed) = match runtime.execute(call).await {
-            Ok(output) => (output.into_mcp_result(), false),
-            Err(error) => (tool_error_result(&error), true),
+        let progress = call
+            .tracks_action()
+            .then(|| Arc::new(ActionProgress::default()));
+        let (result, failed) = match runtime.execute(call, progress.clone()).await {
+            Ok(output) => {
+                let output = if let Some(progress) = progress.as_deref() {
+                    output.with_action_progress(progress)
+                } else {
+                    output
+                };
+                (output.into_mcp_result(), false)
+            }
+            Err(error) => {
+                let error = match progress.as_deref() {
+                    Some(progress) => with_action_progress(error, progress),
+                    None => error,
+                };
+                (tool_error_result(&error), true)
+            }
         };
         serde_json::to_writer(&mut *output, &result).map_err(|error| {
             CliError::Mcp(format!("failed to write direct-call result: {error}"))
@@ -250,8 +239,8 @@ async fn doctor() {
     }
 
     println!("\n[Accessibility (AT-SPI)]");
-    let atspi = SemanticRuntime::new(AtspiAdapter::default());
-    print_doctor_result(atspi.list_apps_text().await);
+    let atspi = AtspiAdapter::default();
+    print_doctor_result(atspi.discover().await.map(|_| ()));
 
     println!("\n[XDG desktop portal]");
     match XdgPortalBackend::default().capabilities().await {
@@ -352,7 +341,11 @@ mod tests {
     }
 
     impl DesktopRuntime for FakeRuntime {
-        async fn execute(&self, call: ToolCall) -> Result<ToolOutput, RuntimeError> {
+        async fn execute(
+            &self,
+            call: ToolCall,
+            _progress: Option<Arc<ActionProgress>>,
+        ) -> Result<ToolOutput, RuntimeError> {
             let mut calls = self.calls.lock().unwrap();
             calls.push(call);
             if self.fail_at == Some(calls.len()) {
@@ -365,7 +358,10 @@ mod tests {
             }
         }
 
-        async fn cleanup(&self) -> Result<(), RuntimeError> {
+        async fn cleanup(
+            &self,
+            _progress: Option<Arc<ActionProgress>>,
+        ) -> Result<(), RuntimeError> {
             Ok(())
         }
     }
@@ -377,9 +373,9 @@ mod tests {
             fail_at: Some(2),
         };
         let calls = vec![
-            json!({"name":"list_applications","arguments":{"scope":"running"}}),
-            json!({"name":"observe","arguments":{"target":"Editor"}}),
-            json!({"name":"list_applications","arguments":{"scope":"running"}}),
+            json!({"name":"list_desktop","arguments":{"scope":"windows"}}),
+            json!({"name":"list_desktop","arguments":{"scope":"windows"}}),
+            json!({"name":"list_desktop","arguments":{"scope":"windows"}}),
         ];
         let mut output = Vec::new();
 

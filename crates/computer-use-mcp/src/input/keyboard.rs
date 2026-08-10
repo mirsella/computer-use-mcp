@@ -1,5 +1,7 @@
 use xkbcommon::xkb;
 
+use crate::validation::MAX_KEYBOARD_MODIFIERS;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyChord {
     pub modifiers: Vec<u32>,
@@ -20,6 +22,11 @@ pub fn parse_chord(value: &str) -> Result<KeyChord, String> {
         .expect("split always yields at least one nonempty token");
     if key_is_modifier {
         return Err("key chord must end with a non-modifier key".into());
+    }
+    if tokens.len() > MAX_KEYBOARD_MODIFIERS {
+        return Err(format!(
+            "key chord may contain at most {MAX_KEYBOARD_MODIFIERS} modifiers"
+        ));
     }
     if let Some((index, _)) = tokens
         .iter()
@@ -149,6 +156,11 @@ mod tests {
             );
         }
         assert!(parse_chord("a+ctrl").is_err());
+        assert!(
+            parse_chord("ctrl+alt+shift+super+meta+F1")
+                .unwrap_err()
+                .contains("at most 4 modifiers")
+        );
         for name in [
             "Return",
             "Tab",

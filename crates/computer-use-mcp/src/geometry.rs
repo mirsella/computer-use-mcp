@@ -33,15 +33,6 @@ pub enum Transform {
     FlipRotate270,
 }
 
-impl Transform {
-    pub fn swaps_axes(self) -> bool {
-        matches!(
-            self,
-            Self::Rotate90 | Self::Rotate270 | Self::FlipRotate90 | Self::FlipRotate270
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

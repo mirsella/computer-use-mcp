@@ -16,19 +16,21 @@ pub struct EncodedPng {
     pub size: (u32, u32),
 }
 
-pub fn encode(
+/// Encode a complete captured frame through the same transform, crop, and
+/// output-budget path used for screenshot observations.  Callers must use the
+/// returned size for coordinate mappings; source crop dimensions are not PNG
+/// dimensions after rotation or bounded downscaling.
+pub fn encode_frame(
     rgba: Vec<u8>,
     frame_size: (u32, u32),
     valid_crop: PixelRect,
     transform: Transform,
-    output_crop: PixelRect,
 ) -> Result<EncodedPng, String> {
     encode_with_limits(
         rgba,
         frame_size,
         valid_crop,
         transform,
-        output_crop,
         MAX_LONGEST_DIMENSION,
         MAX_PNG_BYTES,
     )
@@ -40,15 +42,13 @@ pub(crate) fn encode_with_limits(
     frame_size: (u32, u32),
     valid_crop: PixelRect,
     transform: Transform,
-    output_crop: PixelRect,
     maximum_dimension: u32,
     maximum_bytes: usize,
 ) -> Result<EncodedPng, String> {
     let image = RgbaImage::from_raw(frame_size.0, frame_size.1, rgba)
         .ok_or_else(|| "PipeWire RGBA frame length does not match its dimensions".to_owned())?;
     let cropped = checked_crop(&image, valid_crop)?;
-    let transformed = apply_transform(cropped, transform);
-    let mut image = checked_crop(&transformed, output_crop)?;
+    let mut image = apply_transform(cropped, transform);
     fit_longest_dimension(&mut image, maximum_dimension);
 
     for attempt in 0..MAX_DOWNSCALE_ATTEMPTS {
@@ -140,12 +140,6 @@ mod tests {
                 height: height as u32,
             },
             Transform::Rotate90,
-            PixelRect {
-                x: 0,
-                y: 0,
-                width: height as u32,
-                height: width as u32,
-            },
             128,
             9_000,
         )

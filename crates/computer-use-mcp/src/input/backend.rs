@@ -1,6 +1,43 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
+pub use crate::runtime::{ActionProgress, DispatchStage, PostStatus};
+
 pub type InputFuture<'a, T = ()> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputError {
+    SessionUnavailable(String),
+    Dispatch(String),
+}
+
+impl From<String> for InputError {
+    fn from(message: String) -> Self {
+        if message.starts_with(crate::screenshot::SESSION_UNAVAILABLE) {
+            Self::SessionUnavailable(message)
+        } else {
+            Self::Dispatch(message)
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<&str> for InputError {
+    fn from(message: &str) -> Self {
+        Self::from(message.to_owned())
+    }
+}
+
+impl std::fmt::Display for InputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionUnavailable(message) | Self::Dispatch(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+impl std::error::Error for InputError {}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputEvent {
@@ -41,6 +78,7 @@ impl HeldInput {
 pub trait InputBackend: Send + Sync + 'static {
     fn begin_sequence(&self) -> InputFuture<'_>;
     fn emit(&self, event: InputEvent) -> InputFuture<'_>;
+    fn sync_barrier(&self) -> InputFuture<'_>;
     fn queue_release(&self, held: Vec<HeldInput>);
     fn cleanup_barrier(&self) -> InputFuture<'_>;
 }
@@ -117,22 +155,30 @@ impl Drop for HeldInputGuard {
 pub async fn finish_with_cleanup<T>(
     result: Result<T, String>,
     guard: &mut HeldInputGuard,
+    progress: &ActionProgress,
 ) -> Result<T, String> {
-    match result {
-        Ok(value) => {
-            guard.release_all().await?;
+    let cleanup = guard.release_all().await;
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => {
+            progress.mark_cleanup_completed();
             Ok(value)
         }
-        Err(original) => {
-            if let Err(cleanup) = guard.release_all().await {
-                eprintln!(
-                    "computer-use-mcp: held-input cleanup also failed after {original}: {cleanup}"
-                );
-                return Err(format!(
-                    "{original}; held-input cleanup also failed and the input session was invalidated: {cleanup}"
-                ));
-            }
+        (Ok(_), Err(cleanup)) => {
+            progress.mark_cleanup_failed();
+            Err(cleanup)
+        }
+        (Err(original), Ok(())) => {
+            progress.mark_cleanup_completed();
             Err(original)
+        }
+        (Err(original), Err(cleanup)) => {
+            progress.mark_cleanup_failed();
+            eprintln!(
+                "computer-use-mcp: held-input cleanup also failed after {original}: {cleanup}"
+            );
+            Err(format!(
+                "{original}; held-input cleanup also failed and the input session was invalidated: {cleanup}"
+            ))
         }
     }
 }
@@ -149,6 +195,13 @@ pub(crate) mod test_support {
 
     use super::*;
 
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum TraceEvent {
+        Emit(InputEvent),
+        SyncBarrier,
+        CleanupBarrier,
+    }
+
     pub struct FakeBackend {
         pub events: Mutex<Vec<InputEvent>>,
         pub emergency: Mutex<Vec<HeldInput>>,
@@ -157,6 +210,9 @@ pub(crate) mod test_support {
         pub fail_begin: AtomicBool,
         pub pending_releases: AtomicBool,
         pub cleanup_calls: AtomicUsize,
+        pub sync_calls: AtomicUsize,
+        pub fail_sync: AtomicBool,
+        pub trace: Mutex<Vec<TraceEvent>>,
     }
 
     impl FakeBackend {
@@ -169,6 +225,9 @@ pub(crate) mod test_support {
                 fail_begin: AtomicBool::new(false),
                 pending_releases: AtomicBool::new(false),
                 cleanup_calls: AtomicUsize::new(0),
+                sync_calls: AtomicUsize::new(0),
+                fail_sync: AtomicBool::new(false),
+                trace: Mutex::new(Vec::new()),
             })
         }
     }
@@ -184,7 +243,8 @@ pub(crate) mod test_support {
             let result = if index == self.fail_at.load(Ordering::Acquire) {
                 Err(format!("fake failure at event {index}"))
             } else {
-                self.events.lock().unwrap().push(event);
+                self.events.lock().unwrap().push(event.clone());
+                self.trace.lock().unwrap().push(TraceEvent::Emit(event));
                 Ok(())
             };
             Box::pin(async move { result })
@@ -199,6 +259,17 @@ pub(crate) mod test_support {
             Box::pin(async move { result })
         }
 
+        fn sync_barrier(&self) -> InputFuture<'_> {
+            self.sync_calls.fetch_add(1, Ordering::AcqRel);
+            self.trace.lock().unwrap().push(TraceEvent::SyncBarrier);
+            let result = if self.fail_sync.load(Ordering::Acquire) {
+                Err("fake synchronization failure".into())
+            } else {
+                Ok(())
+            };
+            Box::pin(async move { result })
+        }
+
         fn queue_release(&self, held: Vec<HeldInput>) {
             self.queue_calls.lock().unwrap().push(held.clone());
             self.emergency.lock().unwrap().extend(held);
@@ -206,6 +277,7 @@ pub(crate) mod test_support {
 
         fn cleanup_barrier(&self) -> InputFuture<'_> {
             self.cleanup_calls.fetch_add(1, Ordering::AcqRel);
+            self.trace.lock().unwrap().push(TraceEvent::CleanupBarrier);
             let held = std::mem::take(&mut *self.emergency.lock().unwrap());
             for input in held {
                 self.events.lock().unwrap().push(input.release_event());

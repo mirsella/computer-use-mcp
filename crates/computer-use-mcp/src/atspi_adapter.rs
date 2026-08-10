@@ -300,13 +300,13 @@ impl AtspiAdapter {
         } else {
             None
         };
-        let (text, selected_text) = if interface_set
+        let (text, text_truncated, selected_text) = if interface_set
             .as_ref()
             .is_some_and(|interfaces| interfaces.contains(Interface::Text))
         {
             read_text_metadata(connection, object, text_limit).await
         } else {
-            (None, None)
+            (None, None, None)
         };
         let has_value = interface_set
             .as_ref()
@@ -332,6 +332,7 @@ impl AtspiAdapter {
             name,
             value,
             text,
+            text_truncated,
             selected_text,
             states,
             capabilities,
@@ -381,6 +382,17 @@ impl AtspiAdapter {
         }
         Ok(())
     }
+
+    async fn activate_inner(&self, object: &ObjectId) -> Result<(), RuntimeError> {
+        let connection = self.connection().await?;
+        let proxy = component_proxy(connection, object).await?;
+        if !proxy.grab_focus().await.map_err(atspi_call_error)? {
+            return Err(runtime_error(
+                "AT-SPI Component.GrabFocus did not activate the window",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl AccessibilityAdapter for AtspiAdapter {
@@ -402,6 +414,13 @@ impl AccessibilityAdapter for AtspiAdapter {
         action: SemanticAction,
     ) -> impl Future<Output = Result<(), RuntimeError>> + Send + 'a {
         self.act_inner(object, action)
+    }
+
+    fn activate<'a>(
+        &'a self,
+        object: &'a ObjectId,
+    ) -> impl Future<Output = Result<(), RuntimeError>> + Send + 'a {
+        self.activate_inner(object)
     }
 }
 
@@ -484,34 +503,48 @@ async fn read_text_metadata(
     connection: &Connection,
     object: &ObjectId,
     text_limit: usize,
-) -> (Option<String>, Option<String>) {
+) -> (Option<String>, Option<bool>, Option<String>) {
     let Some(proxy) = optional(
         object,
         "Text",
         "proxy",
         text_proxy(connection, object).await,
     ) else {
-        return (None, None);
+        return (None, None, None);
     };
 
-    let text = match optional(
+    let (text, text_truncated) = match optional(
         object,
         "Text",
         "CharacterCount",
         proxy.character_count().await,
     ) {
-        Some(count) if count >= 0 => {
-            let end = count.min(i32::try_from(text_limit).unwrap_or(i32::MAX));
-            optional(object, "Text", "GetText", proxy.get_text(0, end).await)
-        }
-        Some(count) => {
-            eprintln!(
-                "computer-use-mcp: optional AT-SPI metadata unavailable: object={}{} interface=Text member=CharacterCount error=negative character count {count}",
-                object.bus_name, object.path
-            );
-            None
-        }
-        None => None,
+        Some(count) => match bounded_text_end(count, text_limit) {
+            Some((end, truncated)) => {
+                match optional(object, "Text", "GetText", proxy.get_text(0, end).await) {
+                    Some(value) => {
+                        let (value, provider_truncated) =
+                            limit_metadata_with_truncation(value, text_limit);
+                        if provider_truncated {
+                            eprintln!(
+                                "computer-use-mcp: AT-SPI Text.GetText provider exceeded the configured {text_limit}-character budget for object={}{}; clamped locally",
+                                object.bus_name, object.path
+                            );
+                        }
+                        (Some(value), Some(truncated || provider_truncated))
+                    }
+                    None => (None, None),
+                }
+            }
+            None => {
+                eprintln!(
+                    "computer-use-mcp: optional AT-SPI metadata unavailable: object={}{} interface=Text member=CharacterCount error=negative character count {count}",
+                    object.bus_name, object.path
+                );
+                (None, None)
+            }
+        },
+        None => (None, None),
     };
 
     let selected_text = match optional(
@@ -522,19 +555,51 @@ async fn read_text_metadata(
     ) {
         Some(count) if count > 0 => {
             match optional(object, "Text", "GetSelection", proxy.get_selection(0).await) {
-                Some((start, end)) => optional(
-                    object,
-                    "Text",
-                    "GetText(selection)",
-                    // Toolkits can invalidate a selection between these D-Bus calls.
-                    proxy.get_text(start, end).await,
-                ),
+                Some((start, end)) if start >= 0 && end >= start => {
+                    let bounded_end = bounded_selection_end(start, end, text_limit)
+                        .expect("selection range was checked above");
+                    if bounded_end < end {
+                        eprintln!(
+                            "computer-use-mcp: capping AT-SPI selected text read at {text_limit} characters for object={}{}",
+                            object.bus_name, object.path
+                        );
+                    }
+                    optional(
+                        object,
+                        "Text",
+                        "GetText(selection)",
+                        // Toolkits can invalidate a selection between these D-Bus calls.
+                        proxy
+                            .get_text(start, bounded_end)
+                            .await
+                            .map(|value| limit_metadata(value, text_limit)),
+                    )
+                }
+                Some((start, end)) => {
+                    eprintln!(
+                        "computer-use-mcp: optional AT-SPI selected text unavailable: invalid range ({start}, {end}) for object={}{}",
+                        object.bus_name, object.path
+                    );
+                    None
+                }
                 None => None,
             }
         }
         _ => None,
     };
-    (text, selected_text)
+    (text, text_truncated, selected_text)
+}
+
+fn bounded_selection_end(start: i32, end: i32, text_limit: usize) -> Option<i32> {
+    (start >= 0 && end >= start)
+        .then(|| end.min(start.saturating_add(i32::try_from(text_limit).unwrap_or(i32::MAX))))
+}
+
+fn bounded_text_end(count: i32, text_limit: usize) -> Option<(i32, bool)> {
+    (count >= 0).then(|| {
+        let end = count.min(i32::try_from(text_limit).unwrap_or(i32::MAX));
+        (end, count > end)
+    })
 }
 
 async fn read_value_metadata(connection: &Connection, object: &ObjectId) -> Option<String> {
@@ -544,13 +609,21 @@ async fn read_value_metadata(connection: &Connection, object: &ObjectId) -> Opti
         "proxy",
         value_proxy(connection, object).await,
     )?;
-    if let Some(display) = optional(object, "Value", "Text", proxy.text().await)
-        && !display.is_empty()
-    {
-        return Some(display);
-    }
+    // Value.Text has no range argument in the AT-SPI API. Do not request an
+    // unrestricted provider string; CurrentValue is the bounded source we can
+    // safely expose at this boundary.
     optional(object, "Value", "CurrentValue", proxy.current_value().await)
         .map(|value| value.to_string())
+}
+
+fn limit_metadata(value: String, text_limit: usize) -> String {
+    limit_metadata_with_truncation(value, text_limit).0
+}
+
+fn limit_metadata_with_truncation(value: String, text_limit: usize) -> (String, bool) {
+    let mut chars = value.chars();
+    let value = chars.by_ref().take(text_limit).collect();
+    (value, chars.next().is_some())
 }
 
 fn optional<T, E: std::fmt::Display>(
@@ -608,7 +681,10 @@ fn runtime_error(message: impl Into<String>) -> RuntimeError {
 
 #[cfg(test)]
 mod tests {
-    use super::{AtspiAdapter, optional};
+    use super::{
+        AtspiAdapter, bounded_selection_end, bounded_text_end, limit_metadata_with_truncation,
+        optional,
+    };
     use crate::accessibility::{AccessibilityAdapter, ObjectId};
 
     #[test]
@@ -625,6 +701,42 @@ mod tests {
         ] {
             assert!(optional::<(), _>(&object, "Value", "Text", Err(error)).is_none());
         }
+    }
+
+    #[test]
+    fn selected_text_range_is_bounded_before_the_dbus_read() {
+        assert_eq!(bounded_selection_end(10, 100, 5), Some(15));
+        assert_eq!(bounded_selection_end(10, 100, 0), Some(10));
+        assert_eq!(bounded_selection_end(-1, 10, 5), None);
+        assert_eq!(bounded_selection_end(10, 9, 5), None);
+    }
+
+    #[test]
+    fn ordinary_text_range_is_bounded_before_the_dbus_read_and_reports_truncation() {
+        assert_eq!(bounded_text_end(100, 5), Some((5, true)));
+        assert_eq!(bounded_text_end(5, 5), Some((5, false)));
+        assert_eq!(bounded_text_end(0, 0), Some((0, false)));
+        assert_eq!(bounded_text_end(-1, 5), None);
+    }
+
+    #[test]
+    fn ordinary_text_read_reclamps_an_overlong_provider_response() {
+        let (requested_end, source_truncated) = bounded_text_end(2, 2).expect("valid count");
+        let mut requested_range = None;
+        let mut provider = |start, end| {
+            requested_range = Some((start, end));
+            // This fake provider ignores the bounded end and returns one extra
+            // Unicode scalar value, as an out-of-contract toolkit may do.
+            "A😀B".to_owned()
+        };
+
+        let (value, provider_truncated) =
+            limit_metadata_with_truncation(provider(0, requested_end), 2);
+
+        assert_eq!(requested_range, Some((0, 2)));
+        assert_eq!(value, "A😀");
+        assert!(!source_truncated);
+        assert!(provider_truncated);
     }
 
     #[tokio::test]

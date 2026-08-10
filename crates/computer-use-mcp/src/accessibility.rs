@@ -10,7 +10,7 @@ use std::{
 };
 
 use futures_util::FutureExt;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::{
     sync::watch,
     task::JoinHandle,
@@ -18,17 +18,77 @@ use tokio::{
 };
 
 use crate::{
-    errors::{RuntimeError, ToolOutcome},
-    input::GeneratedInputAction,
-    runtime::{DesktopRuntime, ToolOutput},
-    screenshot::{NoScreenshots, SESSION_UNAVAILABLE, ScreenshotMapping, ScreenshotProvider},
+    errors::{RuntimeError, StaleAuthority, ToolOutcome},
+    input::{
+        GeneratedInputAction,
+        backend::{DispatchStage, InputError, PostStatus},
+    },
+    runtime::{
+        ActionProgress, ActionProgressSnapshot, DesktopRuntime, ToolOutput, action_progress_json,
+        compact_action_progress, with_action_progress, with_action_progress_snapshot,
+    },
+    screenshot::{
+        FrameWaitCondition, NoScreenshots, SESSION_UNAVAILABLE, ScreenshotMapping,
+        ScreenshotProvider,
+    },
     validation::{
-        ApplicationScope, ElementAction, KeyboardFocus, MAX_TEXT_LIMIT, ObservationView, TextLimit,
-        ToolCall,
+        AccessibilityRequest, AccessibilityScope, ActOperation, DEFAULT_ACCESSIBILITY_MAX_DEPTH,
+        DEFAULT_ACCESSIBILITY_MAX_NODES, DEFAULT_ACCESSIBILITY_TEXT_LIMIT, DesktopScope,
+        ElementAction, MAX_TEXT_LIMIT, ObservationRef, ObserveView, TargetRef, TextLimit, ToolCall,
+        WaitCondition,
+    },
+    wayland_catalog::WaylandCatalog,
+    window_backend::{
+        AtspiBinding, BackendError, BackendKind, BackendStatus, CapabilityState, CatalogError,
+        WindowCatalog, WindowEntry, WindowTarget,
     },
 };
 
 pub const EMPTY_APPS_MESSAGE: &str = "No running applications with accessible windows found.";
+
+/// Hard budgets for model-facing observation/action payloads.  These are byte
+/// budgets for UTF-8 text and serialized structured JSON respectively; the
+/// implementation below trims complete elements or individual text fields,
+/// never an already-serialized JSON byte slice.
+pub const MAX_MODEL_TEXT_BYTES: usize = crate::runtime::MAX_MODEL_TEXT_BYTES;
+pub const MAX_MODEL_STRUCTURED_BYTES: usize = crate::runtime::MAX_MODEL_STRUCTURED_BYTES;
+
+const MAX_MODEL_FIELD_CHARS: usize = 1_024;
+const MAX_MODEL_ACTIONS: usize = 16;
+const MAX_MODEL_STATES: usize = 32;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ResponseTruncation {
+    truncated: bool,
+    fields_truncated: bool,
+    elements_included: usize,
+    elements_omitted: usize,
+}
+
+impl ResponseTruncation {
+    fn json(self) -> Value {
+        json!({
+            "truncated": self.truncated,
+            "reason": self.truncated.then_some("response_byte_budget"),
+            "fields_truncated": self.fields_truncated,
+            "elements_included": self.elements_included,
+            "elements_omitted": self.elements_omitted,
+        })
+    }
+
+    fn text_marker(self) -> String {
+        format!(
+            "Truncated: reason=response_byte_budget elements_included={} elements_omitted={} fields_truncated={}",
+            self.elements_included, self.elements_omitted, self.fields_truncated
+        )
+    }
+}
+
+#[derive(Debug)]
+struct TextProjection {
+    text: String,
+    truncation: ResponseTruncation,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ObjectId {
@@ -150,6 +210,7 @@ pub struct NodeInfo {
     pub name: String,
     pub value: Option<String>,
     pub text: Option<String>,
+    pub text_truncated: Option<bool>,
     pub selected_text: Option<String>,
     pub states: BTreeSet<String>,
     pub capabilities: NodeCapabilities,
@@ -194,6 +255,16 @@ pub trait AccessibilityAdapter: Send + Sync + 'static {
         object: &'a ObjectId,
         action: SemanticAction,
     ) -> impl Future<Output = Result<(), RuntimeError>> + Send + 'a;
+    fn activate<'a>(
+        &'a self,
+        _object: &'a ObjectId,
+    ) -> impl Future<Output = Result<(), RuntimeError>> + Send + 'a {
+        async {
+            Err(capability_error(
+                "the accessibility backend does not advertise window activation",
+            ))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -228,9 +299,9 @@ impl Drop for DesktopSession {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            default_max_nodes: 1_200,
-            default_max_depth: 64,
-            default_text_limit: 500,
+            default_max_nodes: DEFAULT_ACCESSIBILITY_MAX_NODES,
+            default_max_depth: DEFAULT_ACCESSIBILITY_MAX_DEPTH,
+            default_text_limit: DEFAULT_ACCESSIBILITY_TEXT_LIMIT,
             call_timeout: Duration::from_secs(2),
             portal_timeout: Duration::from_secs(60),
             snapshot_timeout: Duration::from_secs(12),
@@ -252,18 +323,48 @@ pub struct SnapshotLimits {
     pub depth: usize,
 }
 
+#[derive(Debug, Clone)]
+struct VisualSnapshotOptions {
+    view: ObserveView,
+    accessibility_scope: AccessibilityScope,
+    element_query: Option<String>,
+    limits: SnapshotLimits,
+    accessibility_ready: bool,
+    accessibility_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
-    pub app_query: String,
-    pub view: ObservationView,
+    pub view: AccessibilityScope,
     pub element_query: Option<String>,
     pub app: AppInfo,
     pub window: WindowInfo,
     pub generation: u64,
     pub elements: Vec<ElementSnapshot>,
+    pub element_ids: Vec<String>,
     pub node_limit_reached: bool,
     pub depth_limit_reached: bool,
     pub limits: SnapshotLimits,
+    pub target_ref: Option<TargetRef>,
+    pub accessibility_ready: bool,
+    pub accessibility_reason: Option<String>,
+    pub requires_atspi_revalidation: bool,
+    pub screenshot_requested: bool,
+}
+
+struct ElementWaitRequest<'a, F> {
+    target: &'a TargetRef,
+    baseline: Arc<Snapshot>,
+    element_id: &'a str,
+    deadline: tokio::time::Instant,
+    condition: WaitCondition,
+    predicate: F,
+    success_message: &'a str,
+}
+
+struct GeneratedActionResult {
+    output: ToolOutput,
+    replacement: Option<Arc<Snapshot>>,
 }
 
 #[derive(Debug)]
@@ -275,6 +376,7 @@ struct CachedObservation {
 #[derive(Debug, Default)]
 struct Cache {
     generation: u64,
+    element_generation: u64,
     observations: Vec<CachedObservation>,
 }
 
@@ -293,6 +395,16 @@ impl Cache {
             .checked_add(1)
             .ok_or_else(|| operational_error("snapshot generation overflow"))?;
         snapshot.generation = self.generation;
+        let mut element_ids = Vec::with_capacity(snapshot.elements.len());
+        for _ in &snapshot.elements {
+            let id = format!("e-{:016x}", self.element_generation);
+            self.element_generation = self
+                .element_generation
+                .checked_add(1)
+                .ok_or_else(|| operational_error("element ID generation overflow"))?;
+            element_ids.push(id);
+        }
+        snapshot.element_ids = element_ids;
         let snapshot = Arc::new(snapshot);
         self.observations
             .retain(|cached| !same_target(&cached.snapshot, &snapshot));
@@ -313,15 +425,15 @@ impl Cache {
         Ok(snapshot)
     }
 
-    fn required(&self, state_id: &str) -> Result<&CachedObservation, RuntimeError> {
+    fn required(&self, observation_id: &str) -> Result<&CachedObservation, RuntimeError> {
         self.observations
             .iter()
-            .find(|cached| snapshot_state_id(&cached.snapshot) == state_id)
+            .find(|cached| observation_id_for_snapshot(&cached.snapshot) == observation_id)
             .ok_or_else(|| {
                 if self.observations.is_empty() {
                     state_required_error("no observation is available; call observe first")
                 } else {
-                    stale_state_error(format!("state_id {state_id:?} is stale"))
+                    stale_observation_error(format!("observation_id {observation_id:?} is stale"))
                 }
             })
     }
@@ -335,7 +447,7 @@ impl Cache {
                 state_required_error("state cache lost the observation before action dispatch")
             })?;
         if !same_target(&self.observations[position].snapshot, expected) {
-            return Err(stale_state_error(
+            return Err(stale_observation_error(
                 "state changed before action dispatch; call observe again",
             ));
         }
@@ -353,6 +465,39 @@ impl Cache {
         for cached in &mut self.observations {
             cached.screenshot_mapping = None;
         }
+    }
+
+    fn invalidate_all(&mut self) {
+        self.observations.clear();
+    }
+
+    fn frame_for_target(
+        &self,
+        target: &TargetRef,
+        frame_id: Option<&str>,
+    ) -> Result<(Arc<Snapshot>, ScreenshotMapping), RuntimeError> {
+        self.observations
+            .iter()
+            .rev()
+            .filter(|cached| cached.snapshot.target_ref.as_ref() == Some(target))
+            .find_map(|cached| {
+                cached.screenshot_mapping.as_ref().and_then(|mapping| {
+                    frame_id
+                        .is_none_or(|frame_id| crate::capture::frame_id(&mapping.source) == frame_id)
+                        .then(|| (Arc::clone(&cached.snapshot), mapping.clone()))
+                })
+            })
+            .ok_or_else(|| {
+                if frame_id.is_some() {
+                    stale_observation_error(
+                        "frame_id is unknown, stale, or belongs to another target",
+                    )
+                } else {
+                    state_required_error(
+                        "no retained monitor frame belongs to this target; call observe with screenshot",
+                    )
+                }
+            })
     }
 }
 
@@ -401,8 +546,7 @@ fn node_string_bytes(node: &NodeInfo) -> usize {
 }
 
 fn snapshot_string_bytes(snapshot: &Snapshot) -> usize {
-    snapshot.app_query.len()
-        + snapshot.element_query.as_ref().map_or(0, String::len)
+    snapshot.element_query.as_ref().map_or(0, String::len)
         + app_string_bytes(&snapshot.app)
         + window_string_bytes(&snapshot.window)
         + snapshot
@@ -418,8 +562,11 @@ pub struct SemanticRuntime<A, S = NoScreenshots> {
     desktop_session: DesktopSession,
     config: RuntimeConfig,
     cache: Mutex<Cache>,
+    catalog: Mutex<WindowCatalog>,
+    wayland: Arc<WaylandCatalog>,
     mutation: tokio::sync::Mutex<()>,
     launch_in_progress: Arc<AtomicBool>,
+    launch_tasks: Arc<crate::desktop_launcher::LaunchTasks>,
 }
 
 impl<A, S> std::fmt::Debug for SemanticRuntime<A, S> {
@@ -443,6 +590,7 @@ impl<A: AccessibilityAdapter> SemanticRuntime<A, NoScreenshots> {
 
 impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
     pub fn with_screenshot_provider(adapter: A, screenshots: S, config: RuntimeConfig) -> Self {
+        let wayland = Arc::new(WaylandCatalog::start());
         Self {
             adapter,
             screenshots: Arc::new(screenshots),
@@ -452,8 +600,11 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             },
             config,
             cache: Mutex::new(Cache::default()),
+            catalog: Mutex::new(WindowCatalog::default()),
+            wayland,
             mutation: tokio::sync::Mutex::new(()),
             launch_in_progress: Arc::new(AtomicBool::new(false)),
+            launch_tasks: Arc::new(crate::desktop_launcher::LaunchTasks::default()),
         }
     }
 
@@ -538,65 +689,975 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         }
     }
 
-    async fn list_running_apps(&self) -> Result<Vec<AppInfo>, RuntimeError> {
-        let mut apps = self.discover().await?;
-        apps.retain(|app| !app.windows.is_empty());
-        apps.sort_by(|left, right| {
-            left.name
-                .to_lowercase()
-                .cmp(&right.name.to_lowercase())
-                .then_with(|| left.name.cmp(&right.name))
-                .then_with(|| left.pid.cmp(&right.pid))
-        });
-        Ok(apps)
-    }
-
-    pub async fn list_apps_text(&self) -> Result<String, RuntimeError> {
-        let apps = self.list_running_apps().await?;
-        Ok(format_running_apps(&apps))
-    }
-
-    pub async fn snapshot_text(
+    async fn list_desktop(
         &self,
-        app_query: String,
-        text_limit: Option<TextLimit>,
-        max_nodes: Option<usize>,
-        max_depth: Option<usize>,
-    ) -> Result<String, RuntimeError> {
-        let _mutation = self.mutation.lock().await;
-        let snapshot = self
-            .requested_snapshot(
-                app_query,
-                ObservationView::Full,
-                None,
-                text_limit,
-                max_nodes,
-                max_depth,
+        scope: DesktopScope,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ToolOutput, RuntimeError> {
+        match scope {
+            DesktopScope::Applications => {
+                let apps = crate::desktop_launcher::list_installed_apps().await?;
+                let generation = installed_app_page_generation(&apps);
+                let start = page_start(cursor, scope, generation, apps.len())?;
+                let end = start
+                    .checked_add(limit)
+                    .ok_or_else(|| operational_error("desktop page limit overflow"))?
+                    .min(apps.len());
+                let page = &apps[start..end];
+                let next_cursor = (end < apps.len()).then(|| page_cursor(scope, generation, end));
+                let text = if page.is_empty() {
+                    "No installed desktop applications found.".to_owned()
+                } else {
+                    let entries = page
+                        .iter()
+                        .map(|app| {
+                            format!(
+                                "{} — {}",
+                                truncate(&escape(&app.name), MAX_MODEL_FIELD_CHARS),
+                                app.desktop_id
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    bounded_list_text("", &entries, next_cursor.as_deref())
+                };
+                let text = if page.is_empty() {
+                    bounded_list_text(&text, &[], next_cursor.as_deref())
+                } else {
+                    text
+                };
+                let structured = json!({
+                    "scope": "applications",
+                    "limit": limit,
+                    "next_cursor": next_cursor,
+                    "applications": page.iter().map(|app| json!({
+                        "desktop_id": app.desktop_id,
+                        "name": app.name,
+                        "shown": app.shown,
+                        "capabilities": {"launch": "supported"}
+                    })).collect::<Vec<_>>()
+                });
+                Ok(ToolOutput::text(text).with_structured_content(structured))
+            }
+            DesktopScope::Windows => {
+                let apps = match self.discover().await {
+                    Ok(apps) => apps,
+                    Err(error) => {
+                        eprintln!(
+                            "computer-use-mcp: AT-SPI discovery unavailable while listing compositor windows: {error}"
+                        );
+                        Vec::new()
+                    }
+                };
+                let compositor = self.wayland.snapshot().await.map_err(|error| {
+                    eprintln!(
+                        "computer-use-mcp: Wayland catalog unavailable while listing windows: {error}"
+                    );
+                    operational_error(format!("Wayland catalog snapshot failed: {error}"))
+                })?;
+                let (entries, membership_generation) = {
+                    let mut catalog = self.lock_catalog()?;
+                    let entries = catalog
+                        .reconcile_sources(&apps, compositor.records)
+                        .map_err(catalog_error)?;
+                    (entries, catalog.membership_generation())
+                };
+                let start = page_start(cursor, scope, membership_generation, entries.len())?;
+                let end = start
+                    .checked_add(limit)
+                    .ok_or_else(|| operational_error("desktop page limit overflow"))?
+                    .min(entries.len());
+                let page = &entries[start..end];
+                let next_cursor =
+                    (end < entries.len()).then(|| page_cursor(scope, membership_generation, end));
+                let backend_text = format!(
+                    "Backends: standard_foreign_toplevel={} kde_plasma_rich={}",
+                    compact_backend_status(&compositor.standard),
+                    compact_backend_status(&compositor.kde),
+                );
+                let text = if page.is_empty() {
+                    bounded_list_text(
+                        &backend_text,
+                        &[EMPTY_APPS_MESSAGE.to_owned()],
+                        next_cursor.as_deref(),
+                    )
+                } else {
+                    let entries = page.iter().map(compact_window_entry).collect::<Vec<_>>();
+                    bounded_list_text(&backend_text, &entries, next_cursor.as_deref())
+                };
+                let structured = json!({
+                    "scope": "windows",
+                    "limit": limit,
+                    "next_cursor": next_cursor,
+                    "windows": page.iter().map(WindowEntry::as_json).collect::<Vec<_>>(),
+                    "backends": {
+                        "standard_foreign_toplevel": compositor.standard.capability().as_json(),
+                        "kde_plasma_rich": compositor.kde.capability().as_json(),
+                    }
+                });
+                Ok(ToolOutput::text(text).with_structured_content(structured))
+            }
+        }
+    }
+
+    fn lock_catalog(&self) -> Result<std::sync::MutexGuard<'_, WindowCatalog>, RuntimeError> {
+        self.catalog.lock().map_err(|_| {
+            eprintln!("computer-use-mcp: window catalog mutex poisoned");
+            operational_error("window catalog invariant failed")
+        })
+    }
+
+    fn target_entry(&self, target: &TargetRef) -> Result<WindowEntry, RuntimeError> {
+        self.lock_catalog()?
+            .get(&WindowTarget {
+                app_instance_id: target.app_instance_id.clone(),
+                window_instance_id: target.window_instance_id.clone(),
+            })
+            .map_err(catalog_error)
+    }
+
+    async fn refresh_window_catalog(&self) -> Result<(), RuntimeError> {
+        let apps = match self.discover().await {
+            Ok(apps) => apps,
+            Err(error) => {
+                eprintln!(
+                    "computer-use-mcp: AT-SPI discovery unavailable while refreshing target catalog: {error}"
+                );
+                Vec::new()
+            }
+        };
+        let compositor = self.wayland.snapshot().await.map_err(|error| {
+            eprintln!(
+                "computer-use-mcp: Wayland catalog unavailable while refreshing targets: {error}"
+            );
+            operational_error(format!("Wayland catalog snapshot failed: {error}"))
+        })?;
+        self.lock_catalog()?
+            .reconcile_sources(&apps, compositor.records)
+            .map_err(catalog_error)?;
+        Ok(())
+    }
+
+    async fn requested_target_snapshot(
+        &self,
+        target: &TargetRef,
+        view: ObserveView,
+        accessibility: Option<AccessibilityRequest>,
+    ) -> Result<Arc<Snapshot>, RuntimeError> {
+        // Target IDs are process-lifetime handles, but the backend record must
+        // still be present in the current catalog before visual capture or
+        // accessibility collection begins.
+        self.refresh_window_catalog().await?;
+        let entry = self.target_entry(target)?;
+        let accessibility = accessibility.unwrap_or_else(|| AccessibilityRequest {
+            scope: AccessibilityScope::default(),
+            query: None,
+            limits: crate::validation::AccessibilityLimits {
+                text: TextLimit::Count(self.config.default_text_limit),
+                nodes: self.config.default_max_nodes,
+                depth: self.config.default_max_depth,
+            },
+        });
+        let wants_accessibility = matches!(view, ObserveView::Accessibility | ObserveView::Both);
+        let wants_screenshot = matches!(view, ObserveView::Screenshot | ObserveView::Both);
+        let snapshot_limits = SnapshotLimits {
+            text: match accessibility.limits.text {
+                TextLimit::Count(value) => value,
+                TextLimit::Max => MAX_TEXT_LIMIT,
+            },
+            nodes: accessibility.limits.nodes,
+            depth: accessibility.limits.depth,
+        };
+
+        if !wants_accessibility {
+            return self.commit_snapshot(self.visual_snapshot(
+                &entry,
+                target,
+                VisualSnapshotOptions {
+                    view,
+                    accessibility_scope: accessibility.scope,
+                    element_query: accessibility.query.clone(),
+                    limits: snapshot_limits,
+                    accessibility_ready: false,
+                    accessibility_reason: Some("accessibility was not requested".into()),
+                },
+            ));
+        }
+
+        let Some(binding) = entry.atspi.clone() else {
+            let reason = "this window has no AT-SPI authority";
+            if wants_screenshot {
+                return self.commit_snapshot(self.visual_snapshot(
+                    &entry,
+                    target,
+                    VisualSnapshotOptions {
+                        view,
+                        accessibility_scope: accessibility.scope,
+                        element_query: accessibility.query.clone(),
+                        limits: snapshot_limits,
+                        accessibility_ready: false,
+                        accessibility_reason: Some(reason.into()),
+                    },
+                ));
+            }
+            return self.commit_snapshot(self.visual_snapshot(
+                &entry,
+                target,
+                VisualSnapshotOptions {
+                    view,
+                    accessibility_scope: accessibility.scope,
+                    element_query: accessibility.query,
+                    limits: snapshot_limits,
+                    accessibility_ready: false,
+                    accessibility_reason: Some(reason.into()),
+                },
+            ));
+        };
+        let mut snapshot = self
+            .collect_snapshot(
+                &binding,
+                accessibility.scope,
+                accessibility.query,
+                snapshot_limits,
             )
             .await?;
-        Ok(format!(
-            "{}\nScreenshot unavailable: capture was not requested by the text-only API.",
-            format_snapshot(&snapshot)
+        snapshot.target_ref = Some(target.clone());
+        snapshot.screenshot_requested = wants_screenshot;
+        snapshot.requires_atspi_revalidation = true;
+        self.commit_snapshot(snapshot)
+    }
+
+    fn visual_snapshot(
+        &self,
+        entry: &WindowEntry,
+        target: &TargetRef,
+        options: VisualSnapshotOptions,
+    ) -> Snapshot {
+        let (app, window) = entry.atspi.clone().map_or_else(
+            || {
+                let app_object = ObjectId {
+                    bus_name: "visual-authority".into(),
+                    path: format!("/{}", target.app_instance_id),
+                };
+                let window_object = ObjectId {
+                    bus_name: "visual-authority".into(),
+                    path: format!("/{}", target.window_instance_id),
+                };
+                (
+                    AppInfo {
+                        object: app_object,
+                        name: entry.app_id.clone().unwrap_or_else(|| "unknown".into()),
+                        pid: entry.pid.unwrap_or_default(),
+                        windows: Vec::new(),
+                    },
+                    WindowInfo {
+                        object: window_object,
+                        title: entry.title.clone(),
+                        states: entry.states.clone(),
+                    },
+                )
+            },
+            |binding| (binding.app, binding.window),
+        );
+        Snapshot {
+            view: options.accessibility_scope,
+            element_query: options.element_query,
+            app,
+            window,
+            generation: 0,
+            elements: Vec::new(),
+            element_ids: Vec::new(),
+            node_limit_reached: false,
+            depth_limit_reached: false,
+            limits: options.limits,
+            target_ref: Some(target.clone()),
+            accessibility_ready: options.accessibility_ready,
+            accessibility_reason: options.accessibility_reason,
+            requires_atspi_revalidation: false,
+            screenshot_requested: matches!(
+                options.view,
+                ObserveView::Screenshot | ObserveView::Both
+            ),
+        }
+    }
+
+    async fn activate_window(
+        &self,
+        target: &TargetRef,
+        progress: &ActionProgress,
+    ) -> Result<ToolOutput, RuntimeError> {
+        self.refresh_window_catalog().await?;
+        let entry = self.target_entry(target)?;
+        let before_active = entry.states.contains("active");
+        if entry.source != BackendKind::KdePlasma && entry.source != BackendKind::Atspi {
+            return Err(capability_error(
+                "this compositor authority does not advertise activation",
+            ));
+        }
+        if entry.source == BackendKind::Atspi && entry.atspi.is_none() {
+            return Err(capability_error(
+                "window activation is unavailable because this target has no verified AT-SPI binding",
+            ));
+        }
+        self.lock_cache()?.invalidate_all();
+
+        let activation_deadline = tokio::time::Instant::now() + self.config.call_timeout;
+        let (
+            backend,
+            status,
+            after_active,
+            transition,
+            atspi_active_observed,
+            protocol_state_verified,
+            request_accepted,
+            protocol_request_sent,
+            request_flushed,
+        ) = if entry.source == BackendKind::KdePlasma {
+            if before_active {
+                (
+                    "kde-plasma",
+                    "already_active",
+                    true,
+                    "already_active",
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                )
+            } else {
+                let pending = self
+                    .wayland
+                    .begin_activation(entry.backend_identity.clone(), self.config.call_timeout)
+                    .map_err(backend_activation_error);
+                let activation = match pending {
+                    Ok(pending) => {
+                        progress.mark_started();
+                        pending.wait().await.map_err(backend_activation_error)
+                    }
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = activation {
+                    if error.outcome != ToolOutcome::NotStarted
+                        && progress.snapshot().dispatch_stage == DispatchStage::NotStarted
+                    {
+                        progress.mark_started();
+                    }
+                    return Err(with_action_progress_snapshot(error, progress.snapshot()));
+                }
+                progress.mark_completed();
+                (
+                    "kde-plasma",
+                    "protocol_state_verified",
+                    true,
+                    "active_transition_observed",
+                    false,
+                    true,
+                    true,
+                    true,
+                    true,
+                )
+            }
+        } else {
+            let binding = entry.atspi.clone().ok_or_else(|| {
+                capability_error(
+                    "window activation is unavailable because this target has no verified AT-SPI binding",
+                )
+            })?;
+            progress.mark_started();
+            let dispatch = timeout(
+                self.config.call_timeout,
+                self.adapter.activate(&binding.window.object),
+            )
+            .await
+            .map_err(|_| timeout_error("AT-SPI activation dispatch timed out"))
+            .and_then(|result| result);
+            if let Err(error) = dispatch {
+                return Err(map_attempt_error(error, progress.snapshot()));
+            }
+            progress.mark_completed();
+
+            let mut after_active = false;
+            while tokio::time::Instant::now() < activation_deadline {
+                let remaining =
+                    activation_deadline.saturating_duration_since(tokio::time::Instant::now());
+                let apps = match timeout(remaining, self.adapter.discover()).await {
+                    Ok(Ok(apps)) => apps,
+                    Ok(Err(error)) => {
+                        progress.mark_post_accessibility(PostStatus::AccessibilityRefreshFailed);
+                        return Err(with_action_progress_snapshot(
+                            completed_without_observation(error),
+                            progress.snapshot(),
+                        ));
+                    }
+                    Err(_) => break,
+                };
+                if let Some(window) = apps
+                    .iter()
+                    .find(|app| app.object == binding.app.object && app.pid == binding.app.pid)
+                    .and_then(|app| {
+                        app.windows
+                            .iter()
+                            .find(|window| window.object == binding.window.object)
+                    })
+                {
+                    after_active = window.states.contains("active");
+                    if after_active {
+                        break;
+                    }
+                }
+                let remaining =
+                    activation_deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                sleep(Duration::from_millis(25).min(remaining)).await;
+            }
+            if !after_active {
+                progress.mark_post_accessibility(PostStatus::Unavailable);
+                return Err(with_action_progress_snapshot(
+                    RuntimeError::new(
+                        "activation_unknown",
+                        "AT-SPI activation was dispatched but no fresh active-state evidence was observed",
+                        ToolOutcome::Completed,
+                        false,
+                        "Call list_desktop and observe the exact target before deciding whether activation is still needed; do not retry blindly.",
+                    ),
+                    progress.snapshot(),
+                ));
+            }
+            (
+                "atspi",
+                "atspi_active_observed",
+                after_active,
+                if before_active {
+                    "already_active"
+                } else {
+                    "active_state_observed"
+                },
+                true,
+                false,
+                true,
+                true,
+                false,
+            )
+        };
+
+        if let Err(error) = self.refresh_window_catalog().await {
+            progress.mark_post_accessibility(post_status_for_error(&error, true));
+            return Err(with_action_progress_snapshot(
+                completed_without_observation(error),
+                progress.snapshot(),
+            ));
+        }
+        let replacement = self
+            .requested_target_snapshot(target, ObserveView::Accessibility, None)
+            .await
+            .map_err(|error| {
+                progress.mark_post_accessibility(post_status_for_error(&error, true));
+                with_action_progress_snapshot(
+                    completed_without_observation(error),
+                    progress.snapshot(),
+                )
+            })?;
+        progress.mark_post_accessibility(post_accessibility_status(&replacement));
+        let replacement = self.observe(replacement, Ok(())).await.map_err(|error| {
+            progress.mark_post_accessibility(post_status_for_error(&error, true));
+            with_action_progress_snapshot(completed_without_observation(error), progress.snapshot())
+        })?;
+        let replacement_structured = replacement.structured_content.unwrap_or(Value::Null);
+        let replacement_observation_id = replacement_structured["observation_id"]
+            .as_str()
+            .map(str::to_owned);
+        let text = format!(
+            "Activation: backend={backend} status={status} before_active={before_active} after_active={after_active} transition={transition} request_accepted={request_accepted} protocol_request_sent={protocol_request_sent} request_flushed={request_flushed} seat_focus=not_observable replacement_observation={replacement_observation_id:?}"
+        );
+        let structured = json!({
+            "outcome": "completed",
+            "target": target.as_json(),
+            "before_active": before_active,
+            "after_active": after_active,
+            "status": status,
+            "transition": transition,
+            "atspi_active_observed": atspi_active_observed,
+            "protocol_state_verified": protocol_state_verified,
+            "seat_focus": "not_observable",
+            "dispatch": {
+                "request_accepted": request_accepted,
+                "protocol_request_sent": protocol_request_sent,
+                "request_flushed": request_flushed,
+                "synchronized": false,
+                "client_delivery": "not_observable"
+            },
+            "backend": backend,
+            "replacement_observation_id": replacement_observation_id,
+            "replacement_observation": replacement_structured,
+        });
+        Ok(ToolOutput::text(text)
+            .with_structured_content(bound_action_structured(structured))
+            .with_action_progress(progress))
+    }
+
+    async fn act_new(
+        &self,
+        target: &TargetRef,
+        source: &ObservationRef,
+        operation: ActOperation,
+        progress: Arc<ActionProgress>,
+    ) -> Result<ToolOutput, RuntimeError> {
+        self.refresh_window_catalog().await?;
+        let observation_id = self.observation_id_for_source(source, target)?;
+        let source_snapshot = self.required_cached(&observation_id)?;
+        // Refresh first, then resolve the exact opaque target. The catalog
+        // guarantees that this ID remains bound to one backend object,
+        // authority, and PID for its entire lifetime.
+        let _ = self.target_entry(target)?;
+        let (output, replacement_snapshot) = match operation.clone() {
+            ActOperation::Semantic { element_id, action } => {
+                let snapshot = self
+                    .element_action(&observation_id, &element_id, action, progress.as_ref())
+                    .await?;
+                let output = self
+                    .post_action_observation(Arc::clone(&snapshot), Arc::clone(&progress))
+                    .await?;
+                (output, Some(snapshot))
+            }
+            ActOperation::Pointer { action } => {
+                let Some(frame_id) = &source.frame_id else {
+                    return Err(state_required_error(
+                        "spatial act requires frame_id from the exact source observation",
+                    ));
+                };
+                let mapping = self.required_screenshot(&observation_id)?.1;
+                if crate::capture::frame_id(&mapping.source) != *frame_id {
+                    eprintln!(
+                        "computer-use-mcp: refusing spatial action with a mismatched source frame: expected={} supplied={frame_id}",
+                        crate::capture::frame_id(&mapping.source)
+                    );
+                    return Err(stale_observation_error(
+                        "source frame is stale; call observe again",
+                    ));
+                }
+                let output = self
+                    .perform_generated_with_progress(
+                        &observation_id,
+                        GeneratedInputAction::Pointer(action),
+                        Arc::clone(&progress),
+                    )
+                    .await?;
+                (output.output, output.replacement)
+            }
+            ActOperation::Keyboard { focus, events } => {
+                let Some(frame_id) = &source.frame_id else {
+                    return Err(state_required_error(
+                        "keyboard act requires frame_id from the exact source observation",
+                    ));
+                };
+                let mapping = self.required_screenshot(&observation_id)?.1;
+                if crate::capture::frame_id(&mapping.source) != *frame_id {
+                    return Err(stale_observation_error(
+                        "source frame is stale; call observe again",
+                    ));
+                }
+                let output = self
+                    .perform_generated_with_progress(
+                        &observation_id,
+                        GeneratedInputAction::KeyboardTransaction { focus, events },
+                        Arc::clone(&progress),
+                    )
+                    .await?;
+                (output.output, output.replacement)
+            }
+        };
+        Ok(annotate_action_output_with_progress(
+            output,
+            target,
+            source,
+            &operation,
+            &source_snapshot,
+            replacement_snapshot.as_deref(),
+            Some(progress.as_ref()),
         ))
     }
 
+    fn observation_id_for_source(
+        &self,
+        source: &ObservationRef,
+        target: &TargetRef,
+    ) -> Result<String, RuntimeError> {
+        parse_opaque_counter(&source.observation_id, "obs")?;
+        let snapshot = self.required_cached(&source.observation_id)?;
+        if snapshot.target_ref.as_ref() != Some(target) {
+            eprintln!("computer-use-mcp: source observation target does not match act target");
+            return Err(stale_observation_error(
+                "source observation belongs to another target",
+            ));
+        }
+        Ok(source.observation_id.clone())
+    }
+
+    async fn wait_for_new(
+        &self,
+        target: &TargetRef,
+        condition: WaitCondition,
+        timeout_ms: u64,
+    ) -> Result<ToolOutput, RuntimeError> {
+        let _ = self.target_entry(target)?;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        match condition.clone() {
+            WaitCondition::FrameAdvanced { after_frame_id } => {
+                let (baseline, mapping) = self
+                    .lock_cache()?
+                    .frame_for_target(target, Some(&after_frame_id))?;
+                let after_generation = mapping.source.generation;
+                self.wait_for_frame_condition(
+                    target,
+                    baseline,
+                    mapping,
+                    condition,
+                    timeout_ms,
+                    FrameWaitCondition::Advanced { after_generation },
+                    "a later capture frame was acquired",
+                )
+                .await
+            }
+            WaitCondition::FrameChanged { after_frame_id } => {
+                let (baseline, mapping) = self
+                    .lock_cache()?
+                    .frame_for_target(target, Some(&after_frame_id))?;
+                let after_generation = mapping.source.generation;
+                let after_change_epoch = mapping.source.change_epoch;
+                self.wait_for_frame_condition(
+                    target,
+                    baseline,
+                    mapping,
+                    condition,
+                    timeout_ms,
+                    FrameWaitCondition::Changed {
+                        after_generation,
+                        after_change_epoch,
+                    },
+                    "a later capture frame reported content change evidence",
+                )
+                .await
+            }
+            WaitCondition::FrameStable { for_ms } => {
+                let (baseline, mapping) = self.lock_cache()?.frame_for_target(target, None)?;
+                let after_generation = mapping.source.generation;
+                let after_change_epoch = mapping.source.change_epoch;
+                let after_format_generation = mapping.source.format_generation;
+                self.wait_for_frame_condition(
+                    target,
+                    baseline,
+                    mapping,
+                    condition,
+                    timeout_ms,
+                    FrameWaitCondition::Stable {
+                        after_generation,
+                        after_change_epoch,
+                        after_format_generation,
+                        for_duration: Duration::from_millis(for_ms),
+                    },
+                    "capture content remained stable for the requested interval",
+                )
+                .await
+            }
+            WaitCondition::AccessibilityAdvanced {
+                after_observation_id,
+            } => {
+                let baseline = self.wait_baseline(&after_observation_id, target)?;
+                self.wait_for_accessibility_change(target, baseline, deadline, condition)
+                    .await
+            }
+            WaitCondition::ElementState {
+                observation_id,
+                element_id,
+                state,
+            } => {
+                let baseline = self.wait_baseline(&observation_id, target)?;
+                cached_element(&baseline, &element_id)?;
+                self.wait_for_element_condition(ElementWaitRequest {
+                    target,
+                    baseline,
+                    element_id: &element_id,
+                    deadline,
+                    condition,
+                    predicate: move |node: &NodeInfo| node.states.contains(&state),
+                    success_message:
+                        "the later accessibility observation reported the requested element state",
+                })
+                .await
+            }
+            WaitCondition::ElementValue {
+                observation_id,
+                element_id,
+                value,
+            } => {
+                let baseline = self.wait_baseline(&observation_id, target)?;
+                cached_element(&baseline, &element_id)?;
+                self.wait_for_element_condition(ElementWaitRequest {
+                    target,
+                    baseline,
+                    element_id: &element_id,
+                    deadline,
+                    condition,
+                    predicate: move |node: &NodeInfo| node.value.as_deref() == Some(value.as_str()),
+                    success_message:
+                        "the later accessibility observation reported the requested element value",
+                })
+                .await
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn wait_for_frame_condition(
+        &self,
+        target: &TargetRef,
+        baseline: Arc<Snapshot>,
+        mapping: ScreenshotMapping,
+        condition: WaitCondition,
+        timeout_ms: u64,
+        frame_condition: FrameWaitCondition,
+        success_message: &str,
+    ) -> Result<ToolOutput, RuntimeError> {
+        let result = timeout(
+            Duration::from_millis(timeout_ms),
+            self.screenshots.wait_for_frame(frame_condition, &mapping),
+        )
+        .await;
+        let evidence = match result {
+            Err(_) => {
+                return Ok(wait_output(
+                    target,
+                    condition,
+                    false,
+                    "no matching capture frame before the deadline",
+                ));
+            }
+            Ok(Err(error)) if error.0.to_lowercase().contains("timed out") => {
+                return Ok(wait_output(
+                    target,
+                    condition,
+                    false,
+                    "no matching capture frame before the deadline",
+                ));
+            }
+            Ok(Err(error)) => return Err(wait_backend_error(&error.0)),
+            Ok(Ok(evidence)) => evidence,
+        };
+        if evidence.mapping.app_pid != mapping.app_pid
+            || evidence.mapping.app_identity != mapping.app_identity
+            || evidence.mapping.window_identity != mapping.window_identity
+            || evidence.mapping.accessibility_generation != mapping.accessibility_generation
+            || evidence.mapping.portal_session_identity != mapping.portal_session_identity
+            || evidence.mapping.portal_session_generation != mapping.portal_session_generation
+            || evidence.mapping.stream != mapping.stream
+            || evidence.mapping.source.generation <= mapping.source.generation
+            || evidence.mapping.output_size.0 == 0
+            || evidence.mapping.output_size.1 == 0
+        {
+            eprintln!("computer-use-mcp: frame wait returned an unbound or stale visual mapping");
+            return Err(stale_observation_error(
+                "frame wait returned a visual binding that is stale for the exact target",
+            ));
+        }
+        self.cache_screenshot(&baseline, evidence.mapping.clone())?;
+        Ok(wait_output_with_evidence(
+            target,
+            condition,
+            true,
+            success_message,
+            WaitEvidence {
+                frame: Some(&evidence.mapping.source),
+                observation_id: None,
+                dimensions: Some(evidence.mapping.output_size),
+                changed: evidence.changed,
+                stable_for_ms: evidence.stable_for_ms,
+            },
+        ))
+    }
+
+    fn wait_baseline(
+        &self,
+        observation_id: &str,
+        target: &TargetRef,
+    ) -> Result<Arc<Snapshot>, RuntimeError> {
+        parse_opaque_counter(observation_id, "obs")?;
+        let snapshot = self.required_cached(observation_id)?;
+        if snapshot.target_ref.as_ref() != Some(target) {
+            return Err(stale_observation_error(
+                "wait condition observation belongs to another target",
+            ));
+        }
+        Ok(snapshot)
+    }
+
+    async fn wait_for_accessibility_change(
+        &self,
+        target: &TargetRef,
+        baseline: Arc<Snapshot>,
+        deadline: tokio::time::Instant,
+        condition: WaitCondition,
+    ) -> Result<ToolOutput, RuntimeError> {
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(wait_output(
+                    target,
+                    condition,
+                    false,
+                    "no accessibility change before the deadline",
+                ));
+            }
+            let current = match timeout(
+                remaining,
+                self.collect_exact_snapshot(&baseline, baseline.limits),
+            )
+            .await
+            {
+                Err(_) => {
+                    return Ok(wait_output(
+                        target,
+                        condition,
+                        false,
+                        "no accessibility change before the deadline",
+                    ));
+                }
+                Ok(result) => self.commit_snapshot(result?)?,
+            };
+            if !same_snapshot_content(&baseline, &current) {
+                let current_observation_id = observation_id_for_snapshot(&current);
+                return Ok(wait_output_with_evidence(
+                    target,
+                    condition,
+                    true,
+                    "a later AT-SPI observation reported changed accessibility content",
+                    WaitEvidence {
+                        frame: None,
+                        observation_id: Some(&current_observation_id),
+                        dimensions: None,
+                        changed: None,
+                        stable_for_ms: None,
+                    },
+                ));
+            }
+            sleep(Duration::from_millis(25).min(remaining)).await;
+        }
+    }
+
+    async fn wait_for_element_condition<F>(
+        &self,
+        request: ElementWaitRequest<'_, F>,
+    ) -> Result<ToolOutput, RuntimeError>
+    where
+        F: Fn(&NodeInfo) -> bool,
+    {
+        let ElementWaitRequest {
+            target,
+            baseline,
+            element_id,
+            deadline,
+            condition,
+            predicate,
+            success_message,
+        } = request;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(wait_output(
+                    target,
+                    condition,
+                    false,
+                    "element condition was not satisfied before the deadline",
+                ));
+            }
+            let current = match timeout(
+                remaining,
+                self.collect_exact_snapshot(&baseline, baseline.limits),
+            )
+            .await
+            {
+                Err(_) => {
+                    return Ok(wait_output(
+                        target,
+                        condition,
+                        false,
+                        "element condition was not satisfied before the deadline",
+                    ));
+                }
+                Ok(result) => self.commit_snapshot(result?)?,
+            };
+            let element = match relocated_element(&baseline, &current, element_id) {
+                Ok(element) => element,
+                Err(error) if error.code == "target_unavailable" => return Err(error),
+                Err(error) => return Err(error),
+            };
+            if predicate(&element.node) {
+                let current_observation_id = observation_id_for_snapshot(&current);
+                return Ok(wait_output_with_evidence(
+                    target,
+                    condition,
+                    true,
+                    success_message,
+                    WaitEvidence {
+                        frame: None,
+                        observation_id: Some(&current_observation_id),
+                        dimensions: None,
+                        changed: None,
+                        stable_for_ms: None,
+                    },
+                ));
+            }
+            sleep(Duration::from_millis(25).min(remaining)).await;
+        }
+    }
+
+    #[cfg(test)]
     async fn execute_call(&self, call: ToolCall) -> Result<ToolOutput, RuntimeError> {
+        let progress = call
+            .tracks_action()
+            .then(|| Arc::new(ActionProgress::default()));
+        self.execute_call_with_progress(call, progress).await
+    }
+
+    async fn execute_call_with_progress(
+        &self,
+        call: ToolCall,
+        progress: Option<Arc<ActionProgress>>,
+    ) -> Result<ToolOutput, RuntimeError> {
         call.validate_policy()?;
-        let desktop_session = if call.waits_for_desktop_session() {
+        let visual_session = if call.requires_visual_session() {
             self.desktop_session().await
         } else {
             Ok(())
         };
         match call {
-            ToolCall::ListApplications { scope } => self.list_applications(scope).await,
+            ToolCall::ListDesktop {
+                scope,
+                limit,
+                cursor,
+            } => {
+                let _mutation = self.mutation.lock().await;
+                self.list_desktop(scope, limit, cursor.as_deref()).await
+            }
             ToolCall::LaunchApplication { desktop_id } => {
                 let _mutation = self.mutation.lock().await;
-                self.lock_cache()?.observations.clear();
+                self.invalidate_for_launch()?;
+                let Some(progress) = progress else {
+                    eprintln!(
+                        "computer-use-mcp: launch call reached runtime without an attempt record"
+                    );
+                    return Err(operational_error("launch attempt record is missing"));
+                };
                 let launched = crate::desktop_launcher::launch(
                     &desktop_id,
                     Arc::clone(&self.launch_in_progress),
+                    Arc::clone(&self.launch_tasks),
+                    Arc::clone(&progress),
                 )
-                .await?;
+                .await
+                .map_err(|error| map_attempt_error(error, progress.snapshot()))?;
                 Ok(ToolOutput::text(format!(
                     "Launch requested for {} (desktop_id={}).",
                     launched.name, launched.desktop_id
@@ -606,98 +1667,62 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                     "desktop_id": launched.desktop_id,
                     "name": launched.name
                 })))
+                .map(|output| output.with_action_progress(progress.as_ref()))
             }
-            call => {
+            ToolCall::ActivateWindow { target } => {
                 let _mutation = self.mutation.lock().await;
                 if self.launch_in_progress.load(Ordering::Acquire) {
                     return Err(launch_in_progress_error());
                 }
-                match call {
-                    ToolCall::Observe {
-                        target,
-                        view,
-                        query,
-                        text_limit,
-                        max_tree_nodes,
-                        max_tree_depth,
-                    } => {
-                        let snapshot = self
-                            .requested_snapshot(
-                                target,
-                                view,
-                                query,
-                                text_limit,
-                                max_tree_nodes,
-                                max_tree_depth,
-                            )
-                            .await?;
-                        Ok(self.observe(snapshot, desktop_session).await)
-                    }
-                    ToolCall::ActOnElement {
-                        state_id,
-                        element_id,
-                        action,
-                    } => {
-                        let snapshot = self.element_action(&state_id, &element_id, action).await?;
-                        Ok(self.observe(snapshot, desktop_session).await)
-                    }
-                    ToolCall::Pointer { state_id, action } => {
-                        desktop_session?;
-                        self.perform_generated(&state_id, GeneratedInputAction::Pointer(action))
-                            .await
-                    }
-                    ToolCall::Keyboard {
-                        state_id,
-                        focus,
-                        action,
-                    } => {
-                        desktop_session?;
-                        self.perform_generated(
-                            &state_id,
-                            GeneratedInputAction::Keyboard { focus, action },
-                        )
-                        .await
-                    }
-                    ToolCall::ListApplications { .. } | ToolCall::LaunchApplication { .. } => {
-                        unreachable!("list and launch calls were handled before mutation locking")
-                    }
-                }
-            }
-        }
-    }
-
-    async fn list_applications(&self, scope: ApplicationScope) -> Result<ToolOutput, RuntimeError> {
-        match scope {
-            ApplicationScope::Running => {
-                let apps = self.list_running_apps().await?;
-                let structured = json!({
-                    "scope": "running",
-                    "applications": apps.iter().map(running_app_metadata).collect::<Vec<_>>()
-                });
-                Ok(
-                    ToolOutput::text(format_running_apps(&apps))
-                        .with_structured_content(structured),
-                )
-            }
-            ApplicationScope::Installed => {
-                let apps = crate::desktop_launcher::list_installed_apps().await?;
-                let text = if apps.is_empty() {
-                    "No installed desktop applications found.".to_owned()
-                } else {
-                    apps.iter()
-                        .map(|app| format!("{} — {}", escape(&app.name), app.desktop_id))
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                let Some(progress) = progress else {
+                    eprintln!(
+                        "computer-use-mcp: activation call reached runtime without an attempt record"
+                    );
+                    return Err(operational_error("activation attempt record is missing"));
                 };
-                let structured = json!({
-                    "scope": "installed",
-                    "applications": apps.iter().map(|app| json!({
-                        "desktop_id": app.desktop_id,
-                        "name": app.name,
-                        "shown": app.shown
-                    })).collect::<Vec<_>>()
-                });
-                Ok(ToolOutput::text(text).with_structured_content(structured))
+                self.activate_window(&target, progress.as_ref()).await
+            }
+            ToolCall::Observe {
+                target,
+                view,
+                accessibility,
+            } => {
+                let _mutation = self.mutation.lock().await;
+                if self.launch_in_progress.load(Ordering::Acquire) {
+                    return Err(launch_in_progress_error());
+                }
+                let snapshot = self
+                    .requested_target_snapshot(&target, view, accessibility)
+                    .await?;
+                self.observe(snapshot, visual_session).await
+            }
+            ToolCall::Act {
+                target,
+                source,
+                operation,
+            } => {
+                let _mutation = self.mutation.lock().await;
+                if self.launch_in_progress.load(Ordering::Acquire) {
+                    return Err(launch_in_progress_error());
+                }
+                let Some(progress) = progress else {
+                    eprintln!(
+                        "computer-use-mcp: act call reached runtime without an attempt record"
+                    );
+                    return Err(operational_error("act attempt record is missing"));
+                };
+                self.act_new(&target, &source, operation, progress).await
+            }
+            ToolCall::WaitFor {
+                target,
+                condition,
+                timeout_ms,
+            } => {
+                let _mutation = self.mutation.lock().await;
+                if self.launch_in_progress.load(Ordering::Acquire) {
+                    return Err(launch_in_progress_error());
+                }
+                self.wait_for_new(&target, condition, timeout_ms).await
             }
         }
     }
@@ -726,42 +1751,51 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         self.lock_cache()?.insert(snapshot)
     }
 
+    fn invalidate_for_launch(&self) -> Result<(), RuntimeError> {
+        // A launch can change any visible state, so observations and frame
+        // mappings are stale. Existing target handles remain valid while their
+        // exact backend objects remain present and must never be reissued.
+        self.lock_cache()?.invalidate_all();
+        Ok(())
+    }
+
     async fn collect_snapshot(
         &self,
-        app_query: String,
-        expected_pid: Option<u32>,
-        expected_window: Option<&ObjectId>,
-        view: ObservationView,
+        binding: &AtspiBinding,
+        view: AccessibilityScope,
         element_query: Option<String>,
         limits: SnapshotLimits,
     ) -> Result<Snapshot, RuntimeError> {
         let apps = self.discover().await?;
-        let resolved = resolve_app(&app_query, expected_pid, &apps)?;
-        let window = if let Some(expected_window) = expected_window {
-            resolved
-                .app
-                .windows
-                .iter()
-                .find(|window| &window.object == expected_window)
-                .cloned()
-                .ok_or_else(|| {
-                    operational_error("cached window is no longer present in the target app")
-                })?
-        } else if let Some(window) = resolved.window {
-            window
-        } else {
-            choose_window(&resolved.app.windows)?.clone()
+        let matching_apps = apps
+            .into_iter()
+            .filter(|app| app.pid == binding.app.pid && app.object == binding.app.object)
+            .collect::<Vec<_>>();
+        let [app] = matching_apps.as_slice() else {
+            return Err(operational_error(
+                "application PID or object identity changed since the exact catalog binding",
+            ));
         };
-        if !window_is_viable(&window) {
+        let matching_windows = app
+            .windows
+            .iter()
+            .filter(|window| window.object == binding.window.object)
+            .cloned()
+            .collect::<Vec<_>>();
+        let [window] = matching_windows.as_slice() else {
+            return Err(operational_error(
+                "window object identity changed since the exact catalog binding",
+            ));
+        };
+        if !window_is_viable(window) {
             return Err(operational_error(format!(
                 "matched window {:?} is stale or defunct",
                 window.title
             )));
         }
-        let metadata_bytes = app_query.len()
-            + element_query.as_ref().map_or(0, String::len)
-            + app_string_bytes(&resolved.app)
-            + window_string_bytes(&window);
+        let metadata_bytes = element_query.as_ref().map_or(0, String::len)
+            + app_string_bytes(app)
+            + window_string_bytes(window);
         let element_budget = MAX_CACHED_SNAPSHOT_STRING_BYTES
             .checked_sub(metadata_bytes)
             .ok_or_else(|| {
@@ -769,25 +1803,30 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                     "observation metadata exceeds the retained-state byte limit; use a narrower target",
                 )
             })?;
-        let elements = self.traverse(&window, view, limits, element_budget).await?;
+        let elements = self.traverse(window, view, limits, element_budget).await?;
         Ok(Snapshot {
-            app_query,
             view,
             element_query,
-            app: resolved.app,
-            window,
+            app: app.clone(),
+            window: window.clone(),
             generation: 0,
             node_limit_reached: elements.node_limit_reached,
             depth_limit_reached: elements.depth_limit_reached,
             elements: elements.elements,
+            element_ids: Vec::new(),
             limits,
+            target_ref: None,
+            accessibility_ready: true,
+            accessibility_reason: None,
+            requires_atspi_revalidation: true,
+            screenshot_requested: true,
         })
     }
 
     async fn traverse(
         &self,
         window: &WindowInfo,
-        view: ObservationView,
+        view: AccessibilityScope,
         limits: SnapshotLimits,
         string_byte_budget: usize,
     ) -> Result<Traversal, RuntimeError> {
@@ -831,7 +1870,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 );
                 continue;
             }
-            if depth > 0 && view != ObservationView::Full && is_hidden_document(&node) {
+            if depth > 0 && view != AccessibilityScope::Full && is_hidden_document(&node) {
                 continue;
             }
             string_bytes = string_bytes
@@ -864,12 +1903,16 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
 
     async fn element_action(
         &self,
-        state_id: &str,
+        observation_id: &str,
         index: &str,
         action: ElementAction,
+        progress: &ActionProgress,
     ) -> Result<Arc<Snapshot>, RuntimeError> {
-        let cached = self.required_cached(state_id)?;
-        let old_element = cached_element(&cached, index)?;
+        let cached = self
+            .required_cached(observation_id)
+            .map_err(|error| with_action_progress(error, progress))?;
+        let old_element = cached_element(&cached, index)
+            .map_err(|error| with_action_progress(error, progress))?;
         match self
             .read_node(&old_element.node.object, cached.limits.text)
             .await
@@ -882,29 +1925,72 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 "computer-use-mcp: cached AT-SPI object is stale; attempting strict relocation: {error}"
             ),
         }
-        let current = self.fresh_for_action(&cached).await?;
-        let target = relocate(old_element, &current.elements)?;
-        ensure_element_presented(&current, target, index)?;
-        let semantic = semantic_action(action, target)?;
-        self.lock_cache()?.invalidate_for_mutation(&cached)?;
-        timeout(
+        let current = self
+            .fresh_for_action(&cached)
+            .await
+            .map_err(|error| with_action_progress(error, progress))?;
+        let target = relocate(old_element, &current.elements)
+            .map_err(|error| with_action_progress(error, progress))?;
+        ensure_element_presented(&current, target, index)
+            .map_err(|error| with_action_progress(error, progress))?;
+        let semantic = semantic_action(action, target)
+            .map_err(|error| with_action_progress(error, progress))?;
+        self.lock_cache()
+            .map_err(|error| with_action_progress(error, progress))?
+            .invalidate_for_mutation(&cached)
+            .map_err(|error| with_action_progress(error, progress))?;
+        progress.mark_started();
+        let dispatch = timeout(
             self.config.call_timeout,
             self.adapter.act(&target.node.object, semantic),
         )
         .await
-        .map_err(|_| operational_error("AT-SPI semantic action timed out"))
-        .and_then(|result| result)
-        .map_err(uncertain_action)?;
-        self.settle_and_refresh(cached)
-            .await
-            .map_err(completed_without_observation)
+        .map_err(|_| timeout_error("AT-SPI semantic action timed out"))
+        .and_then(|result| result);
+        match dispatch {
+            Ok(()) => {
+                progress.mark_completed();
+            }
+            Err(error) => return Err(map_attempt_error(error, progress.snapshot())),
+        }
+        match self.settle_and_refresh(cached).await {
+            Ok(snapshot) => {
+                progress.mark_post_accessibility(post_accessibility_status(&snapshot));
+                Ok(snapshot)
+            }
+            Err(error) => {
+                progress.mark_post_accessibility(post_status_for_error(&error, true));
+                Err(with_action_progress(
+                    completed_without_observation(error),
+                    progress,
+                ))
+            }
+        }
     }
 
     async fn fresh_for_action(&self, cached: &Snapshot) -> Result<Snapshot, RuntimeError> {
+        if !cached.requires_atspi_revalidation {
+            let Some(target) = cached.target_ref.as_ref() else {
+                eprintln!(
+                    "computer-use-mcp: visual-only action snapshot has no exact target identity"
+                );
+                return Err(operational_error(
+                    "visual action snapshot has no exact target; call observe again",
+                ));
+            };
+            self.refresh_window_catalog().await?;
+            let entry = self.target_entry(target)?;
+            if !entry.capabilities.screenshot.is_supported() {
+                return Err(capability_error(
+                    "the exact target no longer advertises screenshot input",
+                ));
+            }
+            return Ok(cached.clone());
+        }
         let limits = SnapshotLimits {
             text: cached.limits.text,
-            nodes: self.config.default_max_nodes.max(cached.elements.len()),
-            depth: self.config.default_max_depth,
+            nodes: cached.limits.nodes,
+            depth: cached.limits.depth,
         };
         let current = self.collect_exact_snapshot(cached, limits).await?;
         if current.app.object != cached.app.object {
@@ -920,142 +2006,246 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         cached: &Snapshot,
         limits: SnapshotLimits,
     ) -> Result<Snapshot, RuntimeError> {
-        self.collect_snapshot(
-            cached.app_query.clone(),
-            Some(cached.app.pid),
-            Some(&cached.window.object),
-            cached.view,
-            cached.element_query.clone(),
-            limits,
-        )
-        .await
+        let mut snapshot = self
+            .collect_snapshot(
+                &AtspiBinding {
+                    app: cached.app.clone(),
+                    window: cached.window.clone(),
+                },
+                cached.view,
+                cached.element_query.clone(),
+                limits,
+            )
+            .await?;
+        snapshot.target_ref = cached.target_ref.clone();
+        snapshot.screenshot_requested = cached.screenshot_requested;
+        snapshot.accessibility_ready = cached.accessibility_ready;
+        snapshot.accessibility_reason = cached.accessibility_reason.clone();
+        snapshot.requires_atspi_revalidation = cached.requires_atspi_revalidation;
+        Ok(snapshot)
     }
 
-    async fn requested_snapshot(
+    async fn perform_generated_with_progress(
         &self,
-        app_query: String,
-        view: ObservationView,
-        element_query: Option<String>,
-        text_limit: Option<TextLimit>,
-        max_nodes: Option<usize>,
-        max_depth: Option<usize>,
-    ) -> Result<Arc<Snapshot>, RuntimeError> {
-        let text = match text_limit {
-            Some(TextLimit::Count(limit)) => limit,
-            Some(TextLimit::Max) => MAX_TEXT_LIMIT,
-            None => self.config.default_text_limit,
-        };
-        let future = self.collect_snapshot(
-            app_query,
-            None,
-            None,
-            view,
-            element_query,
-            SnapshotLimits {
-                text,
-                nodes: max_nodes.unwrap_or(self.config.default_max_nodes),
-                depth: max_depth.unwrap_or(self.config.default_max_depth),
-            },
-        );
-        let snapshot = timeout(self.config.snapshot_timeout, future)
-            .await
-            .map_err(|_| operational_error("AT-SPI snapshot timed out"))??;
-        self.commit_snapshot(snapshot)
-    }
-
-    async fn perform_generated(
-        &self,
-        state_id: &str,
+        observation_id: &str,
         action: GeneratedInputAction,
-    ) -> Result<ToolOutput, RuntimeError> {
-        let (cached, mapping) = self.required_screenshot(state_id)?;
-        let current = self.fresh_for_action(&cached).await?;
-        semantic_focus_plan(&action, &cached, &current)?;
-        self.lock_cache()?.position(&cached)?;
+        progress: Arc<ActionProgress>,
+    ) -> Result<GeneratedActionResult, RuntimeError> {
+        let (cached, mapping) = self
+            .required_screenshot(observation_id)
+            .map_err(|error| with_action_progress(error, progress.as_ref()))?;
+        self.fresh_for_action(&cached)
+            .await
+            .map_err(|error| with_action_progress(error, progress.as_ref()))?;
+        self.lock_cache()?
+            .position(&cached)
+            .map_err(|error| with_action_progress(error, progress.as_ref()))?;
         let preparation = timeout(
             self.config.snapshot_timeout,
             self.screenshots.prepare_input(&cached, &mapping, &action),
         )
         .await;
         let cleanup = self.screenshots.cleanup_input().await;
+        if cleanup.is_err() {
+            progress.mark_cleanup_failed();
+        } else {
+            progress.mark_cleanup_completed();
+        }
         let preparation = preparation
-            .map_err(|_| operational_error("generated input preparation timed out"))?
+            .map_err(|_| operational_error("generated input preparation timed out"))
+            .map_err(|error| with_action_progress(error, progress.as_ref()))?
             .map_err(generated_input_error);
         if let Err(error) = preparation {
             if let Err(cleanup) = cleanup {
                 eprintln!(
                     "computer-use-mcp: cleanup also failed after input preparation error: {cleanup}"
                 );
-                return Err(operational_error(format!(
-                    "{error}; generated input cleanup also failed and the input session was invalidated: {cleanup}"
-                )));
+                return Err(with_action_progress(
+                    operational_error(format!(
+                        "{error}; generated input cleanup also failed and the input session was invalidated: {cleanup}"
+                    )),
+                    progress.as_ref(),
+                ));
             }
-            return Err(error);
+            return Err(with_action_progress(error, progress.as_ref()));
         }
-        cleanup.map_err(|error| {
-            operational_error(format!(
-                "generated input preparation cleanup failed: {error}"
-            ))
-        })?;
-        let current = self.fresh_for_action(&cached).await?;
-        let semantic_focus = semantic_focus_plan(&action, &cached, &current)?;
-        self.lock_cache()?.invalidate_for_mutation(&cached)?;
-        if let Some((index, object)) = semantic_focus {
-            timeout(
-                self.config.call_timeout,
-                self.adapter.act(&object, SemanticAction::GrabFocus),
-            )
+        cleanup
+            .map_err(|error| {
+                operational_error(format!(
+                    "generated input preparation cleanup failed: {error}"
+                ))
+            })
+            .map_err(|error| with_action_progress(error, progress.as_ref()))?;
+        self.fresh_for_action(&cached)
             .await
-            .map_err(|_| operational_error("AT-SPI semantic keyboard focus timed out"))
-            .and_then(|result| result)
-            .map_err(uncertain_action)?;
-            sleep(self.config.settle_interval).await;
-            self.verify_semantic_keyboard_focus(&cached, index)
-                .await
-                .map_err(uncertain_action)?;
-        }
+            .map_err(|error| with_action_progress(error, progress.as_ref()))?;
+        self.lock_cache()?
+            .invalidate_for_mutation(&cached)
+            .map_err(|error| with_action_progress(error, progress.as_ref()))?;
         let result = timeout(
             self.config.snapshot_timeout,
-            self.screenshots.perform_input(&cached, &mapping, action),
+            self.screenshots
+                .perform_input(&cached, &mapping, action, Arc::clone(&progress)),
         )
         .await;
         let cleanup = self.screenshots.cleanup_input().await;
-        let result = match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(uncertain_action(operational_error(error))),
-            Err(_) => Err(uncertain_action(timeout_error(
-                "generated input action timed out",
-            ))),
-        };
-        if let Err(error) = result {
-            if let Err(cleanup) = cleanup {
-                eprintln!(
-                    "computer-use-mcp: cleanup also failed after generated input error: {cleanup}"
-                );
-                return Err(uncertain_action(operational_error(format!(
-                    "{error}; generated input cleanup also failed and the input session was invalidated: {cleanup}"
-                ))));
-            }
-            return Err(error);
+        if cleanup.is_err() {
+            progress.mark_cleanup_failed();
+        } else if progress.snapshot().dispatch_stage != DispatchStage::NotStarted {
+            progress.mark_cleanup_completed();
         }
-        cleanup.map_err(|error| {
-            completed_without_observation(operational_error(format!(
-                "generated input cleanup failed: {error}"
-            )))
-        })?;
-        let refreshed = self
-            .settle_and_refresh(cached)
+        let snapshot = progress.snapshot();
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if snapshot.dispatch_stage == DispatchStage::Completed => {
+                return Err(completed_dispatch_error(
+                    input_runtime_error(&error),
+                    snapshot,
+                ));
+            }
+            Ok(Err(error)) => {
+                return Err(map_input_error(error, snapshot));
+            }
+            Err(_) if snapshot.dispatch_stage == DispatchStage::Completed => {}
+            Err(_) => {
+                return Err(map_attempt_error(
+                    timeout_error("generated input action timed out"),
+                    snapshot,
+                ));
+            }
+        }
+        if let Err(cleanup) = cleanup {
+            let error = operational_error(format!("generated input cleanup failed: {cleanup}"));
+            return Err(if snapshot.dispatch_stage == DispatchStage::Completed {
+                completed_cleanup_error(error, snapshot)
+            } else {
+                map_attempt_error(error, snapshot)
+            });
+        }
+        if snapshot.dispatch_stage != DispatchStage::Completed {
+            return Err(with_action_progress(
+                operational_error("generated input returned before completing its dispatch"),
+                progress.as_ref(),
+            ));
+        }
+        let output = self
+            .post_generated_action(Arc::clone(&cached), Arc::clone(&progress))
+            .await?;
+        Ok(output)
+    }
+
+    async fn post_generated_action(
+        &self,
+        cached: Arc<Snapshot>,
+        progress: Arc<ActionProgress>,
+    ) -> Result<GeneratedActionResult, RuntimeError> {
+        let refreshed = match self.settle_and_refresh(Arc::clone(&cached)).await {
+            Ok(refreshed) => {
+                progress.mark_post_accessibility(post_accessibility_status(&refreshed));
+                refreshed
+            }
+            Err(error) => {
+                progress.mark_post_accessibility(post_status_for_error(&error, true));
+                progress.mark_post_visual(PostStatus::NotRun);
+                return Err(with_action_progress_snapshot(
+                    completed_without_observation(error),
+                    progress.snapshot(),
+                ));
+            }
+        };
+        let output = self
+            .post_action_observation(Arc::clone(&refreshed), Arc::clone(&progress))
+            .await?;
+        Ok(GeneratedActionResult {
+            output,
+            replacement: Some(refreshed),
+        })
+    }
+
+    async fn post_action_observation(
+        &self,
+        refreshed: Arc<Snapshot>,
+        progress: Arc<ActionProgress>,
+    ) -> Result<ToolOutput, RuntimeError> {
+        let visual_requested = refreshed.screenshot_requested;
+        match self
+            .observe_with_status(Arc::clone(&refreshed), Ok(()))
             .await
-            .map_err(completed_without_observation)?;
-        Ok(self.observe(refreshed, Ok(())).await)
+        {
+            Ok((output, visual_status)) => {
+                if visual_requested {
+                    progress.mark_post_visual(visual_status);
+                    if visual_status != PostStatus::Observed {
+                        let reason = output
+                            .structured_content
+                            .as_ref()
+                            .and_then(|value| value["screenshot"]["reason"].as_str());
+                        self.discard_failed_post_observation(&refreshed);
+                        return Err(with_action_progress_snapshot(
+                            completed_post_visual_failure(visual_status, reason),
+                            progress.snapshot(),
+                        ));
+                    }
+                }
+                if output
+                    .structured_content
+                    .as_ref()
+                    .is_some_and(|value| value["accessibility"]["ready"] == true)
+                {
+                    progress.mark_post_accessibility(PostStatus::Observed);
+                }
+                Ok(output)
+            }
+            Err(error) => {
+                if visual_requested {
+                    let visual_status = post_visual_error_status(&error);
+                    progress.mark_post_visual(visual_status);
+                    self.discard_failed_post_observation(&refreshed);
+                    return Err(with_action_progress_snapshot(
+                        completed_post_visual_failure(visual_status, Some(&error.message)),
+                        progress.snapshot(),
+                    ));
+                }
+                self.discard_failed_post_observation(&refreshed);
+                Err(with_action_progress_snapshot(
+                    completed_without_observation(error),
+                    progress.snapshot(),
+                ))
+            }
+        }
+    }
+
+    fn discard_failed_post_observation(&self, snapshot: &Snapshot) {
+        match self.lock_cache() {
+            Ok(mut cache) => {
+                cache
+                    .observations
+                    .retain(|cached| cached.snapshot.generation != snapshot.generation);
+                cache.clear_screenshot_mappings();
+            }
+            Err(error) => eprintln!(
+                "computer-use-mcp: failed to discard unusable post-action observation: {error}"
+            ),
+        }
     }
 
     async fn settle_and_refresh(&self, old: Arc<Snapshot>) -> Result<Arc<Snapshot>, RuntimeError> {
         sleep(self.config.settle_interval).await;
-        let future = self.collect_exact_snapshot(&old, old.limits);
-        let refreshed = timeout(self.config.snapshot_timeout, future)
-            .await
-            .map_err(|_| operational_error("AT-SPI snapshot timed out after action"))??;
+        self.refresh_window_catalog().await?;
+        let refreshed = if let Some(target) = old.target_ref.as_ref() {
+            let entry = self
+                .target_entry(target)
+                .map_err(completed_without_observation)?;
+            let future = self.replacement_snapshot(&old, target, &entry);
+            timeout(self.config.snapshot_timeout, future)
+                .await
+                .map_err(|_| operational_error("snapshot timed out after action"))??
+        } else {
+            let future = self.collect_exact_snapshot(&old, old.limits);
+            timeout(self.config.snapshot_timeout, future)
+                .await
+                .map_err(|_| operational_error("AT-SPI snapshot timed out after action"))??
+        };
         if refreshed.app.object != old.app.object {
             return Err(operational_error(
                 "application identity changed while settling after the action",
@@ -1064,11 +2254,95 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         self.commit_snapshot(refreshed)
     }
 
+    async fn replacement_snapshot(
+        &self,
+        old: &Snapshot,
+        target: &TargetRef,
+        entry: &WindowEntry,
+    ) -> Result<Snapshot, RuntimeError> {
+        if !old.requires_atspi_revalidation {
+            let view = if old.screenshot_requested {
+                ObserveView::Screenshot
+            } else {
+                ObserveView::Accessibility
+            };
+            return Ok(self.visual_snapshot(
+                entry,
+                target,
+                VisualSnapshotOptions {
+                    view,
+                    accessibility_scope: old.view,
+                    element_query: old.element_query.clone(),
+                    limits: old.limits,
+                    accessibility_ready: old.accessibility_ready && entry.atspi.is_some(),
+                    accessibility_reason: old.accessibility_reason.clone(),
+                },
+            ));
+        }
+
+        let Some(binding) = entry.atspi.as_ref() else {
+            let view = if old.screenshot_requested {
+                ObserveView::Both
+            } else {
+                ObserveView::Accessibility
+            };
+            return Ok(self.visual_snapshot(
+                entry,
+                target,
+                VisualSnapshotOptions {
+                    view,
+                    accessibility_scope: old.view,
+                    element_query: old.element_query.clone(),
+                    limits: old.limits,
+                    accessibility_ready: false,
+                    accessibility_reason: Some(
+                        "the target no longer has a verified AT-SPI binding".into(),
+                    ),
+                },
+            ));
+        };
+        let mut snapshot = self
+            .collect_snapshot(binding, old.view, old.element_query.clone(), old.limits)
+            .await?;
+        snapshot.target_ref = Some(target.clone());
+        snapshot.screenshot_requested = old.screenshot_requested;
+        snapshot.requires_atspi_revalidation = true;
+        Ok(snapshot)
+    }
+
     async fn observe(
         &self,
         snapshot: Arc<Snapshot>,
         desktop_session: Result<(), RuntimeError>,
-    ) -> ToolOutput {
+    ) -> Result<ToolOutput, RuntimeError> {
+        self.observe_with_status(snapshot, desktop_session)
+            .await
+            .map(|(output, _)| output)
+    }
+
+    async fn observe_with_status(
+        &self,
+        snapshot: Arc<Snapshot>,
+        desktop_session: Result<(), RuntimeError>,
+    ) -> Result<(ToolOutput, PostStatus), RuntimeError> {
+        if !snapshot.screenshot_requested {
+            return Ok((
+                observation_output(
+                    &snapshot,
+                    false,
+                    Some("screenshot was not requested"),
+                    None,
+                    None,
+                    None,
+                ),
+                PostStatus::NotRequested,
+            ));
+        }
+        if snapshot.target_ref.is_some() {
+            // Refresh immediately before capture so a target removed after
+            // requested_target_snapshot cannot start a visual operation.
+            self.revalidate_screenshot_target(&snapshot).await?;
+        }
         if let Err(error) = desktop_session {
             eprintln!(
                 "computer-use-mcp: screenshot preparation failed for pid={} window={}{} generation={}: {error}",
@@ -1077,7 +2351,10 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 snapshot.window.object.path,
                 snapshot.generation
             );
-            return screenshot_unavailable(&snapshot, &error.to_string());
+            return Ok((
+                screenshot_unavailable(&snapshot, &error.to_string()),
+                post_visual_error_status(&error),
+            ));
         }
         match timeout(
             self.config.snapshot_timeout,
@@ -1098,33 +2375,49 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                         snapshot.generation,
                         observation.mapping.accessibility_generation
                     );
-                    return screenshot_unavailable(
-                        &snapshot,
-                        "screenshot mapping identity changed during capture",
-                    );
+                    return Ok((
+                        screenshot_unavailable(
+                            &snapshot,
+                            "screenshot mapping identity changed during capture",
+                        ),
+                        PostStatus::CaptureFailed,
+                    ));
                 }
                 if let Err(error) = self.revalidate_screenshot_target(&snapshot).await {
                     eprintln!(
                         "computer-use-mcp: screenshot target changed after frame acquisition for pid={}: {error}",
                         snapshot.app.pid
                     );
-                    return screenshot_unavailable(&snapshot, &error.to_string());
+                    if snapshot.target_ref.is_some() {
+                        return Err(error);
+                    }
+                    return Ok((
+                        screenshot_unavailable(&snapshot, &error.to_string()),
+                        PostStatus::CaptureFailed,
+                    ));
                 }
                 if let Err(error) = self.cache_screenshot(&snapshot, observation.mapping.clone()) {
                     eprintln!(
                         "computer-use-mcp: screenshot cache update failed for pid={}: {error}",
                         snapshot.app.pid
                     );
-                    return screenshot_unavailable(&snapshot, &error.to_string());
+                    return Ok((
+                        screenshot_unavailable(&snapshot, &error.to_string()),
+                        PostStatus::CaptureFailed,
+                    ));
                 }
                 let (width, height) = observation.mapping.output_size;
-                observation_output(
-                    &snapshot,
-                    true,
-                    None,
-                    Some((width, height)),
-                    Some(observation.png_base64),
-                )
+                Ok((
+                    observation_output(
+                        &snapshot,
+                        true,
+                        None,
+                        Some((width, height)),
+                        Some(observation.png_base64),
+                        Some(&observation.mapping.source),
+                    ),
+                    PostStatus::Observed,
+                ))
             }
             Ok(Err(error)) => {
                 eprintln!(
@@ -1134,19 +2427,32 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                     snapshot.window.object.path,
                     snapshot.generation
                 );
-                screenshot_unavailable(&snapshot, &error.to_string())
+                Ok((
+                    screenshot_unavailable(&snapshot, &error.to_string()),
+                    error.post_status(),
+                ))
             }
             Err(_) => {
                 eprintln!(
                     "computer-use-mcp: screenshot capture timed out for pid={} generation={}",
                     snapshot.app.pid, snapshot.generation
                 );
-                screenshot_unavailable(&snapshot, "screenshot capture timed out")
+                Ok((
+                    screenshot_unavailable(&snapshot, "screenshot capture timed out"),
+                    PostStatus::Timeout,
+                ))
             }
         }
     }
 
     async fn revalidate_screenshot_target(&self, snapshot: &Snapshot) -> Result<(), RuntimeError> {
+        if let Some(target) = snapshot.target_ref.as_ref() {
+            self.refresh_window_catalog().await?;
+            let _ = self.target_entry(target)?;
+        }
+        if !snapshot.requires_atspi_revalidation {
+            return Ok(());
+        }
         let apps = self.discover().await?;
         let matching_apps = apps
             .iter()
@@ -1186,27 +2492,27 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
 
     pub fn screenshot_mapping(
         &self,
-        state_id: &str,
+        observation_id: &str,
     ) -> Result<Option<ScreenshotMapping>, RuntimeError> {
         let cache = self.lock_cache()?;
         Ok(cache
             .observations
             .iter()
-            .find(|cached| snapshot_state_id(&cached.snapshot) == state_id)
+            .find(|cached| observation_id_for_snapshot(&cached.snapshot) == observation_id)
             .and_then(|cached| cached.screenshot_mapping.clone()))
     }
 
-    fn required_cached(&self, state_id: &str) -> Result<Arc<Snapshot>, RuntimeError> {
+    fn required_cached(&self, observation_id: &str) -> Result<Arc<Snapshot>, RuntimeError> {
         let cache = self.lock_cache()?;
-        Ok(Arc::clone(&cache.required(state_id)?.snapshot))
+        Ok(Arc::clone(&cache.required(observation_id)?.snapshot))
     }
 
     fn required_screenshot(
         &self,
-        state_id: &str,
+        observation_id: &str,
     ) -> Result<(Arc<Snapshot>, ScreenshotMapping), RuntimeError> {
         let cache = self.lock_cache()?;
-        let current = cache.required(state_id)?;
+        let current = cache.required(observation_id)?;
         let mapping = current.screenshot_mapping.clone().ok_or_else(|| {
             state_required_error(
                 "the observation has no usable screenshot; call observe and require screenshot.ready=true",
@@ -1215,31 +2521,82 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         Ok((Arc::clone(&current.snapshot), mapping))
     }
 
-    async fn verify_semantic_keyboard_focus(
-        &self,
-        cached: &Snapshot,
-        index: &str,
-    ) -> Result<(), RuntimeError> {
-        let current = self.fresh_for_action(cached).await?;
-        let target = relocated_element(cached, &current, index)?;
-        if !target.node.states.contains("focused") {
-            return Err(operational_error(
-                "semantic keyboard focus target is not focused after GrabFocus",
-            ));
-        }
-        if !current.window.states.contains("active") {
-            return Err(operational_error(
-                "selected window is not active after semantic keyboard focus",
-            ));
-        }
-        Ok(())
-    }
-
     fn lock_cache(&self) -> Result<std::sync::MutexGuard<'_, Cache>, RuntimeError> {
         self.cache.lock().map_err(|_| {
             eprintln!("computer-use-mcp: state cache mutex poisoned");
             operational_error("state cache invariant failed")
         })
+    }
+
+    #[cfg(test)]
+    async fn snapshot_text(
+        &self,
+        _fixture_name: String,
+        view: Option<ObserveView>,
+        max_nodes: Option<usize>,
+        max_depth: Option<usize>,
+    ) -> Result<String, RuntimeError> {
+        let _mutation = self.mutation.lock().await;
+        let scope = match view.unwrap_or(ObserveView::Both) {
+            ObserveView::Screenshot => AccessibilityScope::Interactive,
+            ObserveView::Accessibility => AccessibilityScope::Full,
+            ObserveView::Both => AccessibilityScope::Full,
+        };
+        let apps = self.discover().await?;
+        let [app] = apps.as_slice() else {
+            return Err(operational_error(
+                "test fixture must expose exactly one AT-SPI application",
+            ));
+        };
+        let [window] = app.windows.as_slice() else {
+            return Err(operational_error(
+                "test fixture must expose exactly one AT-SPI window",
+            ));
+        };
+        let binding = AtspiBinding {
+            app: app.clone(),
+            window: window.clone(),
+        };
+        let snapshot = self
+            .collect_snapshot(
+                &binding,
+                scope,
+                None,
+                SnapshotLimits {
+                    text: self.config.default_text_limit,
+                    nodes: max_nodes.unwrap_or(self.config.default_max_nodes),
+                    depth: max_depth.unwrap_or(self.config.default_max_depth),
+                },
+            )
+            .await?;
+        self.refresh_window_catalog().await?;
+        let mut snapshot = snapshot;
+        snapshot.screenshot_requested = false;
+        snapshot.target_ref = Some(TargetRef {
+            app_instance_id: "app-0000000000000000".into(),
+            window_instance_id: "win-0000000000000001".into(),
+        });
+        let snapshot = self.commit_snapshot(snapshot)?;
+        Ok(observation_output(
+            &snapshot,
+            false,
+            Some("screenshot was not requested"),
+            None,
+            None,
+            None,
+        )
+        .text)
+    }
+
+    #[cfg(test)]
+    async fn element_action_for_test(
+        &self,
+        observation_id: &str,
+        index: &str,
+        action: ElementAction,
+    ) -> Result<Arc<Snapshot>, RuntimeError> {
+        self.element_action(observation_id, index, action, &ActionProgress::default())
+            .await
     }
 }
 
@@ -1255,27 +2612,66 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> DesktopRuntime for Semantic
     fn execute(
         &self,
         call: ToolCall,
+        progress: Option<Arc<ActionProgress>>,
     ) -> impl Future<Output = Result<ToolOutput, RuntimeError>> + Send + '_ {
-        self.execute_call(call)
+        self.execute_call_with_progress(call, progress)
     }
 
-    async fn cleanup(&self) -> Result<(), RuntimeError> {
+    async fn cleanup(&self, progress: Option<Arc<ActionProgress>>) -> Result<(), RuntimeError> {
         let _mutation = self.mutation.lock().await;
         self.lock_cache()?.clear_screenshot_mappings();
-        self.screenshots
+        let launch_result = crate::desktop_launcher::cancel_and_join(
+            Arc::clone(&self.launch_in_progress),
+            Arc::clone(&self.launch_tasks),
+            Duration::from_secs(2),
+        )
+        .await;
+        let result = self
+            .screenshots
             .cleanup_input()
             .await
-            .map_err(operational_error)?;
-        Ok(())
+            .map_err(operational_error);
+        let cleanup_result = match (launch_result, result) {
+            (Ok(()), result) => result,
+            (Err(launch), Ok(())) => Err(launch),
+            (Err(launch), Err(cleanup)) => Err(operational_error(format!(
+                "desktop launch cleanup failed: {launch}; input cleanup also failed: {cleanup}"
+            ))),
+        };
+        if let Some(progress) = progress {
+            if cleanup_result.is_ok() {
+                progress.mark_cleanup_completed();
+            } else {
+                progress.mark_cleanup_failed();
+            }
+        }
+        cleanup_result
     }
 
     async fn shutdown(&self) -> Result<(), RuntimeError> {
         self.stop_desktop_session().await;
         let _mutation = self.mutation.lock().await;
-        self.screenshots
+        let launch_result = crate::desktop_launcher::cancel_and_join(
+            Arc::clone(&self.launch_in_progress),
+            Arc::clone(&self.launch_tasks),
+            Duration::from_secs(2),
+        )
+        .await;
+        let screenshot_result = self
+            .screenshots
             .shutdown_input()
             .await
-            .map_err(operational_error)
+            .map_err(operational_error);
+        let wayland_result = self.wayland.shutdown().await.map_err(|error| {
+            operational_error(format!("Wayland catalog shutdown failed: {error}"))
+        });
+        match (launch_result, screenshot_result.and(wayland_result)) {
+            (Ok(()), result) => result,
+            (Err(launch), Ok(())) => Err(launch),
+            (Err(launch), Err(other)) => Err(operational_error(format!(
+                "desktop launch shutdown failed: {launch}; other shutdown failed: {other}"
+            ))),
+        }
     }
 }
 
@@ -1284,121 +2680,6 @@ struct Traversal {
     elements: Vec<ElementSnapshot>,
     node_limit_reached: bool,
     depth_limit_reached: bool,
-}
-
-#[derive(Debug)]
-struct Resolved {
-    app: AppInfo,
-    window: Option<WindowInfo>,
-}
-
-fn resolve_app(
-    query: &str,
-    expected_pid: Option<u32>,
-    apps: &[AppInfo],
-) -> Result<Resolved, RuntimeError> {
-    if let Some(pid) = expected_pid {
-        let matches: Vec<_> = apps.iter().filter(|app| app.pid == pid).collect();
-        if matches.is_empty() {
-            return Err(operational_error(format!(
-                "stale PID {pid}: the app from the cached state is no longer present"
-            )));
-        }
-        return unique_app(query, "cached expected PID", matches);
-    }
-    if let Ok(pid) = query.strip_prefix("PID=").unwrap_or(query).parse::<u32>() {
-        let matches: Vec<_> = apps.iter().filter(|app| app.pid == pid).collect();
-        return unique_app(query, "exact numeric PID", matches);
-    }
-    let exact_apps: Vec<_> = apps
-        .iter()
-        .filter(|app| app.name.eq_ignore_ascii_case(query))
-        .collect();
-    if !exact_apps.is_empty() {
-        return unique_app(query, "exact app name", exact_apps);
-    }
-    let exact_windows: Vec<_> = apps
-        .iter()
-        .flat_map(|app| app.windows.iter().map(move |window| (app, window)))
-        .filter(|(_, window)| window.title.eq_ignore_ascii_case(query))
-        .collect();
-    if !exact_windows.is_empty() {
-        return unique_window(query, "exact window title", exact_windows);
-    }
-    let query_lower = query.to_lowercase();
-    let mut substring_matches = Vec::new();
-    for app in apps {
-        if app.name.to_lowercase().contains(&query_lower) {
-            substring_matches.push((app, None));
-            continue;
-        }
-        for window in &app.windows {
-            if window.title.to_lowercase().contains(&query_lower) {
-                substring_matches.push((app, Some(window)));
-            }
-        }
-    }
-    match substring_matches.as_slice() {
-        [(app, window)] => Ok(Resolved {
-            app: (*app).clone(),
-            window: window.cloned(),
-        }),
-        [] => Err(operational_error(format!(
-            "app not found for query {query:?}"
-        ))),
-        matches => Err(ambiguous(query, "substring app/window", matches.len())),
-    }
-}
-
-fn unique_app(query: &str, tier: &str, matches: Vec<&AppInfo>) -> Result<Resolved, RuntimeError> {
-    match matches.as_slice() {
-        [app] => Ok(Resolved {
-            app: (*app).clone(),
-            window: None,
-        }),
-        [] => Err(operational_error(format!(
-            "app not found at {tier} tier for query {query:?}"
-        ))),
-        matches => Err(ambiguous(query, tier, matches.len())),
-    }
-}
-
-fn unique_window(
-    query: &str,
-    tier: &str,
-    matches: Vec<(&AppInfo, &WindowInfo)>,
-) -> Result<Resolved, RuntimeError> {
-    match matches.as_slice() {
-        [(app, window)] => Ok(Resolved {
-            app: (*app).clone(),
-            window: Some((*window).clone()),
-        }),
-        [] => Err(operational_error(format!(
-            "window not found at {tier} tier for query {query:?}"
-        ))),
-        matches => Err(ambiguous(query, tier, matches.len())),
-    }
-}
-
-fn ambiguous(query: &str, tier: &str, count: usize) -> RuntimeError {
-    operational_error(format!(
-        "ambiguous app query {query:?} at {tier} tier: {count} matches"
-    ))
-}
-
-fn choose_window(windows: &[WindowInfo]) -> Result<&WindowInfo, RuntimeError> {
-    windows
-        .iter()
-        .filter(|window| window_is_viable(window))
-        .find(|window| window.states.contains("active"))
-        .or_else(|| {
-            windows
-                .iter()
-                .filter(|window| window_is_viable(window))
-                .find(|window| window.states.contains("showing"))
-        })
-        .or_else(|| windows.iter().find(|window| window_is_viable(window)))
-        .ok_or_else(|| operational_error("application has no viable top-level window"))
 }
 
 fn window_is_viable(window: &WindowInfo) -> bool {
@@ -1557,70 +2838,92 @@ fn named_actions(actions: &[ActionInfo]) -> impl Iterator<Item = (usize, &Action
 }
 
 pub fn format_snapshot(snapshot: &Snapshot) -> String {
-    let mut output = format!(
-        "State ID: {}\nApp: {} (PID: {})\nWindow: {}\nElement frames: atspi_window_coordinates\n",
-        snapshot_state_id(snapshot),
-        escape(&snapshot.app.name),
-        snapshot.app.pid,
-        escape(&snapshot.window.title)
-    );
-    if snapshot.view != ObservationView::Full || snapshot.element_query.is_some() {
-        output.push_str(&format!("View: {}", snapshot.view.as_str()));
-        if let Some(query) = &snapshot.element_query {
-            output.push_str(&format!(" query=\"{}\"", escape(query)));
-        }
-        output.push('\n');
+    format_snapshot_with_budget(snapshot, MAX_MODEL_TEXT_BYTES).text
+}
+
+fn format_snapshot_with_budget(snapshot: &Snapshot, max_bytes: usize) -> TextProjection {
+    let presented = presented_element_indices(snapshot);
+    let first = build_snapshot_text(snapshot, &presented, max_bytes);
+    let Some(focused) = presented.iter().copied().find(|index| {
+        snapshot
+            .elements
+            .get(*index)
+            .is_some_and(|element| element.node.states.contains("focused"))
+    }) else {
+        return first;
+    };
+    if !first.truncation.truncated
+        || first
+            .text
+            .contains(&element_id_for_snapshot(snapshot, focused))
+    {
+        return first;
     }
+
+    // Preserve the root and focused element when a response budget forces a
+    // choice.  The normal order remains unchanged whenever the complete
+    // observation fits.
+    let mut prioritized = Vec::with_capacity(presented.len());
+    if let Some(root) = presented.first().copied() {
+        prioritized.push(root);
+    }
+    prioritized.push(focused);
+    let rest = presented
+        .iter()
+        .copied()
+        .filter(|index| !prioritized.contains(index))
+        .collect::<Vec<_>>();
+    prioritized.extend(rest);
+    build_snapshot_text(snapshot, &prioritized, max_bytes)
+}
+
+fn build_snapshot_text(
+    snapshot: &Snapshot,
+    element_indexes: &[usize],
+    max_bytes: usize,
+) -> TextProjection {
+    let (app_instance_id, window_instance_id) = snapshot.target_ref.as_ref().map_or_else(
+        || {
+            (
+                format!("app-{:016x}", u64::from(snapshot.app.pid)),
+                format!("win-{:016x}", snapshot.generation),
+            )
+        },
+        |target| {
+            (
+                target.app_instance_id.clone(),
+                target.window_instance_id.clone(),
+            )
+        },
+    );
+    let mut output = format!(
+        "Observation ID: {} target=app_instance_id={} window_instance_id={}\naccessibility_bounds=not_convertible\n",
+        observation_id_for_snapshot(snapshot),
+        app_instance_id,
+        window_instance_id,
+    );
+    let marker_reserve = ResponseTruncation::default().text_marker().len() + 1;
+    let body_budget = max_bytes.saturating_sub(marker_reserve);
     let mut focused = None;
     let mut selected = None;
-    for (index, element) in presented_elements(snapshot) {
-        let indent = "\t".repeat(element.depth + 1);
-        output.push_str(&format!(
-            "{indent}{}: {} name=\"{}\"",
-            index,
-            escape(&element.node.role),
-            escape(&element.node.name)
-        ));
-        let value = element.node.value.as_ref().or(element.node.text.as_ref());
-        if let Some(value) = value {
-            output.push_str(&format!(
-                " value=\"{}\"",
-                escape(&truncate(value, snapshot.limits.text))
-            ));
-        }
-        let capabilities = text_capabilities(element);
-        if !capabilities.is_empty() {
-            output.push_str(" capabilities=[");
-            output.push_str(&capabilities.join(", "));
-            output.push(']');
-        }
-        let actions = named_actions(element.node.capabilities.actions())
-            .map(|(_, action)| {
-                if action.description.is_empty() {
-                    format!("{{name=\"{}\"}}", escape(&action.name))
-                } else {
-                    format!(
-                        "{{name=\"{}\", description=\"{}\"}}",
-                        escape(&action.name),
-                        escape(&action.description)
-                    )
-                }
-            })
-            .collect::<Vec<_>>();
-        if !actions.is_empty() {
-            output.push_str(" named_actions=[");
-            output.push_str(&actions.join(", "));
-            output.push(']');
-        }
-        if let Some(frame) = element.node.window_frame {
-            output.push_str(&format!(
-                " frame_atspi_window=({}, {}, {}, {})",
-                frame.x, frame.y, frame.width, frame.height
-            ));
-        }
-        output.push('\n');
+    let mut included = 0;
+    let mut fields_truncated = false;
+    for index in element_indexes {
+        let Some(element) = snapshot.elements.get(*index) else {
+            eprintln!("computer-use-mcp: snapshot element index disappeared during formatting");
+            continue;
+        };
+        let remaining = body_budget.saturating_sub(output.len());
+        let Some((line, line_truncated)) =
+            fit_element_text_line(snapshot, *index, element, remaining)
+        else {
+            break;
+        };
+        output.push_str(&line);
+        included += 1;
+        fields_truncated |= line_truncated;
         if element.node.states.contains("focused") {
-            focused = Some(index);
+            focused = Some(element_id_for_snapshot(snapshot, *index));
         }
         if selected.is_none() {
             selected = element
@@ -1628,80 +2931,332 @@ pub fn format_snapshot(snapshot: &Snapshot) -> String {
                 .selected_text
                 .as_ref()
                 .filter(|text| !text.is_empty())
-                .map(|text| truncate(text, snapshot.limits.text));
+                .map(|text| truncate(text, snapshot.limits.text.min(MAX_MODEL_FIELD_CHARS)));
         }
     }
-    if let Some(index) = focused {
-        output.push_str(&format!("Focused element: {index}\n"));
+
+    let mut append_optional = |line: String| {
+        if output.len().saturating_add(line.len()) <= body_budget {
+            output.push_str(&line);
+        } else {
+            fields_truncated = true;
+        }
+    };
+    if let Some(element_id) = focused {
+        append_optional(format!("Focused element: {element_id}\n"));
     }
     if let Some(text) = selected {
-        output.push_str(&format!("Selected text: \"{}\"\n", escape(&text)));
+        append_optional(format!("Selected text: \"{}\"\n", escape(&text)));
     }
     if snapshot.node_limit_reached {
-        output.push_str("Warning: accessibility tree node limit reached.\n");
+        append_optional("Warning: accessibility tree node limit reached.\n".into());
     }
     if snapshot.depth_limit_reached {
-        output.push_str("Warning: accessibility tree depth limit reached.\n");
+        append_optional("Warning: accessibility tree depth limit reached.\n".into());
     }
-    output
+
+    let elements_omitted = element_indexes.len().saturating_sub(included);
+    let truncation = ResponseTruncation {
+        truncated: elements_omitted > 0 || fields_truncated,
+        fields_truncated,
+        elements_included: included,
+        elements_omitted,
+    };
+    if truncation.truncated {
+        let marker = format!("{}\n", truncation.text_marker());
+        while output.len().saturating_add(marker.len()) > max_bytes {
+            let Some(last_newline) = output[..output.len().saturating_sub(1)].rfind('\n') else {
+                break;
+            };
+            output.truncate(last_newline + 1);
+        }
+        output.push_str(&marker);
+    }
+    TextProjection {
+        text: output,
+        truncation,
+    }
+}
+
+fn fit_element_text_line(
+    snapshot: &Snapshot,
+    index: usize,
+    element: &ElementSnapshot,
+    remaining: usize,
+) -> Option<(String, bool)> {
+    let upper = MAX_MODEL_FIELD_CHARS;
+    let mut low = 0;
+    let mut high = upper;
+    let mut best = None;
+    while low <= high {
+        let field_limit = low + (high - low) / 2;
+        let (line, field_truncated) = element_text_line(snapshot, index, element, field_limit);
+        if line.len() <= remaining {
+            best = Some((line, field_truncated || field_limit < upper));
+            low = field_limit.saturating_add(1);
+        } else if field_limit == 0 {
+            break;
+        } else {
+            high = field_limit - 1;
+        }
+    }
+    best
+}
+
+fn element_text_line(
+    snapshot: &Snapshot,
+    index: usize,
+    element: &ElementSnapshot,
+    field_limit: usize,
+) -> (String, bool) {
+    let mut truncated_fields = false;
+    let field = |value: &str, truncated_fields: &mut bool| {
+        let was_truncated = value.chars().count() > field_limit;
+        let value = truncate(value, field_limit);
+        *truncated_fields |= was_truncated;
+        escape(&value)
+    };
+    let value_field = |value: &str| {
+        let value = truncate(value, snapshot.limits.text);
+        let truncated = value.chars().count() > field_limit;
+        (escape(&truncate(&value, field_limit)), truncated)
+    };
+    let indent = "\t".repeat(element.depth + 1);
+    let role = field(&element.node.role, &mut truncated_fields);
+    let name = field(&element.node.name, &mut truncated_fields);
+    let mut output = format!(
+        "{indent}{}: {role} name=\"{name}\"",
+        element_id_for_snapshot(snapshot, index),
+    );
+    if let Some(value) = element.node.value.as_ref().or(element.node.text.as_ref()) {
+        let (value, value_truncated) = value_field(value);
+        truncated_fields |= value_truncated;
+        output.push_str(&format!(" value=\"{value}\""));
+    }
+    if element.node.text_truncated == Some(true) {
+        output.push_str(" text_truncated=true");
+    }
+    let capabilities = text_capabilities(element);
+    if !capabilities.is_empty() {
+        output.push_str(" capabilities=[");
+        output.push_str(&capabilities.join(", "));
+        output.push(']');
+    }
+    let actions = named_actions(element.node.capabilities.actions())
+        .take(MAX_MODEL_ACTIONS)
+        .map(|(_, action)| {
+            let name = field(&action.name, &mut truncated_fields);
+            let description = field(&action.description, &mut truncated_fields);
+            if description.is_empty() {
+                format!("{{name=\"{name}\"}}")
+            } else {
+                format!("{{name=\"{name}\", description=\"{description}\"}}")
+            }
+        })
+        .collect::<Vec<_>>();
+    if !actions.is_empty() {
+        output.push_str(" named_actions=[");
+        output.push_str(&actions.join(", "));
+        output.push(']');
+    }
+    if element.node.capabilities.actions().len() > MAX_MODEL_ACTIONS {
+        output.push_str(" named_actions_truncated=true");
+        truncated_fields = true;
+    }
+    output.push('\n');
+    (output, truncated_fields)
 }
 
 fn screenshot_unavailable(snapshot: &Snapshot, reason: &str) -> ToolOutput {
-    observation_output(snapshot, false, Some(reason), None, None)
+    observation_output(snapshot, false, Some(reason), None, None, None)
 }
 
-fn snapshot_state_id(snapshot: &Snapshot) -> String {
-    format!("s-{:016x}", snapshot.generation)
-}
-
-fn format_running_apps(apps: &[AppInfo]) -> String {
-    if apps.is_empty() {
-        return EMPTY_APPS_MESSAGE.to_owned();
+fn installed_app_page_generation(apps: &[crate::desktop_launcher::InstalledApp]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for app in apps {
+        for value in [&app.desktop_id, &app.name] {
+            for byte in value.as_bytes() {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            hash ^= 0xff;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= if app.shown { 1 } else { 0 };
+        hash = hash.wrapping_mul(0x100000001b3);
     }
-    apps.iter()
-        .map(|app| {
-            let windows = app
-                .windows
-                .iter()
-                .map(|window| {
-                    format!(
-                        "  Window: {} object={}{} states=[{}]",
-                        escape(&window.title),
-                        window.object.bus_name,
-                        window.object.path,
-                        window.states.iter().cloned().collect::<Vec<_>>().join(",")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!(
-                "App: {} PID={} object={}{}\n{}",
-                escape(&app.name),
-                app.pid,
-                app.object.bus_name,
-                app.object.path,
-                windows
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    hash
 }
 
-fn running_app_metadata(app: &AppInfo) -> serde_json::Value {
-    json!({
-        "name": app.name,
-        "pid": app.pid,
-        "object": object_metadata(&app.object),
-        "windows": app.windows.iter().map(|window| json!({
-            "title": window.title,
-            "object": object_metadata(&window.object),
-            "states": window.states.iter().collect::<Vec<_>>()
-        })).collect::<Vec<_>>()
-    })
+fn page_scope_name(scope: DesktopScope) -> &'static str {
+    match scope {
+        DesktopScope::Windows => "windows",
+        DesktopScope::Applications => "applications",
+    }
 }
 
-fn object_metadata(object: &ObjectId) -> serde_json::Value {
-    json!({"bus_name": object.bus_name, "path": object.path})
+fn page_cursor(scope: DesktopScope, generation: u64, offset: usize) -> String {
+    format!(
+        "cur-{}-{generation:016x}-{offset:016x}",
+        page_scope_name(scope)
+    )
+}
+
+fn page_start(
+    cursor: Option<&str>,
+    scope: DesktopScope,
+    generation: u64,
+    total: usize,
+) -> Result<usize, RuntimeError> {
+    let Some(cursor) = cursor else {
+        return Ok(0);
+    };
+    let parts = cursor.split('-').collect::<Vec<_>>();
+    if parts.len() != 4
+        || parts[0] != "cur"
+        || parts[1] != page_scope_name(scope)
+        || parts[2].len() != 16
+        || parts[3].len() != 16
+        || !parts[2]
+            .bytes()
+            .chain(parts[3].bytes())
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(RuntimeError::invalid_arguments("cursor is malformed"));
+    }
+    let cursor_generation = u64::from_str_radix(parts[2], 16)
+        .map_err(|_| RuntimeError::invalid_arguments("cursor is malformed"))?;
+    let offset = usize::from_str_radix(parts[3], 16)
+        .map_err(|_| RuntimeError::invalid_arguments("cursor is malformed"))?;
+    if cursor_generation != generation || offset > total {
+        return Err(stale_catalog_error(
+            "cursor is stale; request the first page again",
+        ));
+    }
+    Ok(offset)
+}
+
+fn compact_backend_status(status: &BackendStatus) -> String {
+    compact_capability(&status.capability())
+}
+
+fn compact_capability(status: &CapabilityState) -> String {
+    status.reason().map_or_else(
+        || status.status().to_owned(),
+        |reason| format!("{}({})", status.status(), truncate(&escape(reason), 96)),
+    )
+}
+
+fn compact_window_entry(entry: &WindowEntry) -> String {
+    format!(
+        "{} — app_instance_id={} window_instance_id={} pid={} source={} capabilities=screenshot:{} accessibility:{} activation:{}",
+        truncate(&escape(&entry.title), 160),
+        entry.target.app_instance_id,
+        entry.target.window_instance_id,
+        entry
+            .pid
+            .map_or_else(|| "null".to_owned(), |pid| pid.to_string()),
+        entry.source.as_str(),
+        compact_capability(&entry.capabilities.screenshot),
+        compact_capability(&entry.capabilities.accessibility),
+        compact_capability(&entry.capabilities.activate),
+    )
+}
+
+fn bounded_list_text(header: &str, entries: &[String], next_cursor: Option<&str>) -> String {
+    let prefix = if header.is_empty() {
+        String::new()
+    } else {
+        format!("{header}\n")
+    };
+    let next_line = next_cursor.map(|cursor| format!("Next cursor: {cursor}\n"));
+    let mut output = prefix.clone();
+    for entry in entries {
+        let separator = usize::from(!output.is_empty() && !output.ends_with('\n'));
+        if output
+            .len()
+            .saturating_add(separator)
+            .saturating_add(entry.len())
+            .saturating_add(next_line.as_ref().map_or(0, String::len))
+            <= MAX_MODEL_TEXT_BYTES
+        {
+            if separator != 0 {
+                output.push('\n');
+            }
+            output.push_str(entry);
+        } else {
+            break;
+        }
+    }
+    if output
+        .len()
+        .saturating_add(next_line.as_ref().map_or(0, String::len))
+        <= MAX_MODEL_TEXT_BYTES
+        && output
+            .lines()
+            .count()
+            .saturating_sub(usize::from(!header.is_empty()))
+            == entries.len()
+    {
+        if let Some(next_line) = next_line {
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str(&next_line);
+        }
+        return output;
+    }
+
+    let marker_budget = 128;
+    let next_len = next_line.as_ref().map_or(0, String::len);
+    let mut selected: Vec<&String> = Vec::new();
+    for entry in entries {
+        let separator = usize::from(!prefix.is_empty() || !selected.is_empty());
+        let candidate_len = prefix
+            .len()
+            .saturating_add(selected.iter().map(|entry| entry.len()).sum::<usize>())
+            .saturating_add(selected.len())
+            .saturating_add(separator)
+            .saturating_add(entry.len())
+            .saturating_add(marker_budget)
+            .saturating_add(next_len);
+        if candidate_len > MAX_MODEL_TEXT_BYTES {
+            break;
+        }
+        selected.push(entry);
+    }
+    let mut omitted = entries.len().saturating_sub(selected.len());
+    let mut marker = format!(
+        "List text truncated: reason=response_byte_budget entries_included={} entries_omitted={}\n",
+        selected.len(),
+        omitted
+    );
+    loop {
+        let mut bounded = prefix.clone();
+        for entry in &selected {
+            if !bounded.is_empty() && !bounded.ends_with('\n') {
+                bounded.push('\n');
+            }
+            bounded.push_str(entry);
+            if !bounded.ends_with('\n') {
+                bounded.push('\n');
+            }
+        }
+        bounded.push_str(&marker);
+        if let Some(next_line) = next_line.as_ref() {
+            bounded.push_str(next_line);
+        }
+        if bounded.len() <= MAX_MODEL_TEXT_BYTES || selected.is_empty() {
+            return bounded;
+        }
+        selected.pop();
+        omitted = entries.len().saturating_sub(selected.len());
+        marker = format!(
+            "List text truncated: reason=response_byte_budget entries_included={} entries_omitted={}\n",
+            selected.len(),
+            omitted
+        );
+    }
 }
 
 fn text_capabilities(element: &ElementSnapshot) -> Vec<String> {
@@ -1725,7 +3280,20 @@ fn text_capabilities(element: &ElementSnapshot) -> Vec<String> {
     capabilities
 }
 
-fn element_capabilities(index: usize, element: &ElementSnapshot) -> serde_json::Value {
+fn element_id_for_snapshot(snapshot: &Snapshot, index: usize) -> String {
+    snapshot
+        .element_ids
+        .get(index)
+        .cloned()
+        .unwrap_or_else(|| format!("e-{index:016x}"))
+}
+
+fn element_capabilities_for_snapshot_with_limit(
+    snapshot: &Snapshot,
+    index: usize,
+    element: &ElementSnapshot,
+    field_limit: usize,
+) -> (serde_json::Value, bool) {
     let inspection_complete = element.node.capabilities.inspection_complete();
     let set_value = match element.node.capabilities.set_value_kind() {
         Some(SetValueKind::Text) => Some("text"),
@@ -1733,23 +3301,129 @@ fn element_capabilities(index: usize, element: &ElementSnapshot) -> serde_json::
         None => None,
     };
     let actions = element.node.capabilities.actions();
+    let element_id = element_id_for_snapshot(snapshot, index);
+    let (role, role_truncated) = response_field(&element.node.role, field_limit);
+    let (name, name_truncated) = response_field(&element.node.name, field_limit);
+    let value_limit = field_limit.min(snapshot.limits.text);
+    let (value, value_truncated) = element
+        .node
+        .value
+        .as_deref()
+        .map_or((None, false), |value| {
+            let (value, truncated) = response_field(value, value_limit);
+            (Some(value), truncated)
+        });
+    let (text, text_truncated) = element.node.text.as_deref().map_or((None, false), |text| {
+        let (text, truncated) = response_field(text, value_limit);
+        (Some(text), truncated)
+    });
+    let (states, states_truncated) = bounded_response_strings(
+        element.node.states.iter().map(String::as_str),
+        field_limit,
+        MAX_MODEL_STATES,
+    );
+    let (named_actions, actions_truncated) = bounded_named_actions(actions, field_limit);
+    let fields_truncated = role_truncated
+        || name_truncated
+        || value_truncated
+        || text_truncated
+        || states_truncated
+        || actions_truncated;
+    (
+        json!({
+            "element_id": element_id,
+            "depth": element.depth,
+            "role": role,
+            "name": name,
+            "value": value,
+            "text": text,
+            "text_truncated": element.node.text_truncated,
+            "response_text_truncated": fields_truncated,
+            "states": states,
+            "states_truncated": states_truncated,
+            "bounds": null,
+            "capabilities": {
+                "invoke": inspection_complete && primary_action_index(actions).is_some(),
+                "focus": element.node.supports_focus(),
+                "named_actions": named_actions,
+                "named_actions_truncated": actions_truncated,
+                "set_value": set_value
+            }
+        }),
+        fields_truncated,
+    )
+}
+
+fn response_field(value: &str, limit: usize) -> (String, bool) {
+    if limit == 0 {
+        return (String::new(), !value.is_empty());
+    }
+    let truncated = value.chars().count() > limit;
+    (truncate(value, limit), truncated)
+}
+
+fn bounded_response_strings<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+    field_limit: usize,
+    max_items: usize,
+) -> (Vec<String>, bool) {
+    let mut truncated = false;
+    let values = values
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, value)| {
+            if index >= max_items {
+                truncated = true;
+                return None;
+            }
+            let (value, value_truncated) = response_field(value, field_limit);
+            truncated |= value_truncated;
+            Some(value)
+        })
+        .collect();
+    (values, truncated)
+}
+
+fn bounded_named_actions(actions: &[ActionInfo], field_limit: usize) -> (Vec<Value>, bool) {
+    let mut truncated = actions.len() > MAX_MODEL_ACTIONS;
+    let actions = actions
+        .iter()
+        .take(MAX_MODEL_ACTIONS)
+        .map(|action| {
+            let (name, name_truncated) = response_field(&action.name, field_limit);
+            let (description, description_truncated) =
+                response_field(&action.description, field_limit);
+            truncated |= name_truncated || description_truncated;
+            json!({"name": name, "description": description})
+        })
+        .collect();
+    (actions, truncated)
+}
+
+#[cfg(test)]
+fn element_capabilities(index: usize, element: &ElementSnapshot) -> serde_json::Value {
+    let complete = element.node.capabilities.inspection_complete();
+    let actions = element.node.capabilities.actions();
     json!({
-        "element_id": index.to_string(),
+        "element_id": format!("e-{index:016x}"),
         "depth": element.depth,
         "role": element.node.role,
         "name": element.node.name,
+        "value": element.node.value,
+        "text": element.node.text,
+        "text_truncated": element.node.text_truncated,
         "states": element.node.states.iter().collect::<Vec<_>>(),
-        "frame_atspi_window": element.node.window_frame.map(|frame| {
-            json!({"x": frame.x, "y": frame.y, "width": frame.width, "height": frame.height})
-        }),
-        "inspection_complete": inspection_complete,
-        "invoke": inspection_complete && primary_action_index(actions).is_some(),
+        "inspection_complete": complete,
+        "invoke": complete && primary_action_index(actions).is_some(),
         "focus": element.node.supports_focus(),
-        "named_actions": named_actions(actions).map(|(_, action)| json!({
-            "name": action.name,
-            "description": action.description
-        })).collect::<Vec<_>>(),
-        "set_value": set_value
+        "named_actions": named_actions(actions)
+            .map(|(_, action)| json!({"name": action.name, "description": action.description}))
+            .collect::<Vec<_>>(),
+        "set_value": match element.node.capabilities.set_value_kind() {
+            Some(SetValueKind::Text) => json!("text"),
+            Some(SetValueKind::Number) => json!("number"),
+            None => Value::Null,
+        },
     })
 }
 
@@ -1759,66 +3433,295 @@ fn observation_output(
     screenshot_reason: Option<&str>,
     dimensions: Option<(u32, u32)>,
     png_base64: Option<String>,
+    source: Option<&crate::capture::FrameMetadata>,
 ) -> ToolOutput {
-    let screenshot = match dimensions {
-        Some((width, height)) => json!({
-            "ready": screenshot_ready,
-            "reason": screenshot_reason,
-            "width": width,
-            "height": height,
-            "coordinate_space": "screenshot_png_pixels"
-        }),
-        None => json!({
-            "ready": screenshot_ready,
-            "reason": screenshot_reason,
-            "width": null,
-            "height": null,
-            "coordinate_space": "screenshot_png_pixels"
-        }),
-    };
-    let structured = json!({
-        "state_id": snapshot_state_id(snapshot),
-        "target": {
-            "query": snapshot.app_query,
-            "app": {
-                "name": snapshot.app.name,
-                "pid": snapshot.app.pid,
-                "object": object_metadata(&snapshot.app.object)
-            },
-            "window": {
-                "title": snapshot.window.title,
-                "object": object_metadata(&snapshot.window.object)
+    let structured = build_observation_structured(
+        snapshot,
+        screenshot_ready,
+        screenshot_reason,
+        dimensions,
+        source,
+        MAX_MODEL_STRUCTURED_BYTES,
+    );
+    let frame_id = source.map(crate::capture::frame_id);
+    let png_text = if screenshot_ready {
+        match (frame_id.as_deref(), dimensions) {
+            (Some(frame_id), Some((width, height))) => {
+                format!("PNG frame_id={frame_id} bounds=0<=x<{width},0<=y<{height}")
             }
-        },
-        "view": snapshot.view.as_str(),
-        "element_query": snapshot.element_query,
-        "screenshot": screenshot,
-        "coordinate_spaces": {
-            "screenshot": "screenshot_png_pixels",
-            "element_frames": "atspi_window_coordinates"
-        },
-        "elements": presented_elements(snapshot).map(|(index, element)| {
-            element_capabilities(index, element)
-        }).collect::<Vec<_>>()
-    });
-    let snapshot_text = format_snapshot(snapshot);
-    let mut text = match dimensions {
-        Some((width, height)) => format!(
-            "Screenshot PNG bounds: 0 <= x < {width}, 0 <= y < {height}. Use these bounds for generated input; ignore frame_atspi_window dimensions.\n{snapshot_text}"
-        ),
-        None => snapshot_text,
+            (Some(frame_id), None) => format!("PNG frame_id={frame_id} bounds=unavailable"),
+            _ => "PNG unavailable: frame ID unavailable".to_owned(),
+        }
+    } else {
+        format!(
+            "PNG unavailable: {}",
+            truncate(
+                &escape(screenshot_reason.unwrap_or("screenshot not requested")),
+                MAX_MODEL_FIELD_CHARS,
+            )
+        )
     };
-    if !screenshot_ready {
-        text.push_str(&format!(
-            "Screenshot unavailable: {}",
-            screenshot_reason.unwrap_or("unknown reason")
-        ));
-    }
+    let snapshot_budget = MAX_MODEL_TEXT_BYTES.saturating_sub(png_text.len() + 1);
+    let snapshot_text = format_snapshot_with_budget(snapshot, snapshot_budget).text;
+    let text = format!("{png_text}\n{snapshot_text}");
     let mut output = ToolOutput::text(text).with_structured_content(structured);
     if let Some(png) = png_base64 {
         output = output.with_png_base64(png);
     }
     output
+}
+
+fn build_observation_structured(
+    snapshot: &Snapshot,
+    screenshot_ready: bool,
+    screenshot_reason: Option<&str>,
+    dimensions: Option<(u32, u32)>,
+    source: Option<&crate::capture::FrameMetadata>,
+    max_bytes: usize,
+) -> Value {
+    let (width, height) =
+        dimensions.map_or((None, None), |(width, height)| (Some(width), Some(height)));
+    let screenshot_scope = if screenshot_ready {
+        "monitor"
+    } else {
+        "unavailable"
+    };
+    let frame_id = source.map(crate::capture::frame_id);
+    let screenshot = json!({
+        "ready": screenshot_ready,
+        "reason": screenshot_reason,
+        "scope": screenshot_scope,
+        "width": width,
+        "height": height,
+        "frame_id": frame_id,
+        "coordinate_space": "screenshot_png_pixels",
+        "metadata": source.map(frame_metadata).unwrap_or_else(frame_metadata_unavailable)
+    });
+    let target = snapshot.target_ref.as_ref().map_or_else(
+        || {
+            json!({
+                "app_instance_id": format!("app-{:016x}", u64::from(snapshot.app.pid)),
+                "window_instance_id": format!("win-{:016x}", snapshot.generation)
+            })
+        },
+        TargetRef::as_json,
+    );
+    let (accessibility_ready, accessibility_reason) = if snapshot.accessibility_ready {
+        (true, snapshot.accessibility_reason.as_deref())
+    } else {
+        (
+            false,
+            snapshot
+                .accessibility_reason
+                .as_deref()
+                .or(screenshot_reason),
+        )
+    };
+    let accessibility_requested = snapshot.accessibility_ready
+        || snapshot.accessibility_reason.as_deref() != Some("accessibility was not requested");
+    let view = match (snapshot.screenshot_requested, accessibility_requested) {
+        (true, true) => "both",
+        (true, false) => "screenshot",
+        (false, _) => "accessibility",
+    };
+    let accessibility_scope = snapshot.view.as_str();
+    let text_limit = (snapshot.limits.text != usize::MAX).then_some(snapshot.limits.text);
+    let element_indexes = presented_element_indices(snapshot);
+    let build = |elements: &[Value], truncation: ResponseTruncation| {
+        let truncation_json = truncation.json();
+        json!({
+            "observation_id": observation_id_for_snapshot(snapshot),
+            "target": target,
+            "view": view,
+            "truncated": truncation.truncated,
+            "truncation_reason": truncation.truncated.then_some("response_byte_budget"),
+            "truncation": truncation_json,
+            "accessibility": {
+                "ready": accessibility_ready,
+                "reason": accessibility_reason,
+                "scope": accessibility_scope,
+                "query": snapshot.element_query,
+                "truncated": truncation.truncated,
+                "truncation_reason": truncation.truncated.then_some("response_byte_budget"),
+                "limits": {
+                    "text_limit": text_limit,
+                    "max_nodes": snapshot.limits.nodes,
+                    "max_depth": snapshot.limits.depth
+                }
+            },
+            "screenshot": screenshot,
+            "coordinate_spaces": {
+                "png": "screenshot_png_pixels",
+                "source_logical_size": source.map(|source| json!([source.size.0, source.size.1])),
+                "transform": source.map(|source| format!("{:?}", source.transform)).unwrap_or_else(|| "unavailable".into()),
+                "transform_authority": source.map_or("unavailable", |_| "pipewire"),
+                "accessibility_bounds": "not_convertible"
+            },
+            "elements": elements,
+            "png": Value::Null
+        })
+    };
+    let (structured, truncation) =
+        fit_structured_elements(snapshot, &element_indexes, max_bytes, build);
+    let focused = element_indexes.iter().copied().find(|index| {
+        snapshot
+            .elements
+            .get(*index)
+            .is_some_and(|element| element.node.states.contains("focused"))
+    });
+    if truncation.truncated
+        && focused.is_some_and(|index| {
+            let element_id = element_id_for_snapshot(snapshot, index);
+            !structured["elements"].as_array().is_some_and(|elements| {
+                elements
+                    .iter()
+                    .any(|element| element["element_id"] == element_id)
+            })
+        })
+    {
+        let focused = focused.expect("focused element was checked");
+        let mut prioritized = Vec::with_capacity(element_indexes.len());
+        if let Some(root) = element_indexes.first().copied() {
+            prioritized.push(root);
+        }
+        prioritized.push(focused);
+        let rest = element_indexes
+            .iter()
+            .copied()
+            .filter(|index| !prioritized.contains(index))
+            .collect::<Vec<_>>();
+        prioritized.extend(rest);
+        return fit_structured_elements(snapshot, &prioritized, max_bytes, build).0;
+    }
+    structured
+}
+
+fn fit_structured_elements<F>(
+    snapshot: &Snapshot,
+    element_indexes: &[usize],
+    max_bytes: usize,
+    build: F,
+) -> (Value, ResponseTruncation)
+where
+    F: Fn(&[Value], ResponseTruncation) -> Value,
+{
+    let mut included = Vec::new();
+    let mut fields_truncated = false;
+    let field_limit = MAX_MODEL_FIELD_CHARS;
+    for index in element_indexes {
+        let Some(element) = snapshot.elements.get(*index) else {
+            eprintln!(
+                "computer-use-mcp: snapshot element index disappeared during structured formatting"
+            );
+            continue;
+        };
+        let mut low = 0;
+        let mut high = field_limit;
+        let mut best = None;
+        while low <= high {
+            let candidate_limit = low + (high - low) / 2;
+            let (element_value, element_truncated) = element_capabilities_for_snapshot_with_limit(
+                snapshot,
+                *index,
+                element,
+                candidate_limit,
+            );
+            let mut candidate_elements = included.clone();
+            candidate_elements.push(element_value.clone());
+            let provisional = ResponseTruncation {
+                truncated: true,
+                fields_truncated: fields_truncated || element_truncated,
+                elements_included: candidate_elements.len(),
+                elements_omitted: element_indexes
+                    .len()
+                    .saturating_sub(candidate_elements.len()),
+            };
+            let candidate = build(&candidate_elements, provisional);
+            if json_size(&candidate) <= max_bytes {
+                best = Some((
+                    element_value,
+                    element_truncated || candidate_limit < field_limit,
+                ));
+                low = candidate_limit.saturating_add(1);
+            } else if candidate_limit == 0 {
+                break;
+            } else {
+                high = candidate_limit - 1;
+            }
+        }
+        let Some((element, element_truncated)) = best else {
+            break;
+        };
+        fields_truncated |= element_truncated;
+        included.push(element);
+    }
+    let truncation = ResponseTruncation {
+        truncated: included.len() < element_indexes.len() || fields_truncated,
+        fields_truncated,
+        elements_included: included.len(),
+        elements_omitted: element_indexes.len().saturating_sub(included.len()),
+    };
+    let value = build(&included, truncation);
+    if json_size(&value) > max_bytes {
+        eprintln!(
+            "computer-use-mcp: structured observation budget invariant failed after element trimming"
+        );
+    }
+    (value, truncation)
+}
+
+fn json_size(value: &Value) -> usize {
+    serde_json::to_vec(value)
+        .expect("structured output values must be serializable")
+        .len()
+}
+
+fn presented_element_indices(snapshot: &Snapshot) -> Vec<usize> {
+    presented_elements(snapshot)
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn observation_id_for_snapshot(snapshot: &Snapshot) -> String {
+    format!("obs-{:016x}", snapshot.generation)
+}
+
+fn frame_metadata(source: &crate::capture::FrameMetadata) -> serde_json::Value {
+    json!({
+        "frame_id": crate::capture::frame_id(source),
+        "source_sequence": source.source_sequence,
+        "pts_ns": source.pts_ns,
+        "arrival_monotonic_ns": source.arrival_monotonic_ns,
+        "format_epoch": source.format_generation,
+        "size": [source.size.0, source.size.1],
+        "crop": {"x": source.crop.x, "y": source.crop.y, "width": source.crop.width, "height": source.crop.height},
+        "transform": format!("{:?}", source.transform),
+        "timestamp_authority": source.timestamp_authority.as_str(),
+        "stream_health": source.stream_health.as_str(),
+        "content_hash": format!("{:016x}", source.content_hash),
+        "change_epoch": source.change_epoch,
+        "changed_from_previous": source.changed_from_previous,
+        "sequence_gap": source.sequence_gap
+    })
+}
+
+fn frame_metadata_unavailable() -> serde_json::Value {
+    json!({
+        "frame_id": null,
+        "source_sequence": null,
+        "pts_ns": null,
+        "arrival_monotonic_ns": 0,
+        "format_epoch": 0,
+        "size": [0, 0],
+        "crop": {"x": 0, "y": 0, "width": 0, "height": 0},
+        "transform": "unavailable",
+        "timestamp_authority": "unavailable",
+        "stream_health": "failed",
+        "content_hash": null,
+        "change_epoch": 0,
+        "changed_from_previous": null,
+        "sequence_gap": null
+    })
 }
 
 fn presented_elements(snapshot: &Snapshot) -> impl Iterator<Item = (usize, &ElementSnapshot)> {
@@ -1833,11 +3736,11 @@ fn presented_elements(snapshot: &Snapshot) -> impl Iterator<Item = (usize, &Elem
 }
 
 fn element_is_presented_with_query(
-    view: ObservationView,
+    view: AccessibilityScope,
     query: Option<&str>,
     element: &ElementSnapshot,
 ) -> bool {
-    (view != ObservationView::Interactive || is_interactive(element))
+    (view != AccessibilityScope::Interactive || is_interactive(element))
         && query.is_none_or(|query| element_matches_query(element, query))
 }
 
@@ -1920,6 +3823,619 @@ fn operational_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::not_started("target_unavailable", message)
 }
 
+fn catalog_error(error: CatalogError) -> RuntimeError {
+    match error {
+        CatalogError::StaleTarget(target) => stale_catalog_error(format!(
+            "window target is stale: app_instance_id={} window_instance_id={}",
+            target.app_instance_id, target.window_instance_id
+        )),
+        CatalogError::InvalidIdentity(identity) => {
+            eprintln!("computer-use-mcp: window catalog rejected backend identity {identity:?}");
+            operational_error("window backend returned an invalid explicit identity")
+        }
+        CatalogError::GenerationExhausted => {
+            eprintln!("computer-use-mcp: window catalog generation exhausted");
+            operational_error("window catalog generation exhausted")
+        }
+    }
+}
+
+fn backend_activation_error(error: BackendError) -> RuntimeError {
+    match error {
+        BackendError::Stale(reason) => stale_catalog_error(reason),
+        BackendError::Unsupported(reason) | BackendError::Busy(reason) => capability_error(reason),
+        BackendError::Unavailable(reason) => RuntimeError::new(
+            "backend_unavailable",
+            reason,
+            ToolOutcome::NotStarted,
+            true,
+            "Call list_desktop again and retry only if the exact target and capability remain available.",
+        ),
+        BackendError::Unknown(reason) => RuntimeError::new(
+            "activation_unknown",
+            reason,
+            ToolOutcome::Unknown,
+            false,
+            "Call list_desktop, observe the exact target, and do not retry activation blindly.",
+        ),
+        BackendError::Failed(reason) => uncertain_action(operational_error(reason)),
+    }
+}
+
+fn parse_opaque_counter(value: &str, prefix: &str) -> Result<u64, RuntimeError> {
+    let expected = prefix.len() + 1 + 16;
+    if value.len() != expected || !value.starts_with(&format!("{prefix}-")) {
+        return Err(stale_observation_error(
+            "observation ID is malformed or stale",
+        ));
+    }
+    u64::from_str_radix(&value[prefix.len() + 1..], 16)
+        .map_err(|_| stale_observation_error("observation ID is malformed or stale"))
+}
+
+fn same_snapshot_content(left: &Snapshot, right: &Snapshot) -> bool {
+    left.app == right.app
+        && left.window == right.window
+        && left.view == right.view
+        && left.element_query == right.element_query
+        && left.elements == right.elements
+        && left.node_limit_reached == right.node_limit_reached
+        && left.depth_limit_reached == right.depth_limit_reached
+        && left.limits == right.limits
+}
+
+fn wait_backend_error(message: &str) -> RuntimeError {
+    if message.to_lowercase().contains("timed out") {
+        timeout_error(message)
+    } else {
+        capability_error(format!("frame wait is unavailable: {message}"))
+    }
+}
+
+struct WaitEvidence<'a> {
+    frame: Option<&'a crate::capture::FrameMetadata>,
+    observation_id: Option<&'a str>,
+    dimensions: Option<(u32, u32)>,
+    changed: Option<bool>,
+    stable_for_ms: Option<u64>,
+}
+
+fn annotate_action_output_with_progress(
+    mut output: ToolOutput,
+    target: &TargetRef,
+    source: &ObservationRef,
+    operation: &ActOperation,
+    source_snapshot: &Snapshot,
+    replacement_snapshot: Option<&Snapshot>,
+    progress: Option<&ActionProgress>,
+) -> ToolOutput {
+    let post_action = output.structured_content.take();
+    let replacement = if replacement_snapshot.is_some() {
+        post_action.clone().unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    let (effect_status, effect_evidence, observed_change) = match (operation, replacement_snapshot) {
+        (
+            ActOperation::Semantic {
+                action: ElementAction::Focus,
+                element_id,
+            },
+            Some(current),
+        ) => {
+            let replacement = replacement_element_for_source(source_snapshot, current, element_id);
+            let focused = replacement
+                .as_ref()
+                .map(|(element, _)| element.node.states.contains("focused"));
+            let active = Some(current.window.states.contains("active"));
+            let status = if focused == Some(true) && active == Some(true) {
+                "observed"
+            } else {
+                "not_observed"
+            };
+            (
+                status,
+                format!(
+                    "replacement observation focus state: element_focused={focused:?}, replacement_element_id={:?}, window_active={active:?}",
+                    replacement.as_ref().map(|(_, id)| id)
+                ),
+                Some(!same_snapshot_content(source_snapshot, current)),
+            )
+        }
+        (ActOperation::Semantic { .. }, Some(current)) => (
+            "not_checked",
+            "replacement observation captured; any observed accessibility change is not attributed to this generic semantic action".into(),
+            Some(!same_snapshot_content(source_snapshot, current)),
+        ),
+        (ActOperation::Semantic { .. }, None) => (
+            "unknown",
+            "semantic replacement observation was not retained".into(),
+            None,
+        ),
+        _ => (
+            "not_checked",
+            "input dispatch completed; any observed replacement change is not a target-specific effect predicate".into(),
+            replacement_snapshot.map(|current| !same_snapshot_content(source_snapshot, current)),
+        ),
+    };
+    let focus = match operation {
+        ActOperation::Semantic {
+            action: ElementAction::Focus,
+            element_id,
+        } => {
+            let replacement = replacement_snapshot.and_then(|snapshot| {
+                replacement_element_for_source(source_snapshot, snapshot, element_id)
+            });
+            let element_focused = replacement
+                .as_ref()
+                .map(|(element, _)| element.node.states.contains("focused"));
+            let window_active =
+                replacement_snapshot.map(|snapshot| snapshot.window.states.contains("active"));
+            json!({
+                "requested": true,
+                "element_focused": element_focused,
+                "window_active": window_active,
+                "replacement_element_id": replacement.map(|(_, id)| id),
+                "seat_focus": "not_observable",
+                "application_delivery": "not_observable",
+                "text_delivery": "not_observable",
+                "point": null,
+                "click": null,
+                "barriers": null
+            })
+        }
+        ActOperation::Keyboard { focus, events } => json!({
+            "requested": true,
+            "point": {"x": focus.x, "y": focus.y},
+            "element_focused": null,
+            "window_active": null,
+            "replacement_element_id": null,
+            "seat_focus": "not_observable",
+            "application_delivery": "not_observable",
+            "text_delivery": "not_observable",
+            "click": {
+                "requested": true,
+                "sent": true,
+                "flushed": true
+            },
+            "barriers": {
+                "focus_click_completed": true,
+                "between_events_completed": events.len().saturating_sub(1),
+                "cleanup_barrier_completed": true,
+                "meaning": "protocol_synchronization_only"
+            }
+        }),
+        _ => json!({
+            "requested": false,
+            "element_focused": null,
+            "window_active": null,
+            "replacement_element_id": null,
+            "seat_focus": "not_observable",
+            "application_delivery": "not_observable",
+            "text_delivery": "not_observable",
+            "point": null,
+            "click": null,
+            "barriers": null
+        }),
+    };
+    let replacement_observation_id = replacement_snapshot.map(observation_id_for_snapshot);
+    let replacement_element_id = match (operation, replacement_snapshot) {
+        (ActOperation::Semantic { element_id, .. }, Some(replacement)) => {
+            replacement_element_for_source(source_snapshot, replacement, element_id)
+                .map(|(_, id)| id)
+        }
+        _ => None,
+    };
+    let keyboard_safety = match operation {
+        ActOperation::Keyboard { focus, events } => format!(
+            " focus=point({},{}) focus_click=requested,sent,flushed barriers=focus_click,phase_sync={},cleanup=completed",
+            focus.x,
+            focus.y,
+            events.len().saturating_sub(1),
+        ),
+        _ => String::new(),
+    };
+    let (protocol_request_sent, request_flushed) = match operation {
+        ActOperation::Semantic { .. } => (true, false),
+        ActOperation::Pointer { .. } | ActOperation::Keyboard { .. } => (true, true),
+    };
+    let replacement_frame_id = post_action
+        .as_ref()
+        .and_then(|value| value["screenshot"]["frame_id"].as_str())
+        .map(str::to_owned);
+    let action_line = format!(
+        "\nAction: request_accepted={protocol_request_sent} protocol_request_sent={protocol_request_sent} request_flushed={request_flushed} synchronized=false effect={effect_status} observed_change={observed_change:?} seat_focus=not_observable application_delivery=not_observable text_delivery=not_observable replacement_observation={replacement_observation_id:?} replacement_frame={replacement_frame_id:?} replacement_element_id={replacement_element_id:?}{keyboard_safety}"
+    );
+    let mut suffix = action_line;
+    if let Some(progress) = progress {
+        suffix.push('\n');
+        suffix.push_str(&compact_action_progress(progress.snapshot()));
+    }
+    let text_budget = MAX_MODEL_TEXT_BYTES.saturating_sub(suffix.len());
+    let (prefix, text_truncated) = fit_text_prefix(&output.text, text_budget);
+    output.text = format!("{prefix}{suffix}");
+    let mut action_structured = json!({
+        "status": "completed",
+        "outcome": "completed",
+        "target": target.as_json(),
+        "source_observation": {
+            "observation_id": source.observation_id,
+            "frame_id": source.frame_id
+        },
+        "dispatch": {
+            "request_accepted": protocol_request_sent,
+            "protocol_request_sent": protocol_request_sent,
+            "request_flushed": request_flushed,
+            "synchronized": false,
+            "client_delivery": "not_observable"
+        },
+        "effect": {
+            "status": effect_status,
+            "evidence": effect_evidence,
+            "observed_change": observed_change
+        },
+        "focus": focus,
+        "delivery": {
+            "application_delivery": "not_observable",
+            "text_delivery": "not_observable"
+        },
+        "replacement_observation_id": replacement_observation_id,
+        "replacement_frame_id": replacement_frame_id,
+        "replacement_element_id": replacement_element_id,
+        "replacement_observation": replacement
+    });
+    if replacement_snapshot.is_none() {
+        action_structured["post_action"] = json!({
+            "replacement_available": false,
+            "reason": "post_action_refresh_failed",
+            "observation_id": null,
+            "frame_id": null,
+            "element_ids": []
+        });
+    }
+    if text_truncated {
+        action_structured["text_truncation"] = json!({
+            "truncated": true,
+            "reason": "response_byte_budget",
+            "preserved": "complete_text_lines"
+        });
+    }
+    if let Some(progress) = progress {
+        action_structured["action_progress"] = action_progress_json(progress.snapshot());
+    }
+    output.structured_content = Some(bound_action_structured(action_structured));
+    output
+}
+
+fn fit_text_prefix(text: &str, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text.to_owned(), false);
+    }
+    let marker = "Truncated: reason=response_byte_budget text_projection=complete_lines\n";
+    let body_budget = max_bytes.saturating_sub(marker.len());
+    let mut prefix = String::new();
+    for line in text.split_inclusive('\n') {
+        if prefix.len().saturating_add(line.len()) > body_budget {
+            break;
+        }
+        prefix.push_str(line);
+    }
+    if prefix.len().saturating_add(marker.len()) <= max_bytes {
+        prefix.push_str(marker);
+    } else {
+        eprintln!("computer-use-mcp: action text budget is smaller than its truncation marker");
+    }
+    (prefix, true)
+}
+
+fn bound_action_structured(mut action: Value) -> Value {
+    if json_size(&action) <= MAX_MODEL_STRUCTURED_BYTES {
+        return action;
+    }
+    let Some(replacement) = action.get("replacement_observation").cloned() else {
+        eprintln!(
+            "computer-use-mcp: oversized action structured content has no replacement observation"
+        );
+        return action;
+    };
+    let Some(replacement_object) = replacement.as_object() else {
+        eprintln!("computer-use-mcp: oversized action replacement observation is not an object");
+        return action;
+    };
+    let Some(elements) = replacement_object.get("elements").and_then(Value::as_array) else {
+        eprintln!(
+            "computer-use-mcp: oversized action replacement observation has no element array"
+        );
+        return action;
+    };
+    let original_action = action.clone();
+    action["replacement_observation"] = Value::Null;
+    let focused_index = elements.iter().position(|element| {
+        element["states"]
+            .as_array()
+            .is_some_and(|states| states.iter().any(|state| state == "focused"))
+    });
+    let mut element_order = Vec::with_capacity(elements.len());
+    if !elements.is_empty() {
+        element_order.push(0);
+    }
+    if let Some(focused_index) = focused_index.filter(|index| !element_order.contains(index)) {
+        element_order.push(focused_index);
+    }
+    let rest = (0..elements.len())
+        .filter(|index| !element_order.contains(index))
+        .collect::<Vec<_>>();
+    element_order.extend(rest);
+    let mut included = Vec::new();
+    let mut fields_truncated = false;
+    for element_index in element_order {
+        let element = &elements[element_index];
+        let mut low = 0;
+        let mut high = MAX_MODEL_FIELD_CHARS;
+        let mut best = None;
+        while low <= high {
+            let field_limit = low + (high - low) / 2;
+            let (candidate_element, element_truncated) =
+                bound_structured_element(element, field_limit);
+            let mut candidate_elements = included.clone();
+            candidate_elements.push(candidate_element.clone());
+            let candidate_replacement = replacement_with_elements(
+                &replacement,
+                candidate_elements,
+                ResponseTruncation {
+                    truncated: true,
+                    fields_truncated: fields_truncated || element_truncated,
+                    elements_included: included.len() + 1,
+                    elements_omitted: elements.len().saturating_sub(included.len() + 1),
+                },
+            );
+            let mut candidate_action = original_action.clone();
+            candidate_action["replacement_observation"] = candidate_replacement;
+            if json_size(&candidate_action) <= MAX_MODEL_STRUCTURED_BYTES {
+                best = Some((
+                    candidate_element,
+                    element_truncated || field_limit < MAX_MODEL_FIELD_CHARS,
+                ));
+                low = field_limit.saturating_add(1);
+            } else if field_limit == 0 {
+                break;
+            } else {
+                high = field_limit - 1;
+            }
+        }
+        let Some((element, element_truncated)) = best else {
+            break;
+        };
+        fields_truncated |= element_truncated;
+        included.push(element);
+    }
+    let truncation = ResponseTruncation {
+        truncated: included.len() < elements.len() || fields_truncated,
+        fields_truncated,
+        elements_included: included.len(),
+        elements_omitted: elements.len().saturating_sub(included.len()),
+    };
+    let replacement = replacement_with_elements(&replacement, included, truncation);
+    action = original_action;
+    action["replacement_observation"] = replacement;
+    action["truncation"] = json!({
+        "truncated": truncation.truncated,
+        "reason": truncation.truncated.then_some("response_byte_budget"),
+        "replacement_observation": truncation.json()
+    });
+    if json_size(&action) > MAX_MODEL_STRUCTURED_BYTES {
+        eprintln!(
+            "computer-use-mcp: action structured content budget invariant failed after element trimming"
+        );
+    }
+    action
+}
+
+fn replacement_with_elements(
+    replacement: &Value,
+    elements: Vec<Value>,
+    truncation: ResponseTruncation,
+) -> Value {
+    let Some(mut object) = replacement.as_object().cloned() else {
+        return replacement.clone();
+    };
+    object.insert("elements".into(), Value::Array(elements));
+    object.insert("truncated".into(), Value::Bool(truncation.truncated));
+    let truncation_reason = if truncation.truncated {
+        Value::String("response_byte_budget".into())
+    } else {
+        Value::Null
+    };
+    object.insert("truncation_reason".into(), truncation_reason.clone());
+    object.insert("truncation".into(), truncation.json());
+    if let Some(accessibility) = object
+        .get_mut("accessibility")
+        .and_then(Value::as_object_mut)
+    {
+        accessibility.insert("truncated".into(), Value::Bool(truncation.truncated));
+        accessibility.insert("truncation_reason".into(), truncation_reason);
+    }
+    Value::Object(object)
+}
+
+fn bound_structured_element(element: &Value, field_limit: usize) -> (Value, bool) {
+    let Some(mut object) = element.as_object().cloned() else {
+        eprintln!("computer-use-mcp: structured observation element is not an object");
+        return (element.clone(), false);
+    };
+    let mut truncated = false;
+    for key in ["role", "name", "value", "text"] {
+        if let Some(value) = object.get(key).and_then(Value::as_str) {
+            let (value, value_truncated) = response_field(value, field_limit);
+            truncated |= value_truncated;
+            object.insert(key.into(), Value::String(value));
+        }
+    }
+    if let Some(states) = object.get("states").and_then(Value::as_array) {
+        let (values, states_truncated) = bounded_response_strings(
+            states.iter().filter_map(Value::as_str),
+            field_limit,
+            MAX_MODEL_STATES,
+        );
+        truncated |= states_truncated || values.len() < states.len();
+        object.insert("states".into(), json!(values));
+        object.insert("states_truncated".into(), Value::Bool(states_truncated));
+    }
+    if let Some(capabilities) = object
+        .get_mut("capabilities")
+        .and_then(Value::as_object_mut)
+        && let Some(actions) = capabilities.get("named_actions").and_then(Value::as_array)
+    {
+        let mut bounded = Vec::new();
+        for action in actions.iter().take(MAX_MODEL_ACTIONS) {
+            let Some(mut action) = action.as_object().cloned() else {
+                continue;
+            };
+            for key in ["name", "description"] {
+                if let Some(value) = action.get(key).and_then(Value::as_str) {
+                    let (value, value_truncated) = response_field(value, field_limit);
+                    truncated |= value_truncated;
+                    action.insert(key.into(), Value::String(value));
+                }
+            }
+            bounded.push(Value::Object(action));
+        }
+        if bounded.len() < actions.len() {
+            truncated = true;
+        }
+        capabilities.insert("named_actions".into(), Value::Array(bounded));
+        capabilities.insert("named_actions_truncated".into(), Value::Bool(truncated));
+    }
+    (Value::Object(object), truncated)
+}
+
+fn wait_output(
+    target: &TargetRef,
+    condition: WaitCondition,
+    satisfied: bool,
+    evidence: &str,
+) -> ToolOutput {
+    wait_output_with_evidence(
+        target,
+        condition,
+        satisfied,
+        evidence,
+        WaitEvidence {
+            frame: None,
+            observation_id: None,
+            dimensions: None,
+            changed: None,
+            stable_for_ms: None,
+        },
+    )
+}
+
+fn wait_output_with_evidence(
+    target: &TargetRef,
+    condition: WaitCondition,
+    satisfied: bool,
+    evidence: &str,
+    wait_evidence: WaitEvidence<'_>,
+) -> ToolOutput {
+    let frame_id = wait_evidence.frame.map(crate::capture::frame_id);
+    let text = match (frame_id.as_deref(), wait_evidence.dimensions) {
+        (Some(frame_id), Some((width, height))) => {
+            format!("{evidence}\nFrame ID: {frame_id} bounds=0<=x<{width},0<=y<{height}")
+        }
+        (Some(frame_id), None) => format!("{evidence}\nFrame ID: {frame_id}"),
+        (None, _) => evidence.to_owned(),
+    };
+    let kind = if satisfied {
+        match &condition {
+            WaitCondition::FrameAdvanced { .. }
+            | WaitCondition::FrameChanged { .. }
+            | WaitCondition::FrameStable { .. } => "frame",
+            WaitCondition::AccessibilityAdvanced { .. } => "accessibility",
+            WaitCondition::ElementState { .. } | WaitCondition::ElementValue { .. } => "element",
+        }
+    } else {
+        "no_change"
+    };
+    let scope = if wait_evidence.frame.is_some()
+        || matches!(
+            condition,
+            WaitCondition::FrameAdvanced { .. }
+                | WaitCondition::FrameChanged { .. }
+                | WaitCondition::FrameStable { .. }
+        ) {
+        "monitor"
+    } else if wait_evidence.observation_id.is_some()
+        || matches!(
+            condition,
+            WaitCondition::AccessibilityAdvanced { .. }
+                | WaitCondition::ElementState { .. }
+                | WaitCondition::ElementValue { .. }
+        )
+    {
+        "target"
+    } else {
+        "none"
+    };
+    ToolOutput::text(text).with_structured_content(json!({
+        "target": target.as_json(),
+        "condition": wait_condition_json(&condition),
+        "satisfied": satisfied,
+        "evidence": {
+            "kind": kind,
+        "scope": scope,
+        "frame_id": frame_id,
+        "width": wait_evidence.dimensions.map(|(width, _)| width),
+        "height": wait_evidence.dimensions.map(|(_, height)| height),
+        "dimensions": wait_evidence
+                .dimensions
+                .map(|(width, height)| json!({"width": width, "height": height})),
+            "observation_id": wait_evidence.observation_id,
+            "changed": wait_evidence.changed,
+            "stable_for_ms": wait_evidence.stable_for_ms
+        }
+    }))
+}
+
+fn wait_condition_json(condition: &WaitCondition) -> serde_json::Value {
+    match condition {
+        WaitCondition::FrameAdvanced { after_frame_id } => {
+            json!({"type": "frame_advanced", "after_frame_id": after_frame_id})
+        }
+        WaitCondition::FrameChanged { after_frame_id } => {
+            json!({"type": "frame_changed", "after_frame_id": after_frame_id})
+        }
+        WaitCondition::FrameStable { for_ms } => {
+            json!({"type": "frame_stable", "for_ms": for_ms})
+        }
+        WaitCondition::AccessibilityAdvanced {
+            after_observation_id,
+        } => json!({
+            "type": "accessibility_advanced",
+            "after_observation_id": after_observation_id
+        }),
+        WaitCondition::ElementState {
+            observation_id,
+            element_id,
+            state,
+        } => json!({
+            "type": "element_state",
+            "observation_id": observation_id,
+            "element_id": element_id,
+            "state": state
+        }),
+        WaitCondition::ElementValue {
+            observation_id,
+            element_id,
+            value,
+        } => json!({
+            "type": "element_value",
+            "observation_id": observation_id,
+            "element_id": element_id,
+            "value": value
+        }),
+    }
+}
+
 fn desktop_session_error(code: &'static str, message: impl Into<String>) -> RuntimeError {
     RuntimeError::new(
         code,
@@ -1938,12 +4454,104 @@ fn generated_input_error(message: String) -> RuntimeError {
     }
 }
 
+fn map_attempt_error(error: RuntimeError, progress: ActionProgressSnapshot) -> RuntimeError {
+    let outcome = progress.outcome();
+    let retryable = matches!(outcome, ToolOutcome::NotStarted);
+    let recovery = match outcome {
+        ToolOutcome::NotStarted => "No input dispatch was confirmed. Call observe before retrying.",
+        ToolOutcome::Unknown => {
+            "Input dispatch started but its result is unknown. Call observe and do not retry blindly."
+        }
+        ToolOutcome::Completed => {
+            "Input dispatch completed. Call observe before deciding whether another action is needed."
+        }
+    };
+    with_action_progress_snapshot(
+        error.with_execution_status(outcome, retryable, recovery),
+        progress,
+    )
+}
+
+fn completed_cleanup_error(error: RuntimeError, progress: ActionProgressSnapshot) -> RuntimeError {
+    with_action_progress_snapshot(
+        error.with_execution_status(
+            ToolOutcome::Completed,
+            false,
+            "Input dispatch completed, but cleanup failed. Stop and observe the current desktop before any further action.",
+        ),
+        progress,
+    )
+}
+
+fn completed_dispatch_error(error: RuntimeError, progress: ActionProgressSnapshot) -> RuntimeError {
+    with_action_progress_snapshot(
+        error.with_execution_status(
+            ToolOutcome::Completed,
+            false,
+            "Input dispatch completed but the backend reported an error. Observe the current desktop before any further action.",
+        ),
+        progress,
+    )
+}
+
+fn map_input_error(error: InputError, progress: ActionProgressSnapshot) -> RuntimeError {
+    map_attempt_error(input_runtime_error(&error), progress)
+}
+
+fn input_runtime_error(error: &InputError) -> RuntimeError {
+    match error {
+        InputError::SessionUnavailable(message) => desktop_session_error("backend_failed", message),
+        InputError::Dispatch(message) => operational_error(message),
+    }
+}
+
+fn post_status_for_error(error: &RuntimeError, accessibility: bool) -> PostStatus {
+    let message = error.message.to_ascii_lowercase();
+    if message.starts_with(SESSION_UNAVAILABLE) || error.code == "backend_failed" {
+        PostStatus::SessionUnavailable
+    } else if message.contains("timed out") || error.code == "backend_timeout" {
+        PostStatus::Timeout
+    } else if message.contains("stream") || message.contains("portal") {
+        PostStatus::StreamDegraded
+    } else if message.contains("catalog") {
+        PostStatus::CatalogRefreshFailed
+    } else if accessibility || message.contains("at-spi") || message.contains("accessibility") {
+        PostStatus::AccessibilityRefreshFailed
+    } else {
+        PostStatus::Unavailable
+    }
+}
+
+fn post_visual_error_status(error: &RuntimeError) -> PostStatus {
+    match error.code {
+        "backend_timeout" => PostStatus::Timeout,
+        "backend_failed" if error.message.starts_with(SESSION_UNAVAILABLE) => {
+            PostStatus::SessionUnavailable
+        }
+        _ => PostStatus::CaptureFailed,
+    }
+}
+
+fn post_accessibility_status(snapshot: &Snapshot) -> PostStatus {
+    if snapshot.accessibility_ready {
+        PostStatus::Observed
+    } else if snapshot.accessibility_reason.as_deref() == Some("accessibility was not requested") {
+        PostStatus::NotRun
+    } else {
+        PostStatus::Unavailable
+    }
+}
+
 fn state_required_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::not_started("state_required", message)
 }
 
-fn stale_state_error(message: impl Into<String>) -> RuntimeError {
-    RuntimeError::not_started("stale_state", message)
+fn stale_catalog_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::stale(StaleAuthority::Catalog, message)
+}
+
+fn stale_observation_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::stale(StaleAuthority::Observation, message)
 }
 
 fn capability_error(message: impl Into<String>) -> RuntimeError {
@@ -1986,13 +4594,33 @@ fn completed_without_observation(error: RuntimeError) -> RuntimeError {
     )
 }
 
+fn completed_post_visual_failure(status: PostStatus, reason: Option<&str>) -> RuntimeError {
+    let reason = reason.map_or_else(String::new, |reason| format!("; reason={reason}"));
+    RuntimeError::new(
+        "post_visual_failed",
+        format!(
+            "the action dispatch completed, but its requested post-action visual observation failed (visual={}){reason}",
+            status.as_str()
+        ),
+        ToolOutcome::Completed,
+        false,
+        "The action completed. Observe the exact target again to recover current state, and do not repeat the action based on this failure.",
+    )
+}
+
 fn cached_element<'a>(
     snapshot: &'a Snapshot,
     index: &str,
 ) -> Result<&'a ElementSnapshot, RuntimeError> {
-    let parsed = index
-        .parse::<usize>()
-        .map_err(|_| operational_error(format!("element_id {index:?} is not a snapshot index")))?;
+    let parsed = snapshot
+        .element_ids
+        .iter()
+        .position(|candidate| candidate == index)
+        .ok_or_else(|| {
+            operational_error(format!(
+                "element_id {index:?} is not an opaque ID from this observation"
+            ))
+        })?;
     let element = snapshot.elements.get(parsed).ok_or_else(|| {
         operational_error(format!(
             "element_id {parsed} is not in generation {}",
@@ -2027,21 +4655,22 @@ fn relocated_element<'a>(
     Ok(target)
 }
 
-fn semantic_focus_plan<'a>(
-    action: &'a GeneratedInputAction,
-    cached: &Snapshot,
-    current: &Snapshot,
-) -> Result<Option<(&'a str, ObjectId)>, RuntimeError> {
-    let GeneratedInputAction::Keyboard {
-        focus: KeyboardFocus::Element(index),
-        ..
-    } = action
-    else {
-        return Ok(None);
-    };
-    let target = relocated_element(cached, current, index)?;
-    semantic_action(ElementAction::Focus, target)?;
-    Ok(Some((index, target.node.object.clone())))
+fn replacement_element_for_source<'a>(
+    source: &Snapshot,
+    replacement: &'a Snapshot,
+    source_id: &str,
+) -> Option<(&'a ElementSnapshot, String)> {
+    let source_element = cached_element(source, source_id).ok()?;
+    let index = replacement
+        .elements
+        .iter()
+        .position(|element| element.node.object == source_element.node.object)?;
+    let replacement_id = replacement
+        .element_ids
+        .get(index)
+        .cloned()
+        .unwrap_or_else(|| format!("e-{index:016x}"));
+    Some((&replacement.elements[index], replacement_id))
 }
 
 #[cfg(test)]
@@ -2054,82 +4683,160 @@ mod tests {
 
     use super::*;
     use crate::{
+        runtime::CleanupStatus,
         screenshot::{ScreenshotError, ScreenshotObservation},
-        validation::{KeyboardAction, MouseButton, PointerAction},
+        validation::{
+            DEFAULT_DESKTOP_PAGE_SIZE, KeyboardEvent, KeyboardPoint, MouseButton, PointerAction,
+        },
     };
 
     #[test]
-    fn all_resolution_tiers_and_ambiguities_are_strict() {
-        let apps = apps();
-        assert_eq!(resolve_app("20", None, &apps).unwrap().app.pid, 20);
-        assert_eq!(resolve_app("PID=20", None, &apps).unwrap().app.pid, 20);
-        assert_eq!(resolve_app("EDITOR", None, &apps).unwrap().app.pid, 10);
+    fn action_progress_preserves_dispatch_and_cleanup_truth() {
+        let progress = ActionProgress::default();
         assert_eq!(
-            resolve_app("Preferences", None, &apps)
-                .unwrap()
-                .window
-                .unwrap()
-                .title,
-            "Preferences"
+            progress.snapshot().dispatch_stage,
+            DispatchStage::NotStarted
         );
-        assert_eq!(resolve_app("term", None, &apps).unwrap().app.pid, 20);
-        assert_eq!(
-            resolve_app("anything", Some(10), &apps).unwrap().app.pid,
-            10
-        );
-        assert!(
-            resolve_app("missing", None, &apps)
-                .unwrap_err()
-                .message
-                .contains("not found")
-        );
+        assert_eq!(progress.snapshot().cleanup, CleanupStatus::NotNeeded);
 
-        let mut ambiguous = apps.clone();
-        ambiguous.push(app("editor", 30, "Other"));
-        assert!(
-            resolve_app("editor", None, &ambiguous)
-                .unwrap_err()
-                .message
-                .contains("ambiguous")
-        );
-        ambiguous[2].name = "Other".into();
-        ambiguous[2].windows[0].title = "Preferences".into();
-        assert!(
-            resolve_app("Preferences", None, &ambiguous)
-                .unwrap_err()
-                .message
-                .contains("ambiguous")
-        );
-        assert!(
-            resolve_app("e", None, &apps)
-                .unwrap_err()
-                .message
-                .contains("ambiguous")
-        );
-        assert!(
-            resolve_app("x", Some(999), &apps)
-                .unwrap_err()
-                .message
-                .contains("stale PID")
+        progress.mark_started();
+        progress.mark_cleanup_completed();
+        progress.mark_completed();
+        progress.mark_post_visual(PostStatus::Observed);
+        progress.mark_post_accessibility(PostStatus::Unavailable);
+        let snapshot = progress.snapshot();
+        assert_eq!(snapshot.dispatch_stage, DispatchStage::Completed);
+        assert_eq!(snapshot.cleanup, CleanupStatus::Completed);
+        assert_eq!(snapshot.post_visual, PostStatus::Observed);
+        assert_eq!(snapshot.post_accessibility, PostStatus::Unavailable);
+
+        progress.mark_cleanup_failed();
+        assert_eq!(progress.snapshot().cleanup, CleanupStatus::Failed);
+        let error =
+            completed_cleanup_error(operational_error("dispatch failed"), progress.snapshot());
+        assert_eq!(error.outcome, ToolOutcome::Completed);
+        assert_eq!(
+            error.action_progress.as_ref().unwrap()["dispatch_stage"],
+            "completed"
         );
     }
 
     #[test]
-    fn window_choice_prefers_active_then_showing_then_first_viable() {
-        let mut windows = vec![
-            window("first", &[]),
-            window("shown", &["showing"]),
-            window("active", &["active"]),
-        ];
-        assert_eq!(choose_window(&windows).unwrap().title, "active");
-        windows[2].states.clear();
-        assert_eq!(choose_window(&windows).unwrap().title, "shown");
-        windows[1].states.clear();
-        assert_eq!(choose_window(&windows).unwrap().title, "first");
-        for window in &mut windows {
-            window.states.insert("defunct".into());
-        }
-        assert!(choose_window(&windows).is_err());
+    fn visual_post_status_preserves_typed_failure_outcomes() {
+        let timeout = RuntimeError::new(
+            "backend_timeout",
+            "capture timed out",
+            ToolOutcome::NotStarted,
+            true,
+            "retry",
+        );
+        let session = RuntimeError::new(
+            "backend_failed",
+            SESSION_UNAVAILABLE,
+            ToolOutcome::NotStarted,
+            false,
+            "restart",
+        );
+        let capture = RuntimeError::new(
+            "stale_state",
+            "visual mapping changed",
+            ToolOutcome::NotStarted,
+            true,
+            "observe",
+        );
+        assert_eq!(post_visual_error_status(&timeout), PostStatus::Timeout);
+        assert_eq!(
+            post_visual_error_status(&session),
+            PostStatus::SessionUnavailable
+        );
+        assert_eq!(
+            post_visual_error_status(&capture),
+            PostStatus::CaptureFailed
+        );
+        assert_eq!(
+            ScreenshotError(SESSION_UNAVAILABLE.into()).post_status(),
+            PostStatus::SessionUnavailable
+        );
+        assert_eq!(
+            ScreenshotError("timed out waiting for a complete frame".into()).post_status(),
+            PostStatus::Timeout
+        );
+        assert_eq!(
+            ScreenshotError("PipeWire stream degraded".into()).post_status(),
+            PostStatus::StreamDegraded
+        );
+        assert_eq!(
+            ScreenshotError("PNG encoding failed".into()).post_status(),
+            PostStatus::CaptureFailed
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_window_listing_preserves_backend_source_and_capabilities() {
+        let runtime = fake_runtime(FakeAdapter::tree());
+        let output = runtime
+            .execute_call(ToolCall::ListDesktop {
+                scope: DesktopScope::Windows,
+                limit: DEFAULT_DESKTOP_PAGE_SIZE,
+                cursor: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(output.text.contains("Backends:"));
+        assert!(output.text.contains("source=atspi"));
+        assert!(output.text.contains(
+            "capabilities=screenshot:supported accessibility:supported activation:supported"
+        ));
+        let structured = output.structured_content.expect("canonical listing");
+        assert!(structured["backends"].is_object());
+        assert!(structured["windows"].is_array());
+    }
+
+    #[tokio::test]
+    async fn atspi_activation_dispatches_even_when_already_active_without_verified_claims() {
+        let fake = FakeAdapter::tree();
+        let runtime = fake_runtime(fake.clone());
+        let listed = runtime
+            .execute_call(ToolCall::ListDesktop {
+                scope: DesktopScope::Windows,
+                limit: DEFAULT_DESKTOP_PAGE_SIZE,
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        let target_value = listed.structured_content.unwrap()["windows"][0]["target"].clone();
+        let target = TargetRef {
+            app_instance_id: target_value["app_instance_id"]
+                .as_str()
+                .expect("app target")
+                .into(),
+            window_instance_id: target_value["window_instance_id"]
+                .as_str()
+                .expect("window target")
+                .into(),
+        };
+
+        let output = runtime
+            .execute_call(ToolCall::ActivateWindow {
+                target: target.clone(),
+            })
+            .await
+            .unwrap();
+        let structured = output.structured_content.expect("activation evidence");
+        assert_eq!(structured["backend"], "atspi");
+        assert_eq!(structured["status"], "atspi_active_observed");
+        assert_eq!(structured["before_active"], true);
+        assert_eq!(structured["after_active"], true);
+        assert_eq!(structured["atspi_active_observed"], true);
+        assert_eq!(structured["protocol_state_verified"], false);
+        assert_eq!(structured["seat_focus"], "not_observable");
+        assert_eq!(structured["dispatch"]["request_accepted"], true);
+        assert_eq!(structured["dispatch"]["protocol_request_sent"], true);
+        assert_eq!(structured["dispatch"]["request_flushed"], false);
+        assert!(structured.get("verified").is_none());
+        assert!(output.text.contains("status=atspi_active_observed"));
+        assert_eq!(fake.state.lock().unwrap().activation_calls, [id("root")]);
     }
 
     #[test]
@@ -2155,13 +4862,13 @@ mod tests {
             },
         ]));
         let snapshot = Snapshot {
-            app_query: "Editor".into(),
-            view: ObservationView::Full,
+            view: AccessibilityScope::Full,
             element_query: None,
             app: app("Editor", 1, "Main"),
             window: window("Main", &["active"]),
             generation: 2,
             elements: vec![ElementSnapshot { depth: 0, node }],
+            element_ids: Vec::new(),
             node_limit_reached: true,
             depth_limit_reached: true,
             limits: SnapshotLimits {
@@ -2169,25 +4876,102 @@ mod tests {
                 nodes: 10,
                 depth: 10,
             },
+            target_ref: None,
+            accessibility_ready: true,
+            accessibility_reason: None,
+            requires_atspi_revalidation: true,
+            screenshot_requested: true,
         };
         let text = format_snapshot(&snapshot);
         assert!(text.contains("line\\r\\n\\\"name"));
         assert!(text.contains("value=\"é🙂…\""));
         assert!(text.contains("named_actions=[{name=\"menu\", description=\"Show\\nmenu\"}]"));
-        assert!(text.contains("Focused element: 0"));
+        assert!(text.contains("Focused element: e-0000000000000000"));
         assert!(text.contains("Selected text: \"a\\n…\""));
         assert!(text.contains("node limit"));
         assert!(text.contains("depth limit"));
-        assert!(!text.contains("Screenshot unavailable"));
+        assert!(!text.contains("PNG unavailable"));
     }
 
     #[test]
     fn observation_puts_png_bounds_before_accessibility_frames() {
         let snapshot = snapshot_for_target(1, "content");
-        let output = observation_output(&snapshot, true, None, Some((1280, 853)), None);
-        assert!(output.text.starts_with(
-            "Screenshot PNG bounds: 0 <= x < 1280, 0 <= y < 853. Use these bounds for generated input; ignore frame_atspi_window dimensions.\n"
-        ));
+        let mapping = test_screenshot_mapping(&snapshot, "/session/bounds", None);
+        let output = observation_output(
+            &snapshot,
+            true,
+            None,
+            Some((1280, 853)),
+            None,
+            Some(&mapping.source),
+        );
+        assert!(output.text.starts_with("PNG frame_id=frame-"));
+        assert!(output.text.contains("bounds=0<=x<1280,0<=y<853\n"));
+    }
+
+    #[test]
+    fn ready_screenshot_text_exposes_frame_id_without_source_headers() {
+        let snapshot = snapshot_for_target(1, "content");
+        let mut mapping = test_screenshot_mapping(&snapshot, "/session/frame-text", None);
+        mapping.source.source_sequence = None;
+        mapping.source.pts_ns = None;
+        mapping.source.timestamp_authority = crate::capture::TimestampAuthority::Unavailable;
+        let frame_id = crate::capture::frame_id(&mapping.source);
+
+        let output = observation_output(
+            &snapshot,
+            true,
+            None,
+            Some(mapping.output_size),
+            None,
+            Some(&mapping.source),
+        );
+
+        assert!(
+            output
+                .text
+                .contains(&format!("PNG frame_id={frame_id} bounds="))
+        );
+        let structured = output.structured_content.expect("structured observation");
+        assert_eq!(structured["screenshot"]["frame_id"], frame_id);
+        assert_eq!(
+            structured["screenshot"]["metadata"]["source_sequence"],
+            Value::Null
+        );
+        assert_eq!(structured["screenshot"]["metadata"]["pts_ns"], Value::Null);
+    }
+
+    #[test]
+    fn frame_wait_text_exposes_retained_frame_id() {
+        let snapshot = snapshot_for_target(1, "content");
+        let mapping = test_screenshot_mapping(&snapshot, "/session/wait-text", None);
+        let frame_id = crate::capture::frame_id(&mapping.source);
+        let target = TargetRef {
+            app_instance_id: "app-0000000000000001".into(),
+            window_instance_id: "win-0000000000000002".into(),
+        };
+
+        let output = wait_output_with_evidence(
+            &target,
+            WaitCondition::FrameAdvanced {
+                after_frame_id: frame_id.clone(),
+            },
+            true,
+            "a later capture frame was acquired",
+            WaitEvidence {
+                frame: Some(&mapping.source),
+                observation_id: None,
+                dimensions: Some(mapping.output_size),
+                changed: Some(true),
+                stable_for_ms: None,
+            },
+        );
+
+        assert!(output.text.contains(&format!("Frame ID: {frame_id}")));
+        assert_eq!(
+            output.structured_content.expect("structured wait evidence")["evidence"]["frame_id"],
+            frame_id
+        );
     }
 
     #[test]
@@ -2242,6 +5026,10 @@ mod tests {
         assert!(semantic_action(ElementAction::Focus, &target).is_err());
         assert!(!text_capabilities(&target).contains(&"focus".into()));
         assert_eq!(element_capabilities(0, &target)["focus"], false);
+        assert_eq!(
+            element_capabilities(0, &target)["element_id"],
+            "e-0000000000000000"
+        );
         target.node.states.insert("focusable".into());
         assert_eq!(
             semantic_action(ElementAction::Focus, &target).unwrap(),
@@ -2336,14 +5124,14 @@ mod tests {
         }
         let runtime = fake_runtime(fake);
 
-        let full = requested_snapshot(&runtime, ObservationView::Full, None).await;
+        let full = requested_snapshot(&runtime, ObserveView::Both, None).await;
         assert!(
             full.elements
                 .iter()
                 .any(|element| element.node.name == "Hidden account")
         );
 
-        let visible = requested_snapshot(&runtime, ObservationView::Visible, None).await;
+        let visible = requested_snapshot(&runtime, ObserveView::Accessibility, None).await;
         assert!(
             visible
                 .elements
@@ -2356,25 +5144,32 @@ mod tests {
     #[tokio::test]
     async fn interactive_query_is_compact_and_preserves_element_ids() {
         let runtime = fake_runtime(FakeAdapter::tree());
-        let snapshot = requested_snapshot(
-            &runtime,
-            ObservationView::Interactive,
-            Some("button".into()),
-        )
-        .await;
-        let output = observation_output(&snapshot, false, Some("test"), None, None);
+        let snapshot =
+            requested_snapshot(&runtime, ObserveView::Accessibility, Some("button".into())).await;
+        let output = observation_output(&snapshot, false, Some("test"), None, None, None);
         let elements = output.structured_content.unwrap()["elements"]
             .as_array()
             .unwrap()
             .clone();
+        let button_id = snapshot.element_ids[1].clone();
+        let hidden_id = snapshot.element_ids[2].clone();
 
         assert_eq!(elements.len(), 1);
-        assert_eq!(elements[0]["element_id"], "1");
+        assert_eq!(elements[0]["element_id"], button_id);
         assert_eq!(elements[0]["name"], "Button");
-        assert!(output.text.contains("1: button name=\"Button\""));
-        assert!(!output.text.contains("2: text"));
-        assert_eq!(cached_element(&snapshot, "1").unwrap().node.name, "Button");
-        let hidden = cached_element(&snapshot, "2").unwrap_err();
+        assert!(
+            output
+                .text
+                .contains(&format!("{button_id}: button name=\"Button\""))
+        );
+        assert!(!output.text.contains(&format!("{hidden_id}: text")));
+        assert_eq!(
+            cached_element(&snapshot, &button_id).unwrap().node.name,
+            "Button"
+        );
+        let numeric = cached_element(&snapshot, "1").unwrap_err();
+        assert!(numeric.message.contains("not an opaque ID"), "{numeric}");
+        let hidden = cached_element(&snapshot, &hidden_id).unwrap_err();
         assert!(hidden.message.contains("included"), "{hidden}");
 
         let mut changed = (*snapshot).clone();
@@ -2382,7 +5177,7 @@ mod tests {
         changed.elements[1].node.name = "Renamed".into();
         changed.elements[1].node.capabilities = inspected(ActionCapabilities::Unsupported);
         let changed_error =
-            ensure_element_presented(&changed, &changed.elements[1], "1").unwrap_err();
+            ensure_element_presented(&changed, &changed.elements[1], &button_id).unwrap_err();
         assert!(changed_error.message.contains("no longer included"));
     }
 
@@ -2392,11 +5187,12 @@ mod tests {
         let runtime = fake_runtime(fake.clone());
         let snapshot = requested_snapshot(
             &runtime,
-            ObservationView::Interactive,
+            ObserveView::Accessibility,
             Some("activate".into()),
         )
         .await;
-        let state_id = snapshot_state_id(&snapshot);
+        let observation_id = observation_id_for_snapshot(&snapshot);
+        let element_id = snapshot.element_ids[1].clone();
         {
             let mut state = fake.state.lock().unwrap();
             let NodeCapabilities::Inspected(capabilities) =
@@ -2411,20 +5207,20 @@ mod tests {
         }
 
         let error = runtime
-            .element_action(&state_id, "1", ElementAction::Invoke)
+            .element_action_for_test(&observation_id, &element_id, ElementAction::Invoke)
             .await
             .unwrap_err();
 
         assert!(error.message.contains("no longer included"), "{error}");
         assert!(fake.state.lock().unwrap().actions.is_empty());
-        assert!(runtime.required_cached(&state_id).is_ok());
+        assert!(runtime.required_cached(&observation_id).is_ok());
     }
 
     #[tokio::test]
     async fn observing_another_window_keeps_the_prior_state_cached() {
         let runtime = fake_runtime(FakeAdapter::tree());
-        let first = requested_snapshot(&runtime, ObservationView::Full, None).await;
-        let first_id = snapshot_state_id(&first);
+        let first = requested_snapshot(&runtime, ObserveView::Both, None).await;
+        let first_id = observation_id_for_snapshot(&first);
         let mut reused_objects = (*first).clone();
         reused_objects.app.pid = 11;
         reused_objects.generation = 0;
@@ -2432,12 +5228,11 @@ mod tests {
         assert!(runtime.required_cached(&first_id).is_ok());
         assert!(
             runtime
-                .required_cached(&snapshot_state_id(&reused_objects))
+                .required_cached(&observation_id_for_snapshot(&reused_objects))
                 .is_ok()
         );
 
         let mut other = (*first).clone();
-        other.app_query = "Browser".into();
         other.app.name = "Browser".into();
         other.app.pid = 20;
         other.app.object = id("browser-app");
@@ -2452,7 +5247,7 @@ mod tests {
         );
         assert_eq!(
             runtime
-                .required_cached(&snapshot_state_id(&second))
+                .required_cached(&observation_id_for_snapshot(&second))
                 .unwrap()
                 .app
                 .name,
@@ -2487,7 +5282,7 @@ mod tests {
     async fn action_revalidation_keeps_the_observed_background_window() {
         let fake = FakeAdapter::tree();
         let runtime = fake_runtime(fake.clone());
-        let snapshot = requested_snapshot(&runtime, ObservationView::Full, None).await;
+        let snapshot = requested_snapshot(&runtime, ObserveView::Both, None).await;
         {
             let mut state = fake.state.lock().unwrap();
             state.app.windows[0].states.remove("active");
@@ -2510,10 +5305,14 @@ mod tests {
         let mut cache = Cache::default();
         let first = cache.insert(snapshot_for_target(1, &payload)).unwrap();
         let second = cache.insert(snapshot_for_target(2, &payload)).unwrap();
-        assert!(cache.required(&snapshot_state_id(&first)).is_err());
+        assert!(
+            cache
+                .required(&observation_id_for_snapshot(&first))
+                .is_err()
+        );
         assert_eq!(
             cache
-                .required(&snapshot_state_id(&second))
+                .required(&observation_id_for_snapshot(&second))
                 .unwrap()
                 .snapshot
                 .app
@@ -2529,7 +5328,147 @@ mod tests {
         let payload = "x".repeat(MAX_CACHED_SNAPSHOT_STRING_BYTES + 1);
         let error = cache.insert(snapshot_for_target(1, &payload)).unwrap_err();
         assert!(error.message.contains("byte limit"), "{error}");
-        assert!(cache.required(&snapshot_state_id(&prior)).is_ok());
+        assert!(cache.required(&observation_id_for_snapshot(&prior)).is_ok());
+    }
+
+    #[test]
+    fn replacement_focus_evidence_maps_by_object_identity_to_the_new_element_id() {
+        let target = TargetRef {
+            app_instance_id: "app-0000000000000001".into(),
+            window_instance_id: "win-0000000000000002".into(),
+        };
+        let mut source = snapshot_for_target(1, "source");
+        source.target_ref = Some(target.clone());
+        source.element_ids = vec!["e-0000000000000003".into()];
+        let mut replacement = source.clone();
+        replacement.element_ids = vec!["e-0000000000000004".into()];
+        replacement.elements[0].node.states.insert("focused".into());
+
+        let output = annotate_action_output_with_progress(
+            ToolOutput::text("done"),
+            &target,
+            &ObservationRef {
+                observation_id: "obs-0000000000000005".into(),
+                frame_id: None,
+            },
+            &ActOperation::Semantic {
+                element_id: "e-0000000000000003".into(),
+                action: ElementAction::Focus,
+            },
+            &source,
+            Some(&replacement),
+            None,
+        );
+        let structured = output
+            .structured_content
+            .as_ref()
+            .expect("structured output");
+        assert_eq!(structured["focus"]["element_focused"], true);
+        assert_eq!(
+            structured["focus"]["replacement_element_id"],
+            "e-0000000000000004"
+        );
+        assert_eq!(structured["effect"]["observed_change"], true);
+        assert_eq!(structured["dispatch"]["request_accepted"], true);
+        assert_eq!(structured["dispatch"]["protocol_request_sent"], true);
+        assert_eq!(structured["dispatch"]["request_flushed"], false);
+        assert_eq!(structured["dispatch"]["synchronized"], false);
+        assert!(output.text.contains("Action: request_accepted=true"));
+    }
+
+    #[test]
+    fn completed_action_without_replacement_does_not_reuse_source_evidence() {
+        let target = TargetRef {
+            app_instance_id: "app-0000000000000001".into(),
+            window_instance_id: "win-0000000000000002".into(),
+        };
+        let source = snapshot_for_target(1, "source");
+        let output = annotate_action_output_with_progress(
+            ToolOutput::text("refresh failed").with_structured_content(json!({
+                "observation_id": "obs-0000000000000001",
+                "frame_id": "frame-0000000000000002",
+                "elements": [{"element_id": "e-0000000000000003"}]
+            })),
+            &target,
+            &ObservationRef {
+                observation_id: "obs-0000000000000001".into(),
+                frame_id: Some("frame-0000000000000002".into()),
+            },
+            &ActOperation::Pointer {
+                action: PointerAction::Move { x: 1.0, y: 2.0 },
+            },
+            &source,
+            None,
+            None,
+        );
+        let structured = output.structured_content.expect("structured action");
+        assert_eq!(structured["replacement_observation"], Value::Null);
+        assert_eq!(structured["post_action"]["replacement_available"], false);
+        assert_eq!(structured["post_action"]["observation_id"], Value::Null);
+        assert_eq!(structured["post_action"]["frame_id"], Value::Null);
+        assert!(
+            structured["post_action"]["element_ids"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn keyboard_action_evidence_reports_point_click_and_unobservable_delivery() {
+        let target = TargetRef {
+            app_instance_id: "app-0000000000000001".into(),
+            window_instance_id: "win-0000000000000002".into(),
+        };
+        let source = snapshot_for_target(1, "source");
+        let output = annotate_action_output_with_progress(
+            ToolOutput::text("done"),
+            &target,
+            &ObservationRef {
+                observation_id: "obs-0000000000000005".into(),
+                frame_id: Some("frame-0000000000000006".into()),
+            },
+            &ActOperation::Keyboard {
+                focus: KeyboardPoint { x: 12.0, y: 34.0 },
+                events: vec![
+                    KeyboardEvent::Press("Ctrl+L".into()),
+                    KeyboardEvent::Press("Enter".into()),
+                ],
+            },
+            &source,
+            Some(&source),
+            None,
+        );
+        let structured = output
+            .structured_content
+            .as_ref()
+            .expect("structured output");
+        assert_eq!(structured["focus"]["requested"], true);
+        assert_eq!(structured["focus"]["point"]["x"], 12.0);
+        assert_eq!(structured["focus"]["point"]["y"], 34.0);
+        assert_eq!(structured["focus"]["click"]["requested"], true);
+        assert_eq!(structured["focus"]["click"]["sent"], true);
+        assert_eq!(structured["focus"]["click"]["flushed"], true);
+        assert_eq!(
+            structured["focus"]["barriers"]["focus_click_completed"],
+            true
+        );
+        assert_eq!(
+            structured["focus"]["barriers"]["between_events_completed"],
+            1
+        );
+        assert_eq!(
+            structured["focus"]["barriers"]["cleanup_barrier_completed"],
+            true
+        );
+        assert_eq!(structured["focus"]["seat_focus"], "not_observable");
+        assert_eq!(
+            structured["delivery"]["application_delivery"],
+            "not_observable"
+        );
+        assert_eq!(structured["delivery"]["text_delivery"], "not_observable");
+        assert!(output.text.contains("focus_click=requested,sent,flushed"));
+        assert!(output.text.contains("text_delivery=not_observable"));
     }
 
     #[tokio::test]
@@ -2545,6 +5484,572 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.message.contains("timed out"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn public_act_rejects_a_pid_replacement_after_observe() {
+        let fake = FakeAdapter::tree();
+        let runtime = fake_runtime(fake.clone());
+        let listed = runtime
+            .execute_call(ToolCall::ListDesktop {
+                scope: DesktopScope::Windows,
+                limit: DEFAULT_DESKTOP_PAGE_SIZE,
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        let target_value = listed.structured_content.unwrap()["windows"][0]["target"].clone();
+        let target = TargetRef {
+            app_instance_id: target_value["app_instance_id"].as_str().unwrap().to_owned(),
+            window_instance_id: target_value["window_instance_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        };
+        let observed = runtime
+            .execute_call(ToolCall::Observe {
+                target: target.clone(),
+                view: ObserveView::Accessibility,
+                accessibility: None,
+            })
+            .await
+            .unwrap();
+        let metadata = observed.structured_content.unwrap();
+        let observation_id = metadata["observation_id"].as_str().unwrap().to_owned();
+        let element_id = metadata["elements"][0]["element_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        fake.state.lock().unwrap().app.pid = 11;
+        let error = runtime
+            .execute_call(ToolCall::Act {
+                target,
+                source: ObservationRef {
+                    observation_id,
+                    frame_id: None,
+                },
+                operation: ActOperation::Semantic {
+                    element_id,
+                    action: ElementAction::Invoke,
+                },
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "stale_state");
+        assert_eq!(error.outcome, ToolOutcome::NotStarted);
+        assert!(fake.state.lock().unwrap().actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unchanged_target_observation_survives_unrelated_catalog_membership_change() {
+        let fake = FakeAdapter::tree();
+        let runtime = fake_runtime(fake.clone());
+        let snapshot = requested_snapshot(&runtime, ObserveView::Accessibility, None).await;
+        let observation_id = observation_id_for_snapshot(&snapshot);
+        let element_id = snapshot.element_ids[1].clone();
+        {
+            let mut state = fake.state.lock().unwrap();
+            state.app.windows.push(WindowInfo {
+                object: id("unrelated-window"),
+                title: "Unrelated".into(),
+                states: ["showing".into()].into_iter().collect(),
+            });
+        }
+
+        let output = runtime
+            .execute_call(semantic_call(
+                observation_id,
+                element_id,
+                ElementAction::Invoke,
+            ))
+            .await
+            .expect("unrelated membership must not stale the exact target");
+
+        assert_eq!(fake.state.lock().unwrap().actions.len(), 1);
+        assert_eq!(
+            output.structured_content.unwrap()["action_progress"]["post_visual"],
+            "not_run"
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_invalidation_preserves_existing_target_ids_and_clears_observations() {
+        let runtime = fake_runtime(FakeAdapter::tree());
+        let snapshot = requested_snapshot(&runtime, ObserveView::Accessibility, None).await;
+        let target = snapshot.target_ref.clone().expect("exact target");
+        let before = runtime.target_entry(&target).unwrap();
+        assert!(!runtime.lock_cache().unwrap().observations.is_empty());
+
+        runtime.invalidate_for_launch().unwrap();
+        runtime.refresh_window_catalog().await.unwrap();
+
+        let after = runtime.target_entry(&target).unwrap();
+        assert!(runtime.lock_cache().unwrap().observations.is_empty());
+        assert_eq!(after.target, before.target);
+        assert_eq!(after.backend_identity, before.backend_identity);
+        assert_eq!(after.source, before.source);
+        assert_eq!(after.pid, before.pid);
+    }
+
+    #[tokio::test]
+    async fn list_desktop_structured_windows_retain_source_and_capabilities() {
+        let runtime = fake_runtime(FakeAdapter::tree());
+        let output = runtime
+            .execute_call(ToolCall::ListDesktop {
+                scope: DesktopScope::Windows,
+                limit: DEFAULT_DESKTOP_PAGE_SIZE,
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        let structured = output.structured_content.unwrap();
+        let windows = structured["windows"]
+            .as_array()
+            .expect("structured windows array");
+        let window = windows
+            .iter()
+            .find(|window| window["source"]["authority"] == "atspi")
+            .expect("AT-SPI window entry");
+
+        assert_eq!(window["source"]["authority"], "atspi");
+        assert_eq!(window["source"]["kind"], "atspi");
+        assert_eq!(
+            window["capabilities"]["accessibility"]["status"],
+            "supported"
+        );
+        assert_eq!(window["capabilities"]["activate"]["status"], "supported");
+    }
+
+    #[test]
+    fn desktop_page_cursors_are_deterministic_and_fail_closed() {
+        let generation = 0x1234_u64;
+        let cursor = page_cursor(DesktopScope::Windows, generation, 37);
+        assert_eq!(cursor, "cur-windows-0000000000001234-0000000000000025");
+        assert_eq!(
+            page_start(Some(&cursor), DesktopScope::Windows, generation, 100).unwrap(),
+            37
+        );
+        assert_eq!(
+            page_start(
+                Some(&page_cursor(DesktopScope::Windows, generation, 100)),
+                DesktopScope::Windows,
+                generation,
+                100,
+            )
+            .unwrap(),
+            100
+        );
+
+        for malformed in [
+            "",
+            "cur-windows",
+            "cur-applications-1-2",
+            "cur-windows-nope-2",
+            "cur-windows-1-0000000000000001",
+            "cur-windows-0000000000001234-00000000000000AF",
+        ] {
+            let error = page_start(Some(malformed), DesktopScope::Windows, generation, 100)
+                .expect_err("malformed cursor must fail");
+            assert_eq!(error.code, "invalid_arguments", "{malformed:?}");
+        }
+
+        let stale = page_start(
+            Some(&page_cursor(DesktopScope::Windows, generation + 1, 37)),
+            DesktopScope::Windows,
+            generation,
+            100,
+        )
+        .expect_err("generation changes must invalidate a cursor");
+        assert_eq!(stale.code, "stale_state");
+        assert!(stale.recovery.contains("list_desktop again"));
+        assert!(!stale.recovery.contains("observe again"));
+
+        let past_end = page_start(
+            Some(&page_cursor(DesktopScope::Windows, generation, 101)),
+            DesktopScope::Windows,
+            generation,
+            100,
+        )
+        .expect_err("an offset past the page boundary must fail");
+        assert_eq!(past_end.code, "stale_state");
+        assert!(past_end.recovery.contains("list_desktop again"));
+    }
+
+    #[test]
+    fn desktop_list_text_budget_keeps_entries_whole_and_cursor_exact() {
+        let compact = bounded_list_text(
+            "Backends: supported",
+            &["Window".into()],
+            Some("cur-windows-0000000000000001-0000000000000001"),
+        );
+        assert!(compact.contains("Window\nNext cursor:"));
+
+        let entries = (0..200)
+            .map(|index| format!("entry-{index}-{}", "x".repeat(200)))
+            .collect::<Vec<_>>();
+        let text = bounded_list_text(
+            "Backends: standard_foreign_toplevel=supported kde_plasma_rich=unsupported",
+            &entries,
+            Some("cur-windows-0000000000000001-0000000000000002"),
+        );
+        assert!(text.len() <= MAX_MODEL_TEXT_BYTES);
+        assert!(text.contains("List text truncated: reason=response_byte_budget"));
+        assert!(text.contains("Next cursor: cur-windows-0000000000000001-0000000000000002"));
+        assert!(text.contains("\nNext cursor: cur-windows-0000000000000001-0000000000000002"));
+        assert!(!text.contains("entry-199-"));
+    }
+
+    #[tokio::test]
+    async fn compact_outputs_report_bounded_text_and_structured_sizes() {
+        let runtime = fake_runtime(FakeAdapter::tree());
+        let list = runtime
+            .execute_call(ToolCall::ListDesktop {
+                scope: DesktopScope::Windows,
+                limit: DEFAULT_DESKTOP_PAGE_SIZE,
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        assert_text_budget("list text", &list.text, 12_000, 500);
+        assert_json_budget(
+            "list structured",
+            list.structured_content.as_ref().expect("list structured"),
+            32_000,
+        );
+
+        let snapshot = snapshot_for_target(1, "budget");
+        let mapping = test_screenshot_mapping(&snapshot, "/session/budget", None);
+        let observation = observation_output(
+            &snapshot,
+            true,
+            None,
+            Some(mapping.output_size),
+            None,
+            Some(&mapping.source),
+        );
+        assert_text_budget("observation text", &observation.text, 24_000, 2_000);
+        assert_json_budget(
+            "observation structured",
+            observation
+                .structured_content
+                .as_ref()
+                .expect("observation structured"),
+            48_000,
+        );
+
+        let target = TargetRef {
+            app_instance_id: "app-0000000000000001".into(),
+            window_instance_id: "win-0000000000000002".into(),
+        };
+        let action = annotate_action_output_with_progress(
+            ToolOutput::text("done"),
+            &target,
+            &ObservationRef {
+                observation_id: "obs-0000000000000005".into(),
+                frame_id: None,
+            },
+            &ActOperation::Semantic {
+                element_id: "e-0000000000000003".into(),
+                action: ElementAction::Focus,
+            },
+            &snapshot,
+            Some(&snapshot),
+            None,
+        );
+        assert_text_budget("action text", &action.text, 4_000, 300);
+        assert_json_budget(
+            "action structured",
+            action
+                .structured_content
+                .as_ref()
+                .expect("action structured"),
+            32_000,
+        );
+    }
+
+    #[test]
+    fn worst_case_observation_and_replacement_are_explicitly_truncated() {
+        let mut elements = Vec::new();
+        for index in 0..240 {
+            let mut node = node(
+                &format!("worst-{index}"),
+                "button",
+                &format!("名{}", "name".repeat(2_000)),
+            );
+            node.value = Some("value🙂".repeat(2_000));
+            node.text = Some("text\n\r\"".repeat(2_000));
+            node.states.insert("focusable".into());
+            if index == 239 {
+                node.states.insert("focused".into());
+            }
+            node.capabilities = inspected(ActionCapabilities::Inspected(
+                (0..64)
+                    .map(|action| ActionInfo {
+                        name: format!("action-{action}-{}", "n".repeat(100)),
+                        description: format!("description-{}", "d".repeat(400)),
+                    })
+                    .collect(),
+            ));
+            elements.push(ElementSnapshot {
+                depth: index % 8,
+                node,
+            });
+        }
+        let target = TargetRef {
+            app_instance_id: "app-0000000000000001".into(),
+            window_instance_id: "win-0000000000000002".into(),
+        };
+        let snapshot = Snapshot {
+            view: AccessibilityScope::Full,
+            element_query: None,
+            app: app("A", 1, "Main"),
+            window: window("Main", &["active"]),
+            generation: 7,
+            elements,
+            element_ids: (0..240).map(|index| format!("e-{index:016x}")).collect(),
+            node_limit_reached: true,
+            depth_limit_reached: true,
+            limits: SnapshotLimits {
+                text: usize::MAX,
+                nodes: 5_000,
+                depth: 128,
+            },
+            target_ref: Some(target.clone()),
+            accessibility_ready: true,
+            accessibility_reason: None,
+            requires_atspi_revalidation: true,
+            screenshot_requested: true,
+        };
+        let mapping = test_screenshot_mapping(&snapshot, "/session/worst", None);
+        let observation = observation_output(
+            &snapshot,
+            true,
+            None,
+            Some(mapping.output_size),
+            None,
+            Some(&mapping.source),
+        );
+        assert!(observation.text.len() <= MAX_MODEL_TEXT_BYTES);
+        let structured = observation
+            .structured_content
+            .as_ref()
+            .expect("structured observation");
+        assert_json_budget("worst observation", structured, MAX_MODEL_STRUCTURED_BYTES);
+        assert_eq!(structured["truncated"], true);
+        assert_eq!(structured["truncation"]["reason"], "response_byte_budget");
+        assert!(
+            structured["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|element| { element["element_id"] == "e-0000000000000000" })
+        );
+        assert!(
+            structured["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|element| { element["element_id"] == "e-00000000000000ef" })
+        );
+        assert!(
+            observation
+                .text
+                .contains("Truncated: reason=response_byte_budget")
+        );
+
+        let progress = Arc::new(ActionProgress::default());
+        progress.mark_started();
+        progress.mark_cleanup_completed();
+        progress.mark_completed();
+        progress.mark_post_visual(PostStatus::Observed);
+        progress.mark_post_accessibility(PostStatus::Observed);
+        let action = annotate_action_output_with_progress(
+            observation,
+            &target,
+            &ObservationRef {
+                observation_id: "obs-0000000000000007".into(),
+                frame_id: Some(crate::capture::frame_id(&mapping.source)),
+            },
+            &ActOperation::Semantic {
+                element_id: "e-00000000000000ef".into(),
+                action: ElementAction::Focus,
+            },
+            &snapshot,
+            Some(&snapshot),
+            Some(&progress),
+        );
+        assert!(action.text.len() <= MAX_MODEL_TEXT_BYTES);
+        assert!(action.text.contains("Action: request_accepted=true"));
+        assert!(action.text.contains(
+            "replacement_observation=Some(\"obs-0000000000000007\") replacement_frame=Some(\"frame-0000000000000007\") replacement_element_id=Some(\"e-00000000000000ef\")"
+        ));
+        assert!(action.text.ends_with(
+            "Action progress: dispatch=completed cleanup=completed visual=observed accessibility=observed"
+        ));
+        assert!(!action.text.contains("rTruncated:"));
+        assert!(!action.text.contains("\"dispatch_stage\""));
+        assert!(!action.text.contains("source_sequence"));
+        assert!(!action.text.contains("pts_ns"));
+        assert_json_budget(
+            "worst action",
+            action
+                .structured_content
+                .as_ref()
+                .expect("structured action"),
+            MAX_MODEL_STRUCTURED_BYTES,
+        );
+        let structured = action.structured_content.as_ref().unwrap();
+        assert_eq!(structured["status"], "completed");
+        assert_eq!(structured["outcome"], "completed");
+        assert_eq!(
+            structured["replacement_observation_id"],
+            "obs-0000000000000007"
+        );
+        assert_eq!(structured["replacement_frame_id"], "frame-0000000000000007");
+        assert_eq!(structured["replacement_element_id"], "e-00000000000000ef");
+        assert!(structured["action_progress"].is_object());
+    }
+
+    #[tokio::test]
+    async fn successful_public_act_projects_bounded_replacement_evidence() {
+        struct SuccessfulScreenshots;
+
+        impl ScreenshotProvider for SuccessfulScreenshots {
+            async fn prepare(&self) -> Result<(), ScreenshotError> {
+                Ok(())
+            }
+
+            async fn capture<'a>(
+                &'a self,
+                snapshot: &'a Snapshot,
+            ) -> Result<ScreenshotObservation, ScreenshotError> {
+                Ok(ScreenshotObservation {
+                    png_base64: "cG5n".into(),
+                    mapping: test_screenshot_mapping(snapshot, "/session/act", None),
+                })
+            }
+
+            async fn perform_input<'a>(
+                &'a self,
+                _snapshot: &'a Snapshot,
+                _mapping: &'a ScreenshotMapping,
+                _action: GeneratedInputAction,
+                progress: Arc<ActionProgress>,
+            ) -> Result<(), InputError> {
+                progress.mark_started();
+                progress.mark_completed();
+                Ok(())
+            }
+        }
+
+        let runtime = SemanticRuntime::with_screenshot_provider(
+            FakeAdapter::tree(),
+            SuccessfulScreenshots,
+            test_config(),
+        );
+        let listed = runtime
+            .execute_call(ToolCall::ListDesktop {
+                scope: DesktopScope::Windows,
+                limit: DEFAULT_DESKTOP_PAGE_SIZE,
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        let target_value = listed.structured_content.unwrap()["windows"][0]["target"].clone();
+        let target = TargetRef {
+            app_instance_id: target_value["app_instance_id"].as_str().unwrap().into(),
+            window_instance_id: target_value["window_instance_id"].as_str().unwrap().into(),
+        };
+        let observed = runtime
+            .execute_call(ToolCall::Observe {
+                target: target.clone(),
+                view: ObserveView::Both,
+                accessibility: Some(AccessibilityRequest {
+                    scope: AccessibilityScope::Full,
+                    ..AccessibilityRequest::default()
+                }),
+            })
+            .await
+            .unwrap();
+        let metadata = observed.structured_content.unwrap();
+        let element_id = metadata["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|element| element["capabilities"]["invoke"] == true)
+            .and_then(|element| element["element_id"].as_str())
+            .expect("an invokable element");
+        let source = ObservationRef {
+            observation_id: metadata["observation_id"].as_str().unwrap().into(),
+            frame_id: Some(metadata["screenshot"]["frame_id"].as_str().unwrap().into()),
+        };
+        let output = runtime
+            .execute_call(ToolCall::Act {
+                target,
+                source,
+                operation: ActOperation::Semantic {
+                    element_id: element_id.into(),
+                    action: ElementAction::Invoke,
+                },
+            })
+            .await
+            .unwrap();
+        assert!(output.text.len() <= MAX_MODEL_TEXT_BYTES);
+        assert!(output.text.contains("Action: request_accepted=true"));
+        assert!(output.text.contains("Action progress: dispatch=completed"));
+        assert!(!output.text.contains("\"dispatch_stage\""));
+        assert!(!output.text.contains("source_sequence"));
+        assert!(!output.text.contains("pts_ns"));
+        assert_eq!(output.png_base64.as_deref(), Some("cG5n"));
+        let complete = serde_json::to_value(output.clone().into_mcp_result())
+            .expect("serialize complete public act result");
+        assert!(complete["content"][0]["text"].as_str().unwrap().len() <= MAX_MODEL_TEXT_BYTES);
+        assert!(
+            serde_json::to_vec(&complete["structuredContent"])
+                .expect("serialize public act structured content")
+                .len()
+                <= MAX_MODEL_STRUCTURED_BYTES
+        );
+        assert!(
+            complete["content"][1]["data"].as_str().unwrap().len()
+                <= crate::encoder::MAX_PNG_BYTES.div_ceil(3) * 4
+        );
+        assert!(
+            serde_json::to_vec(&complete).unwrap().len()
+                <= MAX_MODEL_TEXT_BYTES + MAX_MODEL_STRUCTURED_BYTES + 4_096
+        );
+        let structured = output.structured_content.expect("successful act evidence");
+        assert_json_budget(
+            "public act structured",
+            &structured,
+            MAX_MODEL_STRUCTURED_BYTES,
+        );
+        assert!(structured["action_progress"].is_object());
+        assert!(structured["replacement_observation"].is_object());
+        assert!(structured["replacement_observation"]["observation_id"].is_string());
+    }
+
+    fn assert_text_budget(label: &str, text: &str, max_bytes: usize, max_words: usize) {
+        let words = text.split_whitespace().count();
+        assert!(
+            text.len() <= max_bytes,
+            "{label}: {} bytes exceeds {max_bytes}",
+            text.len()
+        );
+        assert!(
+            words <= max_words,
+            "{label}: {words} words exceeds {max_words}"
+        );
+    }
+
+    fn assert_json_budget(label: &str, value: &Value, max_bytes: usize) {
+        let bytes = serde_json::to_vec(value).expect("structured content is serializable");
+        assert!(
+            bytes.len() <= max_bytes,
+            "{label}: {} bytes exceeds {max_bytes}",
+            bytes.len()
+        );
     }
 
     #[tokio::test]
@@ -2567,7 +6072,7 @@ mod tests {
         );
         assert!(slider.node.value.is_none());
         assert!(text.contains("name=\"Zoom\""));
-        assert!(text.contains("Screenshot unavailable"));
+        assert!(text.contains("PNG unavailable"));
     }
 
     #[tokio::test]
@@ -2629,33 +6134,37 @@ mod tests {
         );
 
         let mut outputs = Vec::new();
-        let mut previous_state_id = current_state_id(&runtime);
-        for (element_id, action) in [
-            ("1", ElementAction::Invoke),
-            ("1", ElementAction::Named("menu".into())),
-            ("2", ElementAction::SetValue("  λ\n".into())),
-            ("3", ElementAction::SetValue("42.5".into())),
+        let mut previous_observation_id = current_observation_id(&runtime);
+        let mut current_element_ids = current_snapshot(&runtime).element_ids.clone();
+        for (element_index, action) in [
+            (1, ElementAction::Invoke),
+            (1, ElementAction::Named("menu".into())),
+            (2, ElementAction::SetValue("  λ\n".into())),
+            (3, ElementAction::SetValue("42.5".into())),
         ] {
+            let element_id = current_element_ids[element_index].clone();
             let output = runtime
-                .execute_call(ToolCall::ActOnElement {
-                    state_id: previous_state_id.clone(),
-                    element_id: element_id.into(),
+                .execute_call(semantic_call(
+                    previous_observation_id.clone(),
+                    element_id,
                     action,
-                })
+                ))
                 .await
                 .unwrap();
-            let next_state_id = output.structured_content.as_ref().unwrap()["state_id"]
+            let next_observation_id = output.structured_content.as_ref().unwrap()
+                ["replacement_observation"]["observation_id"]
                 .as_str()
                 .unwrap()
                 .to_owned();
-            assert_ne!(next_state_id, previous_state_id);
-            previous_state_id = next_state_id;
+            assert_ne!(next_observation_id, previous_observation_id);
+            previous_observation_id = next_observation_id;
+            current_element_ids = current_snapshot(&runtime).element_ids.clone();
             outputs.push(output);
         }
         assert!(
             outputs
                 .iter()
-                .all(|output| output.text.contains("Screenshot unavailable"))
+                .all(|output| output.text.contains("PNG unavailable"))
         );
         assert_eq!(
             fake.state.lock().unwrap().actions,
@@ -2679,26 +6188,27 @@ mod tests {
             .snapshot_text("Editor".into(), None, None, None)
             .await
             .unwrap();
-        let state_id = current_state_id(&runtime);
+        let observation_id = current_observation_id(&runtime);
+        let element_id = current_snapshot(&runtime).element_ids[1].clone();
         fake.state.lock().unwrap().fail_actions = true;
 
         let error = runtime
-            .execute_call(ToolCall::ActOnElement {
-                state_id: state_id.clone(),
-                element_id: "1".into(),
-                action: ElementAction::Invoke,
-            })
+            .execute_call(semantic_call(
+                observation_id.clone(),
+                element_id.clone(),
+                ElementAction::Invoke,
+            ))
             .await
             .unwrap_err();
         assert_eq!(error.outcome, ToolOutcome::Unknown);
         assert_eq!(fake.state.lock().unwrap().actions.len(), 1);
 
         let retry = runtime
-            .execute_call(ToolCall::ActOnElement {
-                state_id,
-                element_id: "1".into(),
-                action: ElementAction::Invoke,
-            })
+            .execute_call(semantic_call(
+                observation_id,
+                element_id,
+                ElementAction::Invoke,
+            ))
             .await
             .unwrap_err();
         assert_eq!(retry.code, "state_required");
@@ -2710,51 +6220,50 @@ mod tests {
         let fake = FakeAdapter::tree();
         let runtime = fake_runtime(fake.clone());
         let error = runtime
-            .execute_call(ToolCall::Keyboard {
-                state_id: "s-0000000000000001".into(),
-                focus: KeyboardFocus::Point((1.0, 2.0)),
-                action: KeyboardAction::Type("x".into()),
-            })
+            .execute_call(keyboard_call(
+                "obs-0000000000000001".into(),
+                KeyboardPoint { x: 1.0, y: 2.0 },
+                vec![KeyboardEvent::Type("x".into())],
+            ))
             .await
             .unwrap_err();
         assert_eq!(error.code, "state_required");
         assert!(error.message.contains("no observation"));
 
         for call in [
-            ToolCall::Pointer {
-                state_id: "s-0000000000000001".into(),
-                action: PointerAction::Move { x: 1.0, y: 2.0 },
-            },
-            ToolCall::Pointer {
-                state_id: "s-0000000000000001".into(),
-                action: PointerAction::Click {
+            pointer_call(
+                "obs-0000000000000001".into(),
+                PointerAction::Move { x: 1.0, y: 2.0 },
+            ),
+            pointer_call(
+                "obs-0000000000000001".into(),
+                PointerAction::Click {
                     x: 1.0,
                     y: 2.0,
                     button: MouseButton::Left,
                     count: 1,
                 },
-            },
-            ToolCall::Pointer {
-                state_id: "s-0000000000000001".into(),
-                action: PointerAction::Drag {
-                    from: (0.0, 0.0),
-                    to: (1.0, 1.0),
+            ),
+            pointer_call(
+                "obs-0000000000000001".into(),
+                PointerAction::Drag {
+                    path: vec![(0.0, 0.0), (1.0, 1.0)],
                 },
-            },
-            ToolCall::Keyboard {
-                state_id: "s-0000000000000001".into(),
-                focus: KeyboardFocus::Point((1.0, 2.0)),
-                action: KeyboardAction::Press("A".into()),
-            },
-            ToolCall::Pointer {
-                state_id: "s-0000000000000001".into(),
-                action: PointerAction::Scroll {
+            ),
+            keyboard_call(
+                "obs-0000000000000001".into(),
+                KeyboardPoint { x: 1.0, y: 2.0 },
+                vec![KeyboardEvent::Press("A".into())],
+            ),
+            pointer_call(
+                "obs-0000000000000001".into(),
+                PointerAction::Scroll {
                     x: 1.0,
                     y: 2.0,
                     delta_x: 0,
                     delta_y: 120,
                 },
-            },
+            ),
         ] {
             assert_eq!(
                 runtime.execute_call(call).await.unwrap_err().code,
@@ -2784,15 +6293,15 @@ mod tests {
             .await
             .unwrap();
         let error = runtime
-            .execute_call(ToolCall::Pointer {
-                state_id: current_state_id(&runtime),
-                action: PointerAction::Scroll {
+            .execute_call(pointer_call(
+                current_observation_id(&runtime),
+                PointerAction::Scroll {
                     x: 1.0,
                     y: 2.0,
                     delta_x: 0,
                     delta_y: 120,
                 },
-            })
+            ))
             .await
             .unwrap_err();
         assert_eq!(error.code, "state_required");
@@ -2800,22 +6309,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actions_reject_a_stale_state_id() {
+    async fn actions_reject_a_stale_observation_id() {
         let runtime = fake_runtime(FakeAdapter::tree());
         runtime.execute_call(observe_call()).await.unwrap();
-        let stale_state_id = current_state_id(&runtime);
+        let stale_observation_id = current_observation_id(&runtime);
+        let stale_element_id = current_snapshot(&runtime).element_ids[1].clone();
         runtime.execute_call(observe_call()).await.unwrap();
 
         let error = runtime
-            .execute_call(ToolCall::ActOnElement {
-                state_id: stale_state_id,
-                element_id: "1".into(),
-                action: ElementAction::Invoke,
-            })
+            .execute_call(semantic_call(
+                stale_observation_id,
+                stale_element_id,
+                ElementAction::Invoke,
+            ))
             .await
             .unwrap_err();
         assert_eq!(error.code, "stale_state");
         assert!(error.message.contains("is stale"));
+    }
+
+    #[test]
+    fn frame_ids_require_a_retained_mapping_for_the_exact_target() {
+        let target = TargetRef {
+            app_instance_id: "app-0000000000000001".into(),
+            window_instance_id: "win-0000000000000002".into(),
+        };
+        let mut snapshot = snapshot_for_target(1, "content");
+        snapshot.target_ref = Some(target.clone());
+        let mut cache = Cache::default();
+        let snapshot = cache.insert(snapshot).unwrap();
+        let mapping = test_screenshot_mapping(&snapshot, "/session/frame", Some("frame-map"));
+        cache.observations[0].screenshot_mapping = Some(mapping.clone());
+        let frame_id = crate::capture::frame_id(&mapping.source);
+        assert!(cache.frame_for_target(&target, Some(&frame_id)).is_ok());
+        assert!(matches!(
+            cache.frame_for_target(&target, Some("frame-ffffffffffffffff")),
+            Err(error) if error.code == "stale_state"
+        ));
     }
 
     #[tokio::test]
@@ -2828,8 +6358,8 @@ mod tests {
             .unwrap();
         fake.state.lock().unwrap().app.pid = 999;
         let error = click(&runtime).await.unwrap_err();
-        assert_eq!(error.code, "target_unavailable");
-        assert!(error.message.contains("stale PID"));
+        assert_eq!(error.code, "stale_state");
+        assert!(error.message.contains("target"));
 
         let fake = FakeAdapter::tree();
         let runtime = fake_runtime(fake.clone());
@@ -2845,8 +6375,8 @@ mod tests {
             state.app.windows[0].object = id("other-window");
         }
         let error = click(&runtime).await.unwrap_err();
-        assert_eq!(error.code, "target_unavailable");
-        assert!(error.message.contains("cached window is no longer present"));
+        assert_eq!(error.code, "stale_state");
+        assert!(error.message.contains("target"));
 
         let fake = FakeAdapter::tree();
         let runtime = fake_runtime(fake.clone());
@@ -2917,7 +6447,8 @@ mod tests {
             _snapshot: &'a Snapshot,
             _mapping: &'a ScreenshotMapping,
             _action: GeneratedInputAction,
-        ) -> Result<(), String> {
+            _progress: Arc<ActionProgress>,
+        ) -> Result<(), InputError> {
             unreachable!()
         }
 
@@ -2952,6 +6483,32 @@ mod tests {
             }
             assert_eq!(runtime.screenshots.prepares.load(Ordering::Acquire), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn screenshot_initialization_timeout_is_reported_as_unavailable_observation() {
+        let mut config = test_config();
+        config.portal_timeout = Duration::from_millis(1);
+        let runtime = SemanticRuntime::with_screenshot_provider(
+            FakeAdapter::tree(),
+            LifecycleScreenshots::new(Preparation::Pending),
+            config,
+        );
+
+        let output =
+            tokio::time::timeout(Duration::from_secs(1), runtime.execute_call(observe_call()))
+                .await
+                .expect("screenshot initialization timeout should be bounded")
+                .unwrap();
+
+        assert!(output.png_base64.is_none());
+        assert!(output.text.contains("PNG unavailable"));
+        let structured = output.structured_content.expect("structured observation");
+        assert_eq!(structured["screenshot"]["ready"], false);
+        assert_eq!(
+            structured["screenshot"]["reason"],
+            "desktop session initialization timed out"
+        );
     }
 
     #[tokio::test]
@@ -3003,7 +6560,8 @@ mod tests {
                 _snapshot: &'a Snapshot,
                 _mapping: &'a ScreenshotMapping,
                 _action: crate::input::GeneratedInputAction,
-            ) -> impl Future<Output = Result<(), String>> + Send + 'a {
+                _progress: Arc<ActionProgress>,
+            ) -> impl Future<Output = Result<(), InputError>> + Send + 'a {
                 self.generated.fetch_add(1, Ordering::AcqRel);
                 async { Err("fake does not send generated input".into()) }
             }
@@ -3019,36 +6577,53 @@ mod tests {
         );
         let output = runtime.execute_call(observe_call()).await.unwrap();
         assert_eq!(output.png_base64.as_deref(), Some("cG5n"));
-        assert!(!output.text.contains("Screenshot unavailable"));
-        let state_id = current_state_id(&runtime);
+        assert!(!output.text.contains("PNG unavailable"));
+        let observation_id = current_observation_id(&runtime);
         let metadata = output.structured_content.as_ref().unwrap();
-        assert_eq!(metadata["state_id"], state_id);
+        assert_eq!(metadata["observation_id"], observation_id);
         assert_eq!(metadata["screenshot"]["ready"], true);
-        assert_eq!(metadata["elements"][1]["invoke"], true);
-        assert_eq!(metadata["elements"][2]["set_value"], "text");
-        assert_eq!(metadata["elements"][3]["set_value"], "number");
-        let mapping = runtime.screenshot_mapping(&state_id).unwrap().unwrap();
+        assert_eq!(metadata["elements"][1]["capabilities"]["invoke"], true);
+        assert_eq!(metadata["elements"][2]["capabilities"]["set_value"], "text");
+        assert_eq!(
+            metadata["elements"][3]["capabilities"]["set_value"],
+            "number"
+        );
+        let mapping = runtime
+            .screenshot_mapping(&observation_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(mapping.stream.mapping_id.as_deref(), Some("mapping"));
         assert_eq!(mapping.accessibility_generation, 1);
 
         let error = runtime
-            .execute_call(ToolCall::Pointer {
-                state_id: state_id.clone(),
-                action: PointerAction::Move { x: 10.0, y: 10.0 },
-            })
+            .execute_call(spatial_call(
+                observation_id.clone(),
+                crate::capture::frame_id(&mapping.source),
+                ActOperation::Pointer {
+                    action: PointerAction::Move { x: 10.0, y: 10.0 },
+                },
+            ))
             .await
             .unwrap_err();
         assert_eq!(error.code, "target_unavailable");
-        assert_eq!(error.outcome, ToolOutcome::Unknown);
+        assert_eq!(error.outcome, ToolOutcome::NotStarted);
         assert!(error.message.contains("fake does not send generated input"));
-        assert!(runtime.screenshot_mapping(&state_id).unwrap().is_none());
+        assert!(
+            runtime
+                .screenshot_mapping(&observation_id)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(runtime.screenshots.generated.load(Ordering::Acquire), 1);
 
         let retry = runtime
-            .execute_call(ToolCall::Pointer {
-                state_id,
-                action: PointerAction::Move { x: 10.0, y: 10.0 },
-            })
+            .execute_call(spatial_call(
+                observation_id,
+                crate::capture::frame_id(&mapping.source),
+                ActOperation::Pointer {
+                    action: PointerAction::Move { x: 10.0, y: 10.0 },
+                },
+            ))
             .await
             .unwrap_err();
         assert_eq!(retry.code, "state_required");
@@ -3060,26 +6635,29 @@ mod tests {
         let fake = FakeAdapter::tree();
         let runtime = fake_runtime(fake.clone());
         runtime.execute_call(observe_call()).await.unwrap();
-        let state_id = current_state_id(&runtime);
+        let observation_id = current_observation_id(&runtime);
 
         let error = runtime
-            .execute_call(ToolCall::Keyboard {
-                state_id: state_id.clone(),
-                focus: KeyboardFocus::Point((10.0, 10.0)),
-                action: KeyboardAction::Press("Alt+Tab".into()),
-            })
+            .execute_call(spatial_call(
+                observation_id.clone(),
+                "frame-0000000000000000".into(),
+                ActOperation::Keyboard {
+                    focus: KeyboardPoint { x: 10.0, y: 10.0 },
+                    events: vec![KeyboardEvent::Press("Alt+Tab".into())],
+                },
+            ))
             .await
             .unwrap_err();
 
         assert_eq!(error.code, "unsupported_action");
         assert_eq!(error.outcome, ToolOutcome::NotStarted);
         assert!(!error.retryable);
-        assert_eq!(current_state_id(&runtime), state_id);
+        assert_eq!(current_observation_id(&runtime), observation_id);
         assert!(fake.state.lock().unwrap().actions.is_empty());
     }
 
     #[tokio::test]
-    async fn semantic_keyboard_focus_is_confirmed_before_no_click_input() {
+    async fn keyboard_uses_point_focus_without_atspi_focus_authority() {
         use crate::{input::GeneratedInputAction, screenshot::ScreenshotObservation};
 
         #[derive(Default)]
@@ -3107,22 +6685,16 @@ mod tests {
                 _snapshot: &'a Snapshot,
                 _mapping: &'a ScreenshotMapping,
                 action: GeneratedInputAction,
-            ) -> Result<(), String> {
+                progress: Arc<ActionProgress>,
+            ) -> Result<(), InputError> {
                 self.actions.lock().unwrap().push(action);
+                progress.mark_started();
+                progress.mark_completed();
                 Ok(())
             }
         }
 
         let fake = FakeAdapter::tree();
-        {
-            let mut state = fake.state.lock().unwrap();
-            let button = state.nodes.get_mut(&id("button")).unwrap();
-            let NodeCapabilities::Inspected(capabilities) = &mut button.capabilities else {
-                panic!("button capabilities should be inspected");
-            };
-            capabilities.component = true;
-            button.states.insert("focusable".into());
-        }
         let runtime = SemanticRuntime::with_screenshot_provider(
             fake.clone(),
             RecordingScreenshots::default(),
@@ -3131,82 +6703,342 @@ mod tests {
         runtime.execute_call(observe_call()).await.unwrap();
 
         let output = runtime
-            .execute_call(ToolCall::Keyboard {
-                state_id: current_state_id(&runtime),
-                focus: KeyboardFocus::Element("1".into()),
-                action: KeyboardAction::Press("Enter".into()),
-            })
+            .execute_call(spatial_call(
+                current_observation_id(&runtime),
+                crate::capture::frame_id(
+                    &runtime
+                        .screenshot_mapping(&current_observation_id(&runtime))
+                        .unwrap()
+                        .unwrap()
+                        .source,
+                ),
+                ActOperation::Keyboard {
+                    focus: KeyboardPoint { x: 10.0, y: 20.0 },
+                    events: vec![KeyboardEvent::Press("Enter".into())],
+                },
+            ))
             .await
             .unwrap();
 
-        assert_eq!(
-            fake.state.lock().unwrap().actions,
-            [(id("button"), SemanticAction::GrabFocus)]
-        );
+        assert!(fake.state.lock().unwrap().actions.is_empty());
         assert_eq!(
             *runtime.screenshots.actions.lock().unwrap(),
-            [GeneratedInputAction::Keyboard {
-                focus: KeyboardFocus::Element("1".into()),
-                action: KeyboardAction::Press("Enter".into()),
+            [GeneratedInputAction::KeyboardTransaction {
+                focus: KeyboardPoint { x: 10.0, y: 20.0 },
+                events: vec![KeyboardEvent::Press("Enter".into())],
             }]
         );
         assert_eq!(
-            output.structured_content.unwrap()["screenshot"]["ready"],
+            output.structured_content.unwrap()["replacement_observation"]["screenshot"]["ready"],
             true
         );
+    }
 
-        let failed_focus = FakeAdapter::tree();
-        {
-            let mut state = failed_focus.state.lock().unwrap();
-            state.semantic_focus_succeeds = false;
-            let button = state.nodes.get_mut(&id("button")).unwrap();
-            let NodeCapabilities::Inspected(capabilities) = &mut button.capabilities else {
-                panic!("button capabilities should be inspected");
-            };
-            capabilities.component = true;
-            button.states.insert("focusable".into());
+    #[tokio::test]
+    async fn stale_keyboard_frame_is_rejected_before_any_point_click_or_key_event() {
+        use crate::{input::GeneratedInputAction, screenshot::ScreenshotObservation};
+
+        #[derive(Default)]
+        struct RecordingScreenshots {
+            actions: Mutex<Vec<GeneratedInputAction>>,
         }
-        let failed_runtime = SemanticRuntime::with_screenshot_provider(
-            failed_focus.clone(),
+
+        impl ScreenshotProvider for RecordingScreenshots {
+            async fn prepare(&self) -> Result<(), ScreenshotError> {
+                Ok(())
+            }
+
+            async fn capture<'a>(
+                &'a self,
+                snapshot: &'a Snapshot,
+            ) -> Result<ScreenshotObservation, ScreenshotError> {
+                Ok(ScreenshotObservation {
+                    png_base64: "cG5n".into(),
+                    mapping: test_screenshot_mapping(snapshot, "/session/stale-frame", None),
+                })
+            }
+
+            async fn perform_input<'a>(
+                &'a self,
+                _snapshot: &'a Snapshot,
+                _mapping: &'a ScreenshotMapping,
+                action: GeneratedInputAction,
+                progress: Arc<ActionProgress>,
+            ) -> Result<(), InputError> {
+                self.actions.lock().unwrap().push(action);
+                progress.mark_started();
+                progress.mark_completed();
+                Ok(())
+            }
+        }
+
+        let runtime = SemanticRuntime::with_screenshot_provider(
+            FakeAdapter::tree(),
             RecordingScreenshots::default(),
             test_config(),
         );
-        failed_runtime.execute_call(observe_call()).await.unwrap();
-        let error = failed_runtime
-            .execute_call(ToolCall::Keyboard {
-                state_id: current_state_id(&failed_runtime),
-                focus: KeyboardFocus::Element("1".into()),
-                action: KeyboardAction::Press("Enter".into()),
+        let listed = runtime
+            .execute_call(ToolCall::ListDesktop {
+                scope: DesktopScope::Windows,
+                limit: DEFAULT_DESKTOP_PAGE_SIZE,
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        let target_value = listed.structured_content.unwrap()["windows"][0]["target"].clone();
+        let target = TargetRef {
+            app_instance_id: target_value["app_instance_id"]
+                .as_str()
+                .expect("app target")
+                .into(),
+            window_instance_id: target_value["window_instance_id"]
+                .as_str()
+                .expect("window target")
+                .into(),
+        };
+        let observed = runtime
+            .execute_call(ToolCall::Observe {
+                target: target.clone(),
+                view: ObserveView::Screenshot,
+                accessibility: None,
+            })
+            .await
+            .unwrap();
+        let observation_id = observed.structured_content.unwrap()["observation_id"]
+            .as_str()
+            .expect("observation ID")
+            .to_owned();
+
+        let error = runtime
+            .execute_call(ToolCall::Act {
+                target,
+                source: ObservationRef {
+                    observation_id,
+                    frame_id: Some("frame-ffffffffffffffff".into()),
+                },
+                operation: ActOperation::Keyboard {
+                    focus: KeyboardPoint { x: 10.0, y: 20.0 },
+                    events: vec![KeyboardEvent::Press("Enter".into())],
+                },
             })
             .await
             .unwrap_err();
-        assert_eq!(error.outcome, ToolOutcome::Unknown);
-        assert!(
-            error.message.contains("not focused after GrabFocus"),
-            "{error}"
+
+        assert_eq!(error.code, "stale_state");
+        assert!(error.message.contains("source frame is stale"));
+        assert!(error.recovery.contains("observe again"));
+        assert!(!error.recovery.contains("list_desktop again"));
+        assert!(runtime.screenshots.actions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_spatial_action_is_a_tool_error_when_replacement_refresh_fails() {
+        let fake = FakeAdapter::tree();
+        let runtime = SemanticRuntime::with_screenshot_provider(
+            fake.clone(),
+            RefreshFailingScreenshots {
+                state: Arc::clone(&fake.state),
+            },
+            test_config(),
         );
-        assert!(
-            failed_runtime
-                .screenshots
-                .actions
-                .lock()
+        runtime.execute_call(observe_call()).await.unwrap();
+        let observation_id = current_observation_id(&runtime);
+        let frame_id = crate::capture::frame_id(
+            &runtime
+                .screenshot_mapping(&observation_id)
                 .unwrap()
-                .is_empty()
+                .unwrap()
+                .source,
+        );
+
+        let error = runtime
+            .execute_call(spatial_call(
+                observation_id,
+                frame_id,
+                ActOperation::Pointer {
+                    action: PointerAction::Move { x: 10.0, y: 10.0 },
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.outcome, ToolOutcome::Completed);
+        assert!(!error.retryable);
+        assert_eq!(
+            error.action_progress.as_ref().unwrap()["post_accessibility"],
+            "accessibility_refresh_failed"
         );
         assert_eq!(
-            failed_focus.state.lock().unwrap().actions,
-            [(id("button"), SemanticAction::GrabFocus)]
+            error.action_progress.as_ref().unwrap()["post_visual"],
+            "not_run"
+        );
+        let wire = serde_json::to_value(crate::runtime::tool_error_result(&error))
+            .expect("serialize MCP tool error");
+        assert_eq!(wire["isError"], true);
+        assert_eq!(wire["structuredContent"]["code"], error.code);
+        assert_eq!(wire["structuredContent"]["outcome"], "completed");
+        assert_eq!(wire["structuredContent"]["retryable"], false);
+        assert!(
+            wire["structuredContent"]["recovery"]
+                .as_str()
+                .unwrap()
+                .contains("Call observe")
+        );
+        assert!(
+            wire["structuredContent"]
+                .get("replacement_observation")
+                .is_none()
+        );
+        assert!(
+            wire["structuredContent"]
+                .get("replacement_observation_id")
+                .is_none()
+        );
+        assert!(
+            wire["structuredContent"]
+                .get("replacement_frame_id")
+                .is_none()
+        );
+        assert!(
+            runtime
+                .lock_cache()
+                .unwrap()
+                .observations
+                .iter()
+                .all(|cached| cached.snapshot.target_ref.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_spatial_action_capture_failed_is_runtime_and_wire_error_without_state() {
+        struct PostCaptureFailingScreenshots {
+            captures: AtomicUsize,
+        }
+
+        impl ScreenshotProvider for PostCaptureFailingScreenshots {
+            async fn prepare(&self) -> Result<(), ScreenshotError> {
+                Ok(())
+            }
+
+            async fn capture<'a>(
+                &'a self,
+                snapshot: &'a Snapshot,
+            ) -> Result<ScreenshotObservation, ScreenshotError> {
+                if self.captures.fetch_add(1, Ordering::AcqRel) == 0 {
+                    return Ok(ScreenshotObservation {
+                        png_base64: "cG5n".into(),
+                        mapping: test_screenshot_mapping(
+                            snapshot,
+                            "/session/post-capture-failure",
+                            None,
+                        ),
+                    });
+                }
+                Err(ScreenshotError("frame encoder failed".into()))
+            }
+
+            async fn perform_input<'a>(
+                &'a self,
+                _snapshot: &'a Snapshot,
+                _mapping: &'a ScreenshotMapping,
+                _action: GeneratedInputAction,
+                progress: Arc<ActionProgress>,
+            ) -> Result<(), InputError> {
+                progress.mark_started();
+                progress.mark_completed();
+                Ok(())
+            }
+        }
+
+        let runtime = SemanticRuntime::with_screenshot_provider(
+            FakeAdapter::tree(),
+            PostCaptureFailingScreenshots {
+                captures: AtomicUsize::new(0),
+            },
+            test_config(),
+        );
+        runtime.execute_call(observe_call()).await.unwrap();
+        let observation_id = current_observation_id(&runtime);
+        let frame_id = crate::capture::frame_id(
+            &runtime
+                .screenshot_mapping(&observation_id)
+                .unwrap()
+                .unwrap()
+                .source,
+        );
+
+        let error = runtime
+            .execute_call(spatial_call(
+                observation_id,
+                frame_id,
+                ActOperation::Pointer {
+                    action: PointerAction::Move { x: 10.0, y: 10.0 },
+                },
+            ))
+            .await
+            .expect_err("missing requested post-action frame must be a tool error");
+
+        assert_eq!(error.code, "post_visual_failed");
+        assert_eq!(error.outcome, ToolOutcome::Completed);
+        assert!(!error.retryable);
+        assert!(error.recovery.contains("do not repeat"));
+        assert_eq!(
+            error.action_progress.as_ref().unwrap()["dispatch_stage"],
+            "completed"
+        );
+        assert_eq!(
+            error.action_progress.as_ref().unwrap()["post_visual"],
+            "capture_failed"
+        );
+        assert_eq!(
+            error.action_progress.as_ref().unwrap()["post_accessibility"],
+            "observed"
+        );
+        let wire = serde_json::to_value(crate::runtime::tool_error_result(&error)).unwrap();
+        assert_eq!(wire["isError"], true);
+        assert_eq!(wire["structuredContent"]["outcome"], "completed");
+        assert_eq!(wire["structuredContent"]["retryable"], false);
+        assert!(
+            wire["structuredContent"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("frame encoder failed")
+        );
+        assert_eq!(
+            wire["structuredContent"]["action_progress"]["post_visual"],
+            "capture_failed"
+        );
+        for forbidden in [
+            "replacement_observation",
+            "replacement_observation_id",
+            "replacement_frame_id",
+            "replacement_element_id",
+            "observation_id",
+            "frame_id",
+            "element_id",
+        ] {
+            assert!(
+                wire["structuredContent"].get(forbidden).is_none(),
+                "{forbidden}"
+            );
+        }
+        assert!(
+            runtime
+                .lock_cache()
+                .unwrap()
+                .observations
+                .iter()
+                .all(|cached| cached.snapshot.target_ref.is_none())
         );
     }
 
     #[tokio::test]
     async fn cleanup_clears_all_screenshot_mappings() {
         let runtime = fake_runtime(FakeAdapter::tree());
-        let snapshot = requested_snapshot(&runtime, ObservationView::Full, None).await;
+        let snapshot = requested_snapshot(&runtime, ObserveView::Both, None).await;
         runtime.lock_cache().unwrap().observations[0].screenshot_mapping =
             Some(test_screenshot_mapping(&snapshot, "/session/cleanup", None));
 
-        DesktopRuntime::cleanup(&runtime).await.unwrap();
+        DesktopRuntime::cleanup(&runtime, None).await.unwrap();
 
         assert!(
             runtime.lock_cache().unwrap().observations[0]
@@ -3252,9 +7084,14 @@ mod tests {
                 _snapshot: &'a Snapshot,
                 _mapping: &'a ScreenshotMapping,
                 _action: GeneratedInputAction,
-            ) -> impl Future<Output = Result<(), String>> + Send + 'a {
+                progress: Arc<ActionProgress>,
+            ) -> impl Future<Output = Result<(), InputError>> + Send + 'a {
                 self.generated.fetch_add(1, Ordering::AcqRel);
-                async { Ok(()) }
+                async move {
+                    progress.mark_started();
+                    progress.mark_completed();
+                    Ok(())
+                }
             }
         }
 
@@ -3269,20 +7106,30 @@ mod tests {
             test_config(),
         ));
         runtime.execute_call(observe_call()).await.unwrap();
-        let initial_state_id = current_state_id(&runtime);
+        let initial_observation_id = current_observation_id(&runtime);
+        let initial_frame_id = crate::capture::frame_id(
+            &runtime
+                .screenshot_mapping(&initial_observation_id)
+                .unwrap()
+                .unwrap()
+                .source,
+        );
         let mutation_runtime = Arc::clone(&runtime);
-        let mutation_state_id = initial_state_id.clone();
+        let mutation_observation_id = initial_observation_id.clone();
         let mutation = tokio::spawn(async move {
             mutation_runtime
-                .execute_call(ToolCall::Pointer {
-                    state_id: mutation_state_id,
-                    action: PointerAction::Click {
-                        x: 10.0,
-                        y: 10.0,
-                        button: MouseButton::Left,
-                        count: 1,
+                .execute_call(spatial_call(
+                    mutation_observation_id,
+                    initial_frame_id,
+                    ActOperation::Pointer {
+                        action: PointerAction::Click {
+                            x: 10.0,
+                            y: 10.0,
+                            button: MouseButton::Left,
+                            count: 1,
+                        },
                     },
-                })
+                ))
                 .await
         });
         runtime.screenshots.entered.notified().await;
@@ -3299,11 +7146,12 @@ mod tests {
         let output = mutation.await.unwrap().unwrap();
         refresh.await.unwrap().unwrap();
         assert_eq!(runtime.screenshots.generated.load(Ordering::Acquire), 1);
-        let returned_state_id = output.structured_content.as_ref().unwrap()["state_id"]
+        let returned_observation_id = output.structured_content.as_ref().unwrap()
+            ["replacement_observation"]["observation_id"]
             .as_str()
             .unwrap();
-        assert_ne!(returned_state_id, initial_state_id);
-        assert_ne!(current_state_id(&runtime), initial_state_id);
+        assert_ne!(returned_observation_id, initial_observation_id);
+        assert_ne!(current_observation_id(&runtime), initial_observation_id);
     }
 
     #[tokio::test]
@@ -3316,28 +7164,70 @@ mod tests {
             },
             test_config(),
         );
-        let output = runtime.execute_call(observe_call()).await.unwrap();
-        assert!(output.png_base64.is_none());
-        assert!(
-            output.text.contains("Screenshot unavailable:"),
-            "{}",
-            output.text
-        );
+        let error = runtime.execute_call(observe_call()).await.unwrap_err();
+        assert_eq!(error.code, "stale_state");
         assert!(
             runtime
-                .screenshot_mapping(&current_state_id(&runtime))
+                .screenshot_mapping(&current_observation_id(&runtime))
                 .unwrap()
                 .is_none()
         );
     }
 
+    #[tokio::test]
+    async fn targeted_visual_observation_rejects_catalog_removal_before_mapping_commit() {
+        let fake = FakeAdapter::tree();
+        let runtime = SemanticRuntime::with_screenshot_provider(
+            fake.clone(),
+            MutatingScreenshots {
+                state: Arc::clone(&fake.state),
+            },
+            test_config(),
+        );
+        let listed = runtime
+            .execute_call(ToolCall::ListDesktop {
+                scope: DesktopScope::Windows,
+                limit: DEFAULT_DESKTOP_PAGE_SIZE,
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        let target_value = listed.structured_content.unwrap()["windows"][0]["target"].clone();
+        let target = TargetRef {
+            app_instance_id: target_value["app_instance_id"].as_str().unwrap().to_owned(),
+            window_instance_id: target_value["window_instance_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        };
+
+        let error = runtime
+            .execute_call(ToolCall::Observe {
+                target,
+                view: ObserveView::Screenshot,
+                accessibility: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "stale_state");
+        assert_eq!(error.outcome, ToolOutcome::NotStarted);
+        assert!(
+            runtime
+                .lock_cache()
+                .unwrap()
+                .observations
+                .iter()
+                .all(|cached| cached.screenshot_mapping.is_none())
+        );
+    }
+
     async fn click(runtime: &SemanticRuntime<FakeAdapter>) -> Result<ToolOutput, RuntimeError> {
         runtime
-            .execute_call(ToolCall::ActOnElement {
-                state_id: current_state_id(runtime),
-                element_id: "1".into(),
-                action: ElementAction::Invoke,
-            })
+            .execute_call(semantic_call(
+                current_observation_id(runtime),
+                current_snapshot(runtime).element_ids[1].clone(),
+                ElementAction::Invoke,
+            ))
             .await
     }
 
@@ -3371,9 +7261,18 @@ mod tests {
             source: crate::capture::FrameMetadata {
                 generation: snapshot.generation,
                 format_generation: 1,
+                source_sequence: Some(snapshot.generation),
+                pts_ns: Some(i64::try_from(snapshot.generation).unwrap_or_default()),
+                arrival_monotonic_ns: snapshot.generation,
                 size: (800, 600),
                 crop,
                 transform: crate::geometry::Transform::Normal,
+                timestamp_authority: crate::capture::TimestampAuthority::SpaHeader,
+                stream_health: crate::capture::StreamHealth::Healthy,
+                content_hash: 0,
+                change_epoch: 0,
+                changed_from_previous: None,
+                sequence_gap: None,
             },
             output_size: (800, 600),
         }
@@ -3395,12 +7294,12 @@ mod tests {
         )
     }
 
-    fn current_state_id<A, S>(runtime: &SemanticRuntime<A, S>) -> String
+    fn current_observation_id<A, S>(runtime: &SemanticRuntime<A, S>) -> String
     where
         A: AccessibilityAdapter,
         S: ScreenshotProvider,
     {
-        snapshot_state_id(&current_snapshot(runtime))
+        observation_id_for_snapshot(&current_snapshot(runtime))
     }
 
     #[derive(Clone)]
@@ -3412,13 +7311,19 @@ mod tests {
         app: AppInfo,
         nodes: HashMap<ObjectId, NodeInfo>,
         actions: Vec<(ObjectId, SemanticAction)>,
+        activation_calls: Vec<ObjectId>,
         discoveries: usize,
         block_reads: bool,
         fail_actions: bool,
         semantic_focus_succeeds: bool,
+        fail_discover: bool,
     }
 
     struct MutatingScreenshots {
+        state: Arc<Mutex<FakeState>>,
+    }
+
+    struct RefreshFailingScreenshots {
         state: Arc<Mutex<FakeState>>,
     }
 
@@ -3426,6 +7331,35 @@ mod tests {
         fn mutate(&self) {
             let mut state = self.state.lock().unwrap();
             state.app.windows[0].object = id("replacement-window");
+        }
+    }
+
+    impl ScreenshotProvider for RefreshFailingScreenshots {
+        async fn prepare(&self) -> Result<(), ScreenshotError> {
+            Ok(())
+        }
+
+        async fn capture<'a>(
+            &'a self,
+            snapshot: &'a Snapshot,
+        ) -> Result<crate::screenshot::ScreenshotObservation, ScreenshotError> {
+            Ok(crate::screenshot::ScreenshotObservation {
+                png_base64: "cG5n".into(),
+                mapping: test_screenshot_mapping(snapshot, "/session/refresh-failure", None),
+            })
+        }
+
+        async fn perform_input<'a>(
+            &'a self,
+            _snapshot: &'a Snapshot,
+            _mapping: &'a ScreenshotMapping,
+            _action: crate::input::GeneratedInputAction,
+            progress: Arc<ActionProgress>,
+        ) -> Result<(), InputError> {
+            self.state.lock().unwrap().fail_discover = true;
+            progress.mark_started();
+            progress.mark_completed();
+            Ok(())
         }
     }
 
@@ -3450,7 +7384,8 @@ mod tests {
             _snapshot: &'a Snapshot,
             _mapping: &'a ScreenshotMapping,
             _action: crate::input::GeneratedInputAction,
-        ) -> Result<(), String> {
+            _progress: Arc<ActionProgress>,
+        ) -> Result<(), InputError> {
             Ok(())
         }
     }
@@ -3517,10 +7452,12 @@ mod tests {
                     app,
                     nodes,
                     actions: Vec::new(),
+                    activation_calls: Vec::new(),
                     discoveries: 0,
                     block_reads: false,
                     fail_actions: false,
                     semantic_focus_succeeds: true,
+                    fail_discover: false,
                 })),
             }
         }
@@ -3530,6 +7467,9 @@ mod tests {
         async fn discover(&self) -> Result<Vec<AppInfo>, RuntimeError> {
             let mut state = self.state.lock().unwrap();
             state.discoveries += 1;
+            if state.fail_discover {
+                return Err(operational_error("fake discovery refresh failure"));
+            }
             Ok(vec![state.app.clone()])
         }
 
@@ -3576,6 +7516,13 @@ mod tests {
             }
             Ok(())
         }
+
+        async fn activate(&self, object: &ObjectId) -> Result<(), RuntimeError> {
+            let mut state = self.state.lock().unwrap();
+            state.activation_calls.push(object.clone());
+            state.app.windows[0].states.insert("active".into());
+            Ok(())
+        }
     }
 
     fn fake_runtime(fake: FakeAdapter) -> SemanticRuntime<FakeAdapter> {
@@ -3584,23 +7531,110 @@ mod tests {
 
     async fn requested_snapshot(
         runtime: &SemanticRuntime<FakeAdapter>,
-        view: ObservationView,
+        view: ObserveView,
         query: Option<String>,
     ) -> Arc<Snapshot> {
-        runtime
-            .requested_snapshot("Editor".into(), view, query, None, None, None)
+        let scope = match (view, query.is_some()) {
+            (ObserveView::Both, _) => AccessibilityScope::Full,
+            (ObserveView::Accessibility, true) => AccessibilityScope::Interactive,
+            (ObserveView::Accessibility, false) => AccessibilityScope::Visible,
+            (ObserveView::Screenshot, _) => AccessibilityScope::Interactive,
+        };
+        runtime.refresh_window_catalog().await.unwrap();
+        let apps = runtime.discover().await.unwrap();
+        let [app] = apps.as_slice() else {
+            panic!("test fixture must expose exactly one application");
+        };
+        let [window] = app.windows.as_slice() else {
+            panic!("test fixture must expose exactly one window");
+        };
+        let binding = AtspiBinding {
+            app: app.clone(),
+            window: window.clone(),
+        };
+        let snapshot = runtime
+            .collect_snapshot(
+                &binding,
+                scope,
+                query,
+                SnapshotLimits {
+                    text: runtime.config.default_text_limit,
+                    nodes: runtime.config.default_max_nodes,
+                    depth: runtime.config.default_max_depth,
+                },
+            )
             .await
-            .unwrap()
+            .unwrap();
+        let mut snapshot = snapshot;
+        snapshot.target_ref = Some(test_target());
+        snapshot.screenshot_requested = matches!(view, ObserveView::Screenshot | ObserveView::Both);
+        runtime.commit_snapshot(snapshot).unwrap()
     }
 
     fn observe_call() -> ToolCall {
         ToolCall::Observe {
-            target: "Editor".into(),
-            view: ObservationView::Full,
-            query: None,
-            text_limit: None,
-            max_tree_nodes: None,
-            max_tree_depth: None,
+            target: test_target(),
+            view: ObserveView::Both,
+            accessibility: Some(AccessibilityRequest {
+                scope: AccessibilityScope::Full,
+                ..AccessibilityRequest::default()
+            }),
+        }
+    }
+
+    fn semantic_call(
+        observation_id: String,
+        element_id: String,
+        action: ElementAction,
+    ) -> ToolCall {
+        ToolCall::Act {
+            target: test_target(),
+            source: ObservationRef {
+                observation_id,
+                frame_id: None,
+            },
+            operation: ActOperation::Semantic { element_id, action },
+        }
+    }
+
+    fn pointer_call(observation_id: String, action: PointerAction) -> ToolCall {
+        spatial_call(
+            observation_id,
+            "frame-0000000000000000".into(),
+            ActOperation::Pointer { action },
+        )
+    }
+
+    fn spatial_call(observation_id: String, frame_id: String, operation: ActOperation) -> ToolCall {
+        ToolCall::Act {
+            target: test_target(),
+            source: ObservationRef {
+                observation_id,
+                frame_id: Some(frame_id),
+            },
+            operation,
+        }
+    }
+
+    fn keyboard_call(
+        observation_id: String,
+        focus: KeyboardPoint,
+        events: Vec<KeyboardEvent>,
+    ) -> ToolCall {
+        ToolCall::Act {
+            target: test_target(),
+            source: ObservationRef {
+                observation_id,
+                frame_id: Some("frame-0000000000000000".into()),
+            },
+            operation: ActOperation::Keyboard { focus, events },
+        }
+    }
+
+    fn test_target() -> TargetRef {
+        TargetRef {
+            app_instance_id: "app-0000000000000000".into(),
+            window_instance_id: "win-0000000000000001".into(),
         }
     }
 
@@ -3608,8 +7642,7 @@ mod tests {
         let mut content = node(&format!("content-{pid}"), "text", "Content");
         content.text = Some(text.into());
         Snapshot {
-            app_query: format!("App {pid}"),
-            view: ObservationView::Full,
+            view: AccessibilityScope::Full,
             element_query: None,
             app: app(&format!("App {pid}"), pid, "Main"),
             window: window("Main", &["active", "showing"]),
@@ -3618,6 +7651,7 @@ mod tests {
                 depth: 0,
                 node: content,
             }],
+            element_ids: Vec::new(),
             node_limit_reached: false,
             depth_limit_reached: false,
             limits: SnapshotLimits {
@@ -3625,6 +7659,11 @@ mod tests {
                 nodes: 1,
                 depth: 1,
             },
+            target_ref: None,
+            accessibility_ready: true,
+            accessibility_reason: None,
+            requires_atspi_revalidation: true,
+            screenshot_requested: true,
         }
     }
 
@@ -3635,13 +7674,6 @@ mod tests {
             settle_interval: Duration::ZERO,
             ..RuntimeConfig::default()
         }
-    }
-
-    fn apps() -> Vec<AppInfo> {
-        vec![
-            app("Editor", 10, "Preferences"),
-            app("Terminal", 20, "Terminal"),
-        ]
     }
 
     fn app(name: &str, pid: u32, title: &str) -> AppInfo {
@@ -3675,6 +7707,7 @@ mod tests {
             name: name.into(),
             value: None,
             text: None,
+            text_truncated: None,
             selected_text: None,
             states: BTreeSet::new(),
             capabilities: inspected(ActionCapabilities::Unsupported),

@@ -22,7 +22,7 @@ use crate::{
     atspi_adapter::AtspiAdapter,
     contract::{SERVER_INSTRUCTIONS, TOOL_NAMES, tool_definitions},
     errors::{CliError, RuntimeError, ToolOutcome},
-    runtime::{DesktopRuntime, tool_error_result},
+    runtime::{ActionProgress, DesktopRuntime, tool_error_result, with_action_progress},
     screenshot::ProductionScreenshotCoordinator,
     validation::validate_call,
 };
@@ -63,15 +63,9 @@ impl<R: DesktopRuntime> ServerHandler for ComputerUseMcpServer<R> {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        context: RequestContext<RoleServer>,
+        _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let mut tools = tool_definitions();
-        if !supports_structured_content(&context) {
-            for tool in &mut tools {
-                tool.output_schema = None;
-            }
-        }
-        Ok(ListToolsResult::with_all_items(tools))
+        Ok(ListToolsResult::with_all_items(tool_definitions()))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
@@ -99,13 +93,16 @@ impl<R: DesktopRuntime> ServerHandler for ComputerUseMcpServer<R> {
                 return Ok(for_protocol(tool_error_result(&error), structured));
             }
         };
-        if call.waits_for_desktop_session() {
+        let progress = call
+            .tracks_action()
+            .then(|| Arc::new(ActionProgress::default()));
+        if call.requires_visual_session() {
             tokio::select! {
                 () = self.runtime.wait_for_desktop_session() => {}
                 () = context.ct.cancelled() => {
                     eprintln!("computer-use-mcp: tool call cancelled while waiting for desktop session initialization");
                     return Ok(for_protocol(
-                        tool_error_result(&cancelled_before_execution()),
+                        tool_error_result(&cancelled_error(progress.as_ref(), "tool call cancelled before execution")),
                         structured,
                     ));
                 }
@@ -115,7 +112,13 @@ impl<R: DesktopRuntime> ServerHandler for ComputerUseMcpServer<R> {
             guard = self.execution_barrier.lock() => guard,
             () = context.ct.cancelled() => {
                 eprintln!("computer-use-mcp: queued tool call cancelled before execution");
-                return Ok(for_protocol(tool_error_result(&cancelled_before_execution()), structured));
+                return Ok(for_protocol(
+                    tool_error_result(&cancelled_error(
+                        progress.as_ref(),
+                        "tool call cancelled before execution",
+                    )),
+                    structured,
+                ));
             }
         };
         let result = if self.unavailable.load(Ordering::Acquire) {
@@ -128,10 +131,13 @@ impl<R: DesktopRuntime> ServerHandler for ComputerUseMcpServer<R> {
             ))
         } else if context.ct.is_cancelled() {
             eprintln!("computer-use-mcp: queued tool call cancelled before execution");
-            tool_error_result(&cancelled_before_execution())
+            tool_error_result(&cancelled_error(
+                progress.as_ref(),
+                "tool call cancelled before execution",
+            ))
         } else {
             tokio::select! {
-                result = self.runtime.execute(call) => match result {
+                result = self.runtime.execute(call, progress.clone()) => match result {
                     Ok(output) => output.into_mcp_result(),
                     Err(error) => {
                         eprintln!("computer-use-mcp: {error}");
@@ -140,7 +146,7 @@ impl<R: DesktopRuntime> ServerHandler for ComputerUseMcpServer<R> {
                 },
                 () = context.ct.cancelled() => {
                     eprintln!("computer-use-mcp: tool call cancelled");
-                    match tokio::time::timeout(Duration::from_secs(2), self.runtime.cleanup()).await {
+                         match tokio::time::timeout(Duration::from_secs(2), self.runtime.cleanup(progress.clone())).await {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => {
                             eprintln!("computer-use-mcp: cancellation cleanup failed: {error}; shutting down the desktop session");
@@ -153,12 +159,9 @@ impl<R: DesktopRuntime> ServerHandler for ComputerUseMcpServer<R> {
                             shutdown_after_cleanup_failure(self.runtime.as_ref()).await;
                         }
                     }
-                    let error = RuntimeError::new(
-                        "cancelled",
+                    let error = cancelled_error(
+                        progress.as_ref(),
                         "tool call cancelled while execution was active",
-                        ToolOutcome::Unknown,
-                        false,
-                        "Call observe and inspect current state before deciding whether another action is needed.",
                     );
                     tool_error_result(&error)
                 }
@@ -176,13 +179,31 @@ async fn shutdown_after_cleanup_failure<R: DesktopRuntime>(runtime: &R) {
     }
 }
 
-fn cancelled_before_execution() -> RuntimeError {
-    RuntimeError::new(
-        "cancelled",
-        "tool call cancelled before execution",
-        ToolOutcome::NotStarted,
-        true,
-        "Retry the call if it is still needed.",
+fn cancelled_error(progress: Option<&Arc<ActionProgress>>, message: &str) -> RuntimeError {
+    let Some(progress) = progress else {
+        return RuntimeError::new(
+            "cancelled",
+            message,
+            ToolOutcome::NotStarted,
+            true,
+            "Retry the call if it is still needed.",
+        );
+    };
+    let outcome = progress.snapshot().outcome();
+    let (retryable, recovery) = match outcome {
+        ToolOutcome::NotStarted => (true, "Retry the call if it is still needed."),
+        ToolOutcome::Unknown => (
+            false,
+            "Input dispatch may have happened. Call observe and do not retry blindly.",
+        ),
+        ToolOutcome::Completed => (
+            false,
+            "Input dispatch completed. Call observe before deciding whether another action is needed.",
+        ),
+    };
+    with_action_progress(
+        RuntimeError::new("cancelled", message, outcome, retryable, recovery),
+        progress,
     )
 }
 

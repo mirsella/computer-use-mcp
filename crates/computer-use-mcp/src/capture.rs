@@ -46,12 +46,57 @@ pub struct OwnedFrame {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimestampAuthority {
+    SpaHeader,
+    Unavailable,
+}
+
+impl TimestampAuthority {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SpaHeader => "spa_header",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamHealth {
+    Healthy,
+    Degraded,
+    Failed,
+}
+
+impl StreamHealth {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Degraded => "degraded",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameMetadata {
+    /// Local arrival counter. This is never an authority claim about the
+    /// compositor or source sequence.
     pub generation: u64,
     pub format_generation: u64,
+    pub source_sequence: Option<u64>,
+    pub pts_ns: Option<i64>,
+    pub arrival_monotonic_ns: u64,
     pub size: (u32, u32),
     pub crop: PixelRect,
     pub transform: Transform,
+    pub timestamp_authority: TimestampAuthority,
+    pub stream_health: StreamHealth,
+    pub content_hash: u64,
+    /// Monotonic content-change epoch, retained even when a later frame
+    /// returns to an earlier hash so transient changes cannot be missed.
+    pub change_epoch: u64,
+    pub changed_from_previous: Option<bool>,
+    pub sequence_gap: Option<u64>,
 }
 
 pub trait CaptureBackend: Send + Sync + 'static {
@@ -63,6 +108,10 @@ pub type CaptureFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> +
 pub trait CaptureSession: Send + 'static {
     fn wait_ready(&mut self) -> CaptureFuture<'_, ()>;
     fn failure(&self) -> Option<String>;
+    /// Return the newest complete frame metadata already committed by the
+    /// capture thread. This is a non-waiting health/format check; input
+    /// preparation must never depend on a frame newer than its source frame.
+    fn current_metadata(&self) -> Result<Option<FrameMetadata>, String>;
     fn latest_after(
         &mut self,
         after_generation: Option<u64>,
@@ -82,6 +131,7 @@ impl CaptureBackend for PipeWireCapture {
 pub struct CaptureHandle {
     receiver: watch::Receiver<Option<OwnedFrame>>,
     status: watch::Receiver<Option<Result<(), String>>>,
+    failure: Arc<Mutex<Option<String>>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     thread_done: std::sync::mpsc::Receiver<()>,
@@ -99,13 +149,15 @@ impl CaptureHandle {
     fn spawn(fd: OwnedFd, target: CaptureTarget) -> Result<Self, String> {
         let (sender, receiver) = watch::channel(None);
         let (status_sender, status) = watch::channel(None);
+        let failure = Arc::new(Mutex::new(None));
+        let thread_failure = Arc::clone(&failure);
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let (done_sender, thread_done) = std::sync::mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("computer-use-mcp-pipewire".into())
             .spawn(move || {
-                let result = run_pipewire(fd, target, sender, &thread_stop);
+                let result = run_pipewire(fd, target, sender, thread_failure, &thread_stop);
                 if let Err(error) = &result {
                     eprintln!("computer-use-mcp: PipeWire capture stopped: {error}");
                 }
@@ -116,6 +168,7 @@ impl CaptureHandle {
         Ok(Self {
             receiver,
             status,
+            failure,
             stop,
             thread: Some(thread),
             thread_done,
@@ -146,6 +199,11 @@ impl CaptureSession for CaptureHandle {
     }
 
     fn failure(&self) -> Option<String> {
+        match self.failure.lock() {
+            Ok(failure) if failure.is_some() => return failure.clone(),
+            Err(_) => return Some("PipeWire failure state mutex poisoned".into()),
+            Ok(_) => {}
+        }
         match self.status.borrow().as_ref() {
             Some(Err(error)) => Some(error.clone()),
             _ if self.status.has_changed().is_err() => {
@@ -153,6 +211,13 @@ impl CaptureSession for CaptureHandle {
             }
             _ => None,
         }
+    }
+
+    fn current_metadata(&self) -> Result<Option<FrameMetadata>, String> {
+        if let Some(error) = self.failure() {
+            return Err(error);
+        }
+        Ok(self.receiver.borrow().as_ref().map(|frame| frame.metadata))
     }
 
     fn latest_after(
@@ -219,6 +284,9 @@ struct StreamUserData {
     generation: u64,
     format_generation: u64,
     format: Option<RawFormat>,
+    last_source_sequence: Option<u64>,
+    last_content_hash: Option<u64>,
+    change_epoch: u64,
     sender: watch::Sender<Option<OwnedFrame>>,
     failure: Arc<Mutex<Option<String>>>,
 }
@@ -234,6 +302,7 @@ fn run_pipewire(
     fd: OwnedFd,
     target: CaptureTarget,
     sender: watch::Sender<Option<OwnedFrame>>,
+    failure: Arc<Mutex<Option<String>>>,
     stop: &AtomicBool,
 ) -> Result<(), String> {
     pw::init();
@@ -242,8 +311,6 @@ fn run_pipewire(
     let core = context
         .connect_fd_rc(fd, None)
         .map_err(|error| format!("cannot open the portal-restricted PipeWire remote: {error}"))?;
-    let failure = Arc::new(Mutex::new(None));
-
     let mut props = properties! {
         *pw::keys::MEDIA_TYPE => "Video",
         *pw::keys::MEDIA_CATEGORY => "Capture",
@@ -263,6 +330,9 @@ fn run_pipewire(
         generation: 0,
         format_generation: 0,
         format: None,
+        last_source_sequence: None,
+        last_content_hash: None,
+        change_epoch: 0,
         sender,
         failure: Arc::clone(&failure),
     };
@@ -348,7 +418,7 @@ fn run_pipewire(
         if dispatched < 0 {
             return Err(format!("PipeWire loop iteration failed with {dispatched}"));
         }
-        if let Some(error) = take_failure(&failure) {
+        if let Some(error) = capture_failure(&failure) {
             return Err(error);
         }
     }
@@ -385,12 +455,18 @@ fn begin_format(data: &mut StreamUserData) -> Result<(), String> {
         )
     })?;
     data.format = None;
+    data.last_source_sequence = None;
+    data.last_content_hash = None;
+    // Keep change_epoch monotonic across format generations. Stability waits
+    // bind both epochs, so renegotiation is independently observable.
     data.sender.send_replace(None);
     Ok(())
 }
 
 fn invalidate_format(data: &mut StreamUserData) {
     data.format = None;
+    data.last_source_sequence = None;
+    data.last_content_hash = None;
     data.sender.send_replace(None);
 }
 
@@ -405,9 +481,9 @@ fn report_failure(failure: &Mutex<Option<String>>, error: String) {
     }
 }
 
-fn take_failure(failure: &Mutex<Option<String>>) -> Option<String> {
+fn capture_failure(failure: &Mutex<Option<String>>) -> Option<String> {
     match failure.lock() {
-        Ok(mut failure) => failure.take(),
+        Ok(failure) => failure.clone(),
         Err(_) => Some("PipeWire failure state mutex poisoned".into()),
     }
 }
@@ -687,6 +763,33 @@ fn process_frame(stream: &pw::stream::Stream, user_data: &mut StreamUserData) {
             return;
         }
     };
+    let header = buffer.find_meta::<MetaHeader>();
+    let source_sequence = header.map(MetaHeader::seq);
+    let pts_ns = header.map(MetaHeader::pts).filter(|pts| *pts >= 0);
+    let sequence_gap = source_sequence.and_then(|sequence| {
+        user_data.last_source_sequence.and_then(|previous| {
+            (sequence > previous.saturating_add(1)).then_some(sequence - previous - 1)
+        })
+    });
+    let discontinuity = header
+        .is_some_and(|header| header.flags().contains(MetaHeaderFlags::DISCONT))
+        || sequence_gap.is_some();
+    let content_hash = hash_rgba(&rgba);
+    let changed_from_previous = user_data
+        .last_content_hash
+        .map(|previous| previous != content_hash || discontinuity);
+    if changed_from_previous == Some(true) {
+        user_data.change_epoch = match user_data.change_epoch.checked_add(1) {
+            Some(epoch) => epoch,
+            None => {
+                eprintln!(
+                    "computer-use-mcp: frame change epoch overflow for stream {}",
+                    user_data.stream_index
+                );
+                return;
+            }
+        };
+    }
     user_data.generation = match user_data.generation.checked_add(1) {
         Some(generation) => generation,
         None => {
@@ -697,16 +800,58 @@ fn process_frame(stream: &pw::stream::Stream, user_data: &mut StreamUserData) {
             return;
         }
     };
+    user_data.last_source_sequence = source_sequence;
+    user_data.last_content_hash = Some(content_hash);
+    let stream_health = if discontinuity {
+        StreamHealth::Degraded
+    } else {
+        StreamHealth::Healthy
+    };
     user_data.sender.send_replace(Some(OwnedFrame {
         metadata: FrameMetadata {
             generation: user_data.generation,
             format_generation: user_data.format_generation,
+            source_sequence,
+            pts_ns,
+            arrival_monotonic_ns: monotonic_nanoseconds(),
             size: (format.width, format.height),
             crop,
             transform,
+            timestamp_authority: if header.is_some() {
+                TimestampAuthority::SpaHeader
+            } else {
+                TimestampAuthority::Unavailable
+            },
+            stream_health,
+            content_hash,
+            change_epoch: user_data.change_epoch,
+            changed_from_previous,
+            sequence_gap,
         },
         rgba,
     }));
+}
+
+fn monotonic_nanoseconds() -> u64 {
+    let time = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    let seconds = u64::try_from(time.tv_sec).unwrap_or_default();
+    let nanos = u64::try_from(time.tv_nsec).unwrap_or_default();
+    seconds.saturating_mul(1_000_000_000).saturating_add(nanos)
+}
+
+/// Deterministic non-cryptographic change evidence. This is not an identity or
+/// security digest.
+fn hash_rgba(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+pub fn frame_id(metadata: &FrameMetadata) -> String {
+    format!("frame-{:016x}", metadata.generation)
 }
 
 fn header_is_usable(flags: Option<MetaHeaderFlags>) -> bool {
@@ -858,6 +1003,28 @@ fn pw_error(error: impl std::fmt::Display) -> String {
 mod tests {
     use super::*;
     use pw::spa::pod::deserialize::PodDeserializer;
+
+    #[test]
+    fn change_epoch_survives_format_renegotiation() {
+        let (sender, _receiver) = watch::channel(None);
+        let mut data = StreamUserData {
+            stream_index: 0,
+            generation: 5,
+            format_generation: 2,
+            format: None,
+            last_source_sequence: Some(8),
+            last_content_hash: Some(9),
+            change_epoch: 7,
+            sender,
+            failure: Arc::new(Mutex::new(None)),
+        };
+
+        begin_format(&mut data).unwrap();
+        assert_eq!(data.format_generation, 3);
+        assert_eq!(data.change_epoch, 7);
+        invalidate_format(&mut data);
+        assert_eq!(data.change_epoch, 7);
+    }
 
     #[test]
     fn converts_formats_stride_offset_padding_and_negative_stride() {
@@ -1044,6 +1211,16 @@ mod tests {
     }
 
     #[test]
+    fn frame_id_uses_local_generation_without_source_headers() {
+        let mut metadata = frame(42, 1, (1, 1), 0).metadata;
+        metadata.source_sequence = None;
+        metadata.pts_ns = None;
+        metadata.timestamp_authority = TimestampAuthority::Unavailable;
+
+        assert_eq!(frame_id(&metadata), "frame-000000000000002a");
+    }
+
+    #[test]
     fn stream_errors_disconnects_and_node_loss_are_capture_failures() {
         assert!(
             stream_state_failure(
@@ -1096,6 +1273,9 @@ mod tests {
             metadata: FrameMetadata {
                 generation,
                 format_generation,
+                source_sequence: Some(generation),
+                pts_ns: Some(i64::try_from(generation).unwrap_or_default()),
+                arrival_monotonic_ns: generation,
                 size,
                 crop: PixelRect {
                     x: 0,
@@ -1104,6 +1284,12 @@ mod tests {
                     height: size.1,
                 },
                 transform: Transform::Normal,
+                timestamp_authority: TimestampAuthority::SpaHeader,
+                stream_health: StreamHealth::Healthy,
+                content_hash: hash_rgba(&vec![value; (size.0 * size.1 * 4) as usize]),
+                change_epoch: 0,
+                changed_from_previous: None,
+                sequence_gap: None,
             },
             rgba: vec![value; (size.0 * size.1 * 4) as usize],
         }
@@ -1117,6 +1303,7 @@ mod tests {
         let mut handle = CaptureHandle {
             receiver: frame_receiver,
             status,
+            failure: Arc::new(Mutex::new(None)),
             stop: Arc::new(AtomicBool::new(false)),
             thread: None,
             thread_done,
@@ -1152,6 +1339,9 @@ mod tests {
                 width: 1,
                 height: 1,
             }),
+            last_source_sequence: None,
+            last_content_hash: None,
+            change_epoch: 0,
             sender: sender.clone(),
             failure,
         };
@@ -1164,6 +1354,7 @@ mod tests {
         let mut handle = CaptureHandle {
             receiver,
             status,
+            failure: Arc::new(Mutex::new(None)),
             stop: Arc::new(AtomicBool::new(false)),
             thread: None,
             thread_done,
@@ -1197,6 +1388,9 @@ mod tests {
             generation: 1,
             format_generation: 1,
             format: Some(format),
+            last_source_sequence: None,
+            last_content_hash: None,
+            change_epoch: 0,
             sender,
             failure: Arc::new(Mutex::new(None)),
         };

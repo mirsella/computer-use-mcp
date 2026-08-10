@@ -8,8 +8,6 @@ fn cli_help_version_and_errors_are_truthful() {
     assert!(help.status.success());
     let help_text = text(&help.stdout);
     assert!(help_text.contains("Computer Use MCP for Linux Wayland"));
-    assert!(help_text.contains("list-apps"));
-    assert!(help_text.contains("snapshot APP"));
     assert!(help_text.contains("init"));
     assert!(help_text.contains("call FILE"));
     let version = run(&["version"]);
@@ -20,9 +18,9 @@ fn cli_help_version_and_errors_are_truthful() {
     assert!(!unknown.status.success());
     assert!(text(&unknown.stderr).contains("unknown command"));
 
-    let missing_app = run(&["snapshot"]);
-    assert!(!missing_app.status.success());
-    assert!(text(&missing_app.stderr).contains("requires exactly one"));
+    let missing_file = run(&["call"]);
+    assert!(!missing_file.status.success());
+    assert!(text(&missing_file.stderr).contains("requires exactly one"));
 }
 
 fn run(arguments: &[&str]) -> Output {

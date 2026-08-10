@@ -22,6 +22,10 @@ rmcp.workspace = true
 rustix.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+wayland-client.workspace = true
+wayland-backend.workspace = true
+wayland-protocols.workspace = true
+wayland-protocols-plasma.workspace = true
 xkbcommon.workspace = true
 zbus.workspace = true
 

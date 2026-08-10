@@ -38,6 +38,7 @@ impl DesktopRuntime for QueuedRuntime {
     fn execute(
         &self,
         _call: ToolCall,
+        _progress: Option<Arc<computer_use_mcp::runtime::ActionProgress>>,
     ) -> impl future::Future<Output = Result<ToolOutput, RuntimeError>> + Send + '_ {
         let first = self.calls.fetch_add(1, Ordering::AcqRel) == 0;
         async move {
@@ -48,7 +49,10 @@ impl DesktopRuntime for QueuedRuntime {
         }
     }
 
-    async fn cleanup(&self) -> Result<(), RuntimeError> {
+    async fn cleanup(
+        &self,
+        _progress: Option<Arc<computer_use_mcp::runtime::ActionProgress>>,
+    ) -> Result<(), RuntimeError> {
         Ok(())
     }
 }
@@ -57,6 +61,7 @@ impl DesktopRuntime for BlockingRuntime {
     fn execute(
         &self,
         _call: ToolCall,
+        _progress: Option<Arc<computer_use_mcp::runtime::ActionProgress>>,
     ) -> impl future::Future<Output = Result<ToolOutput, RuntimeError>> + Send + '_ {
         let first = self.calls.fetch_add(1, Ordering::AcqRel) == 0;
         let clean = self.cleanup_complete.load(Ordering::Acquire);
@@ -75,7 +80,10 @@ impl DesktopRuntime for BlockingRuntime {
         }
     }
 
-    async fn cleanup(&self) -> Result<(), RuntimeError> {
+    async fn cleanup(
+        &self,
+        _progress: Option<Arc<computer_use_mcp::runtime::ActionProgress>>,
+    ) -> Result<(), RuntimeError> {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         self.cleanup_complete.store(true, Ordering::Release);
         Ok(())
@@ -86,6 +94,7 @@ impl DesktopRuntime for CleanupFailureRuntime {
     fn execute(
         &self,
         _call: ToolCall,
+        _progress: Option<Arc<computer_use_mcp::runtime::ActionProgress>>,
     ) -> impl future::Future<Output = Result<ToolOutput, RuntimeError>> + Send + '_ {
         let first = self.calls.fetch_add(1, Ordering::AcqRel) == 0;
         async move {
@@ -102,7 +111,10 @@ impl DesktopRuntime for CleanupFailureRuntime {
         }
     }
 
-    async fn cleanup(&self) -> Result<(), RuntimeError> {
+    async fn cleanup(
+        &self,
+        _progress: Option<Arc<computer_use_mcp::runtime::ActionProgress>>,
+    ) -> Result<(), RuntimeError> {
         Err(RuntimeError::not_started(
             "cleanup_failed",
             "planned cleanup failure",
@@ -117,40 +129,13 @@ impl DesktopRuntime for CleanupFailureRuntime {
 
 #[tokio::test]
 async fn cancelled_runtime_call_emits_no_response_and_server_continues() {
-    let (server_transport, client_transport) = tokio::io::duplex(4096);
     let cleanup_complete = Arc::new(AtomicBool::new(false));
-    let server_cleanup = Arc::clone(&cleanup_complete);
     let calls = Arc::new(AtomicUsize::new(0));
-    let server_calls = Arc::clone(&calls);
-    let server = tokio::spawn(async move {
-        let service = ComputerUseMcpServer::new(Arc::new(BlockingRuntime {
-            calls: server_calls,
-            cleanup_complete: server_cleanup,
-        }))
-        .serve(server_transport)
-        .await
-        .expect("initialize server");
-        service.waiting().await.expect("wait for server");
-    });
-    let mut client = IntoTransport::<RoleClient, _, _>::into_transport(client_transport);
-
-    client
-        .send(message(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-03-26",
-                "capabilities": {},
-                "clientInfo": {"name": "cancellation-test", "version": "0.0.0"},
-            },
-        })))
-        .await
-        .expect("send initialize");
-    assert_eq!(
-        response_id(client.receive().await.expect("initialize response")),
-        Some(1)
-    );
+    let (mut client, server) = start_server(BlockingRuntime {
+        calls: Arc::clone(&calls),
+        cleanup_complete: Arc::clone(&cleanup_complete),
+    })
+    .await;
 
     for payload in [
         json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
@@ -158,7 +143,7 @@ async fn cancelled_runtime_call_emits_no_response_and_server_continues() {
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/call",
-            "params": {"name": "keyboard", "arguments": keyboard_arguments()},
+            "params": {"name": "list_desktop", "arguments": {"scope": "windows"}},
         }),
     ] {
         client.send(message(payload)).await.expect("send message");
@@ -181,7 +166,7 @@ async fn cancelled_runtime_call_emits_no_response_and_server_continues() {
             "jsonrpc": "2.0",
             "id": 3,
             "method": "tools/call",
-            "params": {"name": "keyboard", "arguments": keyboard_arguments()},
+            "params": {"name": "list_desktop", "arguments": {"scope": "windows"}},
         }),
     ] {
         client.send(message(payload)).await.expect("send message");
@@ -196,37 +181,13 @@ async fn cancelled_runtime_call_emits_no_response_and_server_continues() {
 
 #[tokio::test]
 async fn failed_cancellation_cleanup_forces_shutdown_before_next_call() {
-    let (server_transport, client_transport) = tokio::io::duplex(4096);
     let calls = Arc::new(AtomicUsize::new(0));
     let shutdowns = Arc::new(AtomicUsize::new(0));
-    let server_calls = Arc::clone(&calls);
-    let server_shutdowns = Arc::clone(&shutdowns);
-    let server = tokio::spawn(async move {
-        let service = ComputerUseMcpServer::new(Arc::new(CleanupFailureRuntime {
-            calls: server_calls,
-            shutdowns: server_shutdowns,
-        }))
-        .serve(server_transport)
-        .await
-        .expect("initialize server");
-        service.waiting().await.expect("wait for server");
-    });
-    let mut client = IntoTransport::<RoleClient, _, _>::into_transport(client_transport);
-
-    client
-        .send(message(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-03-26",
-                "capabilities": {},
-                "clientInfo": {"name": "cleanup-failure-test", "version": "0.0.0"},
-            },
-        })))
-        .await
-        .unwrap();
-    assert_eq!(response_id(client.receive().await.unwrap()), Some(1));
+    let (mut client, server) = start_server(CleanupFailureRuntime {
+        calls: Arc::clone(&calls),
+        shutdowns: Arc::clone(&shutdowns),
+    })
+    .await;
     for payload in [
         json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
         tool_call(2),
@@ -263,37 +224,13 @@ async fn failed_cancellation_cleanup_forces_shutdown_before_next_call() {
 
 #[tokio::test]
 async fn read_only_call_cancelled_while_queued_never_executes() {
-    let (server_transport, client_transport) = tokio::io::duplex(4096);
     let calls = Arc::new(AtomicUsize::new(0));
     let release_first = Arc::new(tokio::sync::Notify::new());
-    let server_calls = Arc::clone(&calls);
-    let server_release = Arc::clone(&release_first);
-    let server = tokio::spawn(async move {
-        let service = ComputerUseMcpServer::new(Arc::new(QueuedRuntime {
-            calls: server_calls,
-            release_first: server_release,
-        }))
-        .serve(server_transport)
-        .await
-        .expect("initialize server");
-        service.waiting().await.expect("wait for server");
-    });
-    let mut client = IntoTransport::<RoleClient, _, _>::into_transport(client_transport);
-
-    client
-        .send(message(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-03-26",
-                "capabilities": {},
-                "clientInfo": {"name": "queued-cancellation-test", "version": "0.0.0"},
-            },
-        })))
-        .await
-        .unwrap();
-    assert_eq!(response_id(client.receive().await.unwrap()), Some(1));
+    let (mut client, server) = start_server(QueuedRuntime {
+        calls: Arc::clone(&calls),
+        release_first: Arc::clone(&release_first),
+    })
+    .await;
     for payload in [
         json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
         tool_call(2),
@@ -308,7 +245,7 @@ async fn read_only_call_cancelled_while_queued_never_executes() {
     .await
     .expect("first mutation should start");
 
-    client.send(message(list_call(3))).await.unwrap();
+    client.send(message(tool_call(3))).await.unwrap();
     client
         .send(message(json!({
             "jsonrpc": "2.0",
@@ -332,25 +269,40 @@ fn tool_call(id: u64) -> Value {
         "jsonrpc": "2.0",
         "id": id,
         "method": "tools/call",
-        "params": {"name": "keyboard", "arguments": keyboard_arguments()},
+        "params": {"name": "list_desktop", "arguments": {"scope": "windows"}},
     })
 }
 
-fn list_call(id: u64) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": "tools/call",
-        "params": {"name": "list_applications", "arguments": {"scope": "running"}},
-    })
-}
-
-fn keyboard_arguments() -> Value {
-    json!({
-        "state_id": "s-0000000000000000",
-        "focus": {"x": 10, "y": 20},
-        "action": {"type": "press", "key": "Return"},
-    })
+async fn start_server<R: DesktopRuntime + 'static>(
+    runtime: R,
+) -> (impl Transport<RoleClient>, tokio::task::JoinHandle<()>) {
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    let server = tokio::spawn(async move {
+        let service = ComputerUseMcpServer::new(Arc::new(runtime))
+            .serve(server_transport)
+            .await
+            .expect("initialize server");
+        service.waiting().await.expect("wait for server");
+    });
+    let mut client = IntoTransport::<RoleClient, _, _>::into_transport(client_transport);
+    client
+        .send(message(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "cancellation-test", "version": "0.0.0"},
+            },
+        })))
+        .await
+        .expect("send initialize");
+    assert_eq!(
+        response_id(client.receive().await.expect("initialize response")),
+        Some(1)
+    );
+    (client, server)
 }
 
 fn message(value: Value) -> ClientJsonRpcMessage {

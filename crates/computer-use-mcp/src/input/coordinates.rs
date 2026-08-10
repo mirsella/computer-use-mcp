@@ -1,5 +1,6 @@
 use crate::{
     accessibility::Snapshot,
+    capture::StreamHealth,
     portal::{PortalSessionLease, PortalStream},
     screenshot::ScreenshotMapping,
 };
@@ -157,6 +158,9 @@ fn validate_mapping(
     if mapping.output_size.0 == 0 || mapping.output_size.1 == 0 {
         return Err("screenshot mapping has invalid output bounds".into());
     }
+    if mapping.source.stream_health != StreamHealth::Healthy {
+        return Err("screenshot mapping stream health is not healthy".into());
+    }
     if stream != &mapping.stream {
         return Err("live portal stream metadata changed".into());
     }
@@ -170,7 +174,7 @@ mod tests {
     use super::*;
     use crate::{
         accessibility::{AppInfo, ObjectId, Snapshot, SnapshotLimits, WindowInfo},
-        capture::FrameMetadata,
+        capture::{FrameMetadata, StreamHealth},
         geometry::{PixelRect, Transform},
     };
 
@@ -180,8 +184,7 @@ mod tests {
             path: "/window".into(),
         };
         let snapshot = Snapshot {
-            app_query: "App".into(),
-            view: crate::validation::ObservationView::Full,
+            view: crate::validation::AccessibilityScope::Full,
             element_query: None,
             app: AppInfo {
                 object: ObjectId {
@@ -199,6 +202,7 @@ mod tests {
             },
             generation: 7,
             elements: Vec::new(),
+            element_ids: Vec::new(),
             node_limit_reached: false,
             depth_limit_reached: false,
             limits: SnapshotLimits {
@@ -206,6 +210,11 @@ mod tests {
                 nodes: 20,
                 depth: 5,
             },
+            target_ref: None,
+            accessibility_ready: true,
+            accessibility_reason: None,
+            requires_atspi_revalidation: true,
+            screenshot_requested: true,
         };
         let mapping = ScreenshotMapping {
             app_pid: 9,
@@ -226,6 +235,9 @@ mod tests {
             source: FrameMetadata {
                 generation: 8,
                 format_generation: 1,
+                source_sequence: Some(8),
+                pts_ns: Some(8),
+                arrival_monotonic_ns: 8,
                 size: (600, 450),
                 crop: PixelRect {
                     x: 0,
@@ -234,6 +246,12 @@ mod tests {
                     height: 450,
                 },
                 transform: Transform::Normal,
+                timestamp_authority: crate::capture::TimestampAuthority::SpaHeader,
+                stream_health: crate::capture::StreamHealth::Healthy,
+                content_hash: 0,
+                change_epoch: 0,
+                changed_from_previous: None,
+                sequence_gap: None,
             },
             output_size: (600, 450),
         };
@@ -305,6 +323,13 @@ mod tests {
                 .unwrap_err()
                 .contains("changed")
         );
+        let mut unhealthy = mapping.clone();
+        unhealthy.source.stream_health = StreamHealth::Degraded;
+        assert!(
+            map_png_point(&snapshot, &unhealthy, &session, &stream, 1.0, 1.0)
+                .unwrap_err()
+                .contains("health")
+        );
         closed.send_replace(true);
         assert!(
             map_png_point(&snapshot, &mapping, &session, &stream, 1.0, 1.0)
@@ -332,17 +357,11 @@ mod tests {
         let (_, mut mapping, _) = fixture();
         mapping.stream.mapping_id = None;
         mapping.stream.position = None;
-        assert!(
-            EisRoute::from_stream(&mapping.stream)
-                .unwrap_err()
-                .contains("omitted mapping_id and position")
-        );
+        let error = EisRoute::from_stream(&mapping.stream).unwrap_err();
+        assert!(error.contains("omitted mapping_id and position"));
 
         mapping.stream.position = Some((-1, 0));
-        assert!(
-            EisRoute::from_stream(&mapping.stream)
-                .unwrap_err()
-                .contains("negative position")
-        );
+        let error = EisRoute::from_stream(&mapping.stream).unwrap_err();
+        assert!(error.contains("negative position"));
     }
 }

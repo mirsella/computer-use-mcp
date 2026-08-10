@@ -13,5 +13,7 @@ pub mod runtime;
 pub mod screenshot;
 pub mod server;
 pub mod validation;
+pub mod wayland_catalog;
+pub mod window_backend;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

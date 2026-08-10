@@ -26,6 +26,7 @@ use super::{
 };
 
 const READY_TIMEOUT: Duration = Duration::from_secs(3);
+const SYNC_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedKey {
@@ -703,7 +704,7 @@ impl ReisInputBackend {
                 response,
             })
             .map_err(|_| "EIS event thread is unavailable for synchronization".to_owned())?;
-        tokio::time::timeout(Duration::from_secs(1), result)
+        tokio::time::timeout(SYNC_TIMEOUT, result)
             .await
             .map_err(|_| "timed out synchronizing the EIS transaction".to_owned())?
             .map_err(|_| "EIS synchronization callback was dropped".to_owned())?
@@ -734,6 +735,13 @@ impl InputBackend for ReisInputBackend {
         Box::pin(async move {
             let _serial = self.serial.lock().await;
             self.emit_inner(event)
+        })
+    }
+
+    fn sync_barrier(&self) -> InputFuture<'_> {
+        Box::pin(async move {
+            let _serial = self.serial.lock().await;
+            self.synchronize(None).await
         })
     }
 

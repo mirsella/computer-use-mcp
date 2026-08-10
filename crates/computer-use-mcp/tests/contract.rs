@@ -1,17 +1,107 @@
-use std::collections::BTreeSet;
-
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use computer_use_mcp::{
+    accessibility::{MAX_MODEL_STRUCTURED_BYTES, MAX_MODEL_TEXT_BYTES},
     contract::{TOOL_NAMES, tool_definitions},
+    encoder::MAX_PNG_BYTES,
+    input::keyboard::parse_chord,
     runtime::ToolOutput,
 };
+use rmcp::model::{ListToolsResult, NumberOrString, ServerJsonRpcMessage, ServerResult};
 use serde_json::{Value, json};
 
-#[test]
-fn tools_have_exact_order_and_schemas() {
-    let tools = tool_definitions();
-    let names: Vec<_> = tools.iter().map(|tool| tool.name.as_ref()).collect();
-    assert_eq!(names, TOOL_NAMES);
+const PACKAGED_SKILL: &str = include_str!("../guidance/skill.md");
 
+#[test]
+fn tools_list_wire_has_exact_contract_and_stays_within_budget() {
+    let tools = tool_definitions();
+    let wire = ServerJsonRpcMessage::response(
+        ServerResult::ListToolsResult(ListToolsResult::with_all_items(tools)),
+        NumberOrString::Number(1),
+    );
+    let serialized = serde_json::to_vec(&wire).expect("serialize complete tools/list");
+    assert!(
+        serialized.len() <= 16_000,
+        "tools/list is {} bytes",
+        serialized.len()
+    );
+    let value = serde_json::to_value(wire).expect("serialize tools/list value");
+    let tools = value["result"]["tools"].as_array().expect("wire tools");
+    let names: Vec<_> = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect();
+    assert_eq!(names, TOOL_NAMES);
+    let mut total_words = 0;
+    for tool in tools {
+        let schema = &tool["inputSchema"];
+        assert_closed_objects(schema);
+        assert_required_properties_have_no_defaults(
+            schema,
+            tool["name"].as_str().expect("tool name"),
+        );
+        assert!(tool.get("outputSchema").is_none());
+        let tool_bytes = serde_json::to_vec(tool).expect("serialize wire tool").len();
+        assert!(
+            tool_bytes <= 6_000,
+            "{} is {tool_bytes} bytes",
+            tool["name"]
+        );
+        let words = tool["description"]
+            .as_str()
+            .expect("tool description")
+            .split_whitespace()
+            .count();
+        assert!(
+            words <= 80,
+            "{} has {words} description words",
+            tool["name"]
+        );
+        total_words += words;
+    }
+    assert!(computer_use_mcp::contract::SERVER_INSTRUCTIONS.len() <= 2_048);
+    assert!(
+        total_words <= 400,
+        "tool descriptions use {total_words} words"
+    );
+    assert!(PACKAGED_SKILL.len() <= 3_072);
+}
+
+#[test]
+fn complete_tool_result_text_structured_and_image_budgets_are_measurable() {
+    let image_base64 = STANDARD.encode(vec![0_u8; MAX_PNG_BYTES]);
+    let result = ToolOutput::text("t".repeat(MAX_MODEL_TEXT_BYTES))
+        .with_structured_content(json!({
+            "payload": "s".repeat(MAX_MODEL_STRUCTURED_BYTES - 32)
+        }))
+        .with_png_base64(image_base64.clone())
+        .into_mcp_result();
+    let value = serde_json::to_value(&result).expect("serialize complete call result");
+    assert!(value["content"][0]["text"].as_str().unwrap().len() <= MAX_MODEL_TEXT_BYTES);
+    assert!(
+        serde_json::to_vec(&value["structuredContent"])
+            .expect("serialize structured content")
+            .len()
+            <= MAX_MODEL_STRUCTURED_BYTES
+    );
+    let max_image_base64 = MAX_PNG_BYTES.div_ceil(3) * 4;
+    assert!(value["content"][1]["data"].as_str().unwrap().len() <= max_image_base64);
+
+    let wire = ServerJsonRpcMessage::response(
+        ServerResult::CallToolResult(result),
+        NumberOrString::Number(3),
+    );
+    let wire_bytes = serde_json::to_vec(&wire).expect("serialize complete stdio call result");
+    assert!(
+        wire_bytes.len()
+            <= MAX_MODEL_TEXT_BYTES + MAX_MODEL_STRUCTURED_BYTES + max_image_base64 + 4_096,
+        "complete call result is {} bytes",
+        wire_bytes.len()
+    );
+}
+
+#[test]
+fn inputs_use_exact_opaque_targets_and_bounded_operations() {
+    let tools = tool_definitions();
     let schema = |name: &str| {
         tools
             .iter()
@@ -19,296 +109,337 @@ fn tools_have_exact_order_and_schemas() {
             .expect("tool definition")
             .schema_as_json_value()
     };
-    assert_object(&schema("list_applications"), &["scope"], &["scope"]);
+
+    let list = schema("list_desktop");
+    assert_eq!(list["required"], json!(["scope"]));
     assert_eq!(
-        schema("list_applications")["properties"]["scope"]["enum"],
-        json!(["running", "installed"])
+        list["properties"]["scope"]["enum"],
+        json!(["windows", "applications"])
     );
-    assert_object(
-        &schema("launch_application"),
-        &["desktop_id"],
-        &["desktop_id"],
-    );
+    assert_eq!(list["properties"]["limit"]["default"], 50);
+    assert_eq!(list["properties"]["limit"]["maximum"], 100);
+    assert_eq!(list["properties"]["cursor"]["minLength"], 1);
     assert_eq!(
         schema("launch_application")["properties"]["desktop_id"]["pattern"],
         "^[^\\s]+\\.desktop$"
     );
 
-    let observe = schema("observe");
-    assert_object(
-        &observe,
-        &[
-            "target",
-            "view",
-            "query",
-            "text_limit",
-            "max_tree_nodes",
-            "max_tree_depth",
-        ],
-        &["target"],
+    let activate = schema("activate_window");
+    let target = &activate["properties"]["target"];
+    assert_eq!(
+        target["properties"]["app_instance_id"]["pattern"],
+        "^app-[0-9a-f]{16}$"
     );
+    assert_eq!(
+        target["properties"]["window_instance_id"]["pattern"],
+        "^win-[0-9a-f]{16}$"
+    );
+
+    let observe = schema("observe");
+    assert_eq!(observe["required"], json!(["target", "view"]));
     assert_eq!(
         observe["properties"]["view"]["enum"],
-        json!(["full", "visible", "interactive"])
+        json!(["screenshot", "accessibility", "both"])
     );
-    assert_eq!(observe["properties"]["query"]["pattern"], ".*\\S.*");
-    assert_eq!(observe["properties"]["query"]["maxLength"], 1_000);
-    assert_eq!(observe["properties"]["max_tree_nodes"]["maximum"], 5_000);
-    assert_eq!(observe["properties"]["max_tree_depth"]["maximum"], 128);
     assert_eq!(
-        observe["properties"]["text_limit"]["anyOf"][0]["maximum"],
-        100_000
+        observe["properties"]["accessibility"]["properties"]["limits"]["properties"]["max_nodes"]["maximum"],
+        5_000
+    );
+    assert_eq!(
+        observe["properties"]["accessibility"]["properties"]["scope"]["default"],
+        "interactive"
+    );
+    assert_eq!(
+        observe["properties"]["accessibility"]["properties"]["limits"]["properties"]["text_limit"]
+            ["default"],
+        256
+    );
+    assert_eq!(
+        observe["properties"]["accessibility"]["properties"]["limits"]["properties"]["max_nodes"]["default"],
+        250
     );
 
-    let act = schema("act_on_element");
-    assert_object(
-        &act,
-        &["state_id", "element_id", "action"],
-        &["state_id", "element_id", "action"],
+    let act = schema("act");
+    assert_eq!(
+        discriminants(&act["properties"]["operation"]),
+        ["pointer", "semantic", "keyboard"]
     );
     assert_eq!(
-        act["properties"]["element_id"]["anyOf"][1]["maximum"],
-        4_999
-    );
-    assert_eq!(act["properties"]["state_id"], state_id());
-    assert_union(
-        &act["properties"]["action"],
-        &[
-            ("invoke", &["type"], &["type"]),
-            ("focus", &["type"], &["type"]),
-            ("named", &["type", "name"], &["type", "name"]),
-            ("set_value", &["type", "value"], &["type", "value"]),
-        ],
-    );
-
-    let pointer = schema("pointer");
-    assert_object(&pointer, &["state_id", "action"], &["state_id", "action"]);
-    assert_eq!(pointer["properties"]["state_id"], state_id());
-    assert_union(
-        &pointer["properties"]["action"],
-        &[
-            ("move", &["type", "x", "y"], &["type", "x", "y"]),
-            (
-                "click",
-                &["type", "x", "y", "button", "count"],
-                &["type", "x", "y"],
-            ),
-            (
-                "drag",
-                &["type", "from_x", "from_y", "to_x", "to_y"],
-                &["type", "from_x", "from_y", "to_x", "to_y"],
-            ),
-            (
-                "scroll",
-                &["type", "x", "y", "direction", "steps"],
-                &["type", "x", "y", "direction"],
-            ),
-        ],
+        discriminants(&act["properties"]["operation"]["oneOf"][0]["properties"]["action"]),
+        ["move", "click", "drag", "scroll"]
     );
     assert_eq!(
-        pointer["properties"]["action"]["oneOf"][1]["properties"]["count"]["maximum"],
-        3
+        discriminants(&act["properties"]["operation"]["oneOf"][1]["properties"]["action"]),
+        ["invoke", "focus", "named", "set_value"]
     );
     assert_eq!(
-        pointer["properties"]["action"]["oneOf"][1]["properties"]["button"]["default"],
-        "left"
+        act["properties"]["source_observation"]["properties"]["observation_id"]["pattern"],
+        "^obs-[0-9a-f]{16}$"
     );
     assert_eq!(
-        pointer["properties"]["action"]["oneOf"][1]["properties"]["button"]["enum"],
-        json!(["left", "right", "middle"])
+        act["properties"]["operation"]["oneOf"][0]["properties"]["action"]["oneOf"][2]["properties"]
+            ["path"]["maxItems"],
+        32
     );
     assert_eq!(
-        pointer["properties"]["action"]["oneOf"][3]["properties"]["steps"]["maximum"],
-        100
+        act["properties"]["operation"]["oneOf"][2]["properties"]["events"]["oneOf"][0]["maxItems"],
+        8
     );
+    let key_schema = &act["properties"]["operation"]["oneOf"][2]["properties"]["events"]["oneOf"]
+        [0]["items"]["properties"]["key"];
+    let key_pattern = key_schema["pattern"].as_str().expect("key pattern");
     assert_eq!(
-        pointer["properties"]["action"]["oneOf"][3]["properties"]["steps"]["default"],
+        key_pattern,
+        r"^\s*[^\s+](?:[^+]*[^\s+])?(?:\s*\+\s*[^\s+](?:[^+]*[^\s+])?){0,4}\s*$"
+    );
+    assert_eq!(key_schema["maxLength"], 1_000);
+    for (key, expected) in [
+        ("F1", true),
+        (" Ctrl + Alt + Shift + Super + F1 ", true),
+        ("Ctrl+Alt+Shift+Super+Meta+F1", false),
+        ("Ctrl++F1", false),
+        ("A+B+C+D+E+F1", false),
+    ] {
+        assert_eq!(schema_key_shape(key), expected, "schema shape for {key:?}");
+        assert_eq!(
+            parse_chord(key).is_ok(),
+            expected,
+            "runtime shape for {key:?}"
+        );
+    }
+    assert_eq!(
+        act["properties"]["operation"]["oneOf"][2]["properties"]["events"]["oneOf"][1]["maxItems"],
         1
     );
     assert_eq!(
-        pointer["properties"]["action"]["oneOf"][3]["properties"]["direction"]["enum"],
-        json!(["up", "down", "left", "right"])
+        act["properties"]["operation"]["oneOf"][2]["properties"]["events"]["oneOf"][1]["items"]["properties"]
+            ["text"]["maxLength"],
+        4_096
     );
-    let keyboard = schema("keyboard");
-    assert_object(
-        &keyboard,
-        &["state_id", "focus", "action"],
-        &["state_id", "focus", "action"],
-    );
-    let focus = keyboard["properties"]["focus"]["oneOf"].as_array().unwrap();
-    assert_eq!(focus.len(), 2);
-    assert_object(&focus[0], &["x", "y"], &["x", "y"]);
-    assert_object(&focus[1], &["element_id"], &["element_id"]);
-    assert_eq!(focus[0]["properties"]["x"]["minimum"], 0);
     assert_eq!(
-        focus[1]["properties"]["element_id"]["anyOf"][1]["maximum"],
-        4_999
+        act["properties"]["operation"]["oneOf"][2]["properties"]["events"]["oneOf"][1]["items"]["properties"]
+            ["text"]["minLength"],
+        1
     );
-    assert_union(
-        &keyboard["properties"]["action"],
-        &[
-            ("press", &["type", "key"], &["type", "key"]),
-            ("type", &["type", "text"], &["type", "text"]),
-        ],
+    assert_eq!(
+        act["properties"]["operation"]["oneOf"][2]["properties"]["events"]["oneOf"][1]["items"]["properties"]
+            ["text"]["pattern"],
+        "^[^\\u0000]+$"
     );
-}
+    assert_eq!(
+        act["properties"]["operation"]["oneOf"][2]["properties"]["focus"]["properties"]["type"]["const"],
+        "point"
+    );
+    let wait = schema("wait_for");
+    assert_eq!(
+        discriminants(&wait["properties"]["condition"]),
+        [
+            "frame_advanced",
+            "frame_changed",
+            "frame_stable",
+            "accessibility_advanced",
+            "element_state",
+            "element_value",
+        ]
+    );
+    assert_eq!(
+        wait["required"],
+        json!(["target", "condition", "timeout_ms"])
+    );
+    assert!(wait["properties"]["timeout_ms"].get("default").is_none());
+    assert_eq!(wait["properties"]["timeout_ms"]["maximum"], 5_000);
+    let frame_stable = &wait["properties"]["condition"]["oneOf"][2];
+    assert_eq!(frame_stable["properties"]["type"]["const"], "frame_stable");
+    assert_eq!(frame_stable["required"], json!(["type", "for_ms"]));
+    assert!(
+        frame_stable["properties"]["for_ms"]
+            .get("default")
+            .is_none()
+    );
+    assert_eq!(
+        wait["properties"]["condition"]["oneOf"][1]["properties"]["type"]["const"],
+        "frame_changed"
+    );
 
-#[test]
-fn annotations_match_the_inherited_contract() {
-    let tools = tool_definitions();
-    for tool in tools {
-        let annotations = serde_json::to_value(tool.annotations).expect("serialize annotations");
-        let expected = if matches!(tool.name.as_ref(), "list_applications" | "observe") {
-            json!({
-                "openWorldHint": true,
-                "readOnlyHint": true,
-            })
-        } else if tool.name.as_ref() == "launch_application" {
-            json!({
-                "destructiveHint": false,
-                "idempotentHint": false,
-                "openWorldHint": true,
-                "readOnlyHint": false,
-            })
-        } else {
-            json!({
-                "destructiveHint": true,
-                "idempotentHint": false,
-                "openWorldHint": true,
-                "readOnlyHint": false,
-            })
-        };
-        assert_eq!(annotations, expected, "{} annotations", tool.name);
+    for (name, bound, expected) in [
+        ("cursor", &list["properties"]["cursor"]["maxLength"], 128),
+        (
+            "query",
+            &observe["properties"]["accessibility"]["properties"]["query"]["maxLength"],
+            1_000,
+        ),
+        (
+            "text_limit",
+            &observe["properties"]["accessibility"]["properties"]["limits"]["properties"]["text_limit"]
+                ["anyOf"][0]["maximum"],
+            100_000,
+        ),
+        (
+            "max_nodes",
+            &observe["properties"]["accessibility"]["properties"]["limits"]["properties"]["max_nodes"]
+                ["maximum"],
+            5_000,
+        ),
+        (
+            "max_depth",
+            &observe["properties"]["accessibility"]["properties"]["limits"]["properties"]["max_depth"]
+                ["maximum"],
+            128,
+        ),
+        (
+            "click count",
+            &act["properties"]["operation"]["oneOf"][0]["properties"]["action"]["oneOf"][1]["properties"]
+                ["count"]["maximum"],
+            3,
+        ),
+        (
+            "drag points",
+            &act["properties"]["operation"]["oneOf"][0]["properties"]["action"]["oneOf"][2]["properties"]
+                ["path"]["maxItems"],
+            32,
+        ),
+        (
+            "scroll steps",
+            &act["properties"]["operation"]["oneOf"][0]["properties"]["action"]["oneOf"][3]["properties"]
+                ["steps"]["maximum"],
+            100,
+        ),
+        (
+            "named",
+            &act["properties"]["operation"]["oneOf"][1]["properties"]["action"]["oneOf"][2]["properties"]
+                ["name"]["maxLength"],
+            1_000,
+        ),
+        (
+            "set_value",
+            &act["properties"]["operation"]["oneOf"][1]["properties"]["action"]["oneOf"][3]["properties"]
+                ["value"]["maxLength"],
+            100_000,
+        ),
+        (
+            "keyboard text",
+            &act["properties"]["operation"]["oneOf"][2]["properties"]["events"]["oneOf"][1]["items"]
+                ["properties"]["text"]["maxLength"],
+            4_096,
+        ),
+        (
+            "wait timeout",
+            &wait["properties"]["timeout_ms"]["maximum"],
+            5_000,
+        ),
+        (
+            "wait stability",
+            &wait["properties"]["condition"]["oneOf"][2]["properties"]["for_ms"]["maximum"],
+            1_500,
+        ),
+        (
+            "element state",
+            &wait["properties"]["condition"]["oneOf"][4]["properties"]["state"]["maxLength"],
+            1_000,
+        ),
+        (
+            "element value",
+            &wait["properties"]["condition"]["oneOf"][5]["properties"]["value"]["maxLength"],
+            100_000,
+        ),
+    ] {
+        assert_eq!(bound, expected, "{name}");
     }
 }
 
 #[test]
-fn output_schemas_have_expected_shapes() {
-    let tools = tool_definitions();
-    let output_schema = |name: &str| {
-        let tool = tools
-            .iter()
-            .find(|tool| tool.name.as_ref() == name)
-            .expect("tool definition");
-        Value::Object(
-            tool.output_schema
-                .as_ref()
-                .expect("output schema")
-                .as_ref()
-                .clone(),
-        )
-    };
-
-    let list_schema = output_schema("list_applications");
-    let list = &list_schema["oneOf"][0];
-    assert_object(list, &["scope", "applications"], &["scope", "applications"]);
-    assert_eq!(list["properties"]["scope"]["type"], "string");
-    assert_eq!(list["properties"]["applications"]["type"], "array");
-
-    let launch_schema = output_schema("launch_application");
-    let launch = &launch_schema["oneOf"][0];
-    assert_object(
-        launch,
-        &["status", "desktop_id", "name"],
-        &["status", "desktop_id", "name"],
-    );
-    assert_eq!(launch["properties"]["status"]["const"], "requested");
-    assert_eq!(launch["properties"]["desktop_id"]["type"], "string");
-    assert_eq!(launch["properties"]["name"]["type"], "string");
-
-    let observation_schema = output_schema("observe");
-    let observation = &observation_schema["oneOf"][0];
-    assert_object(
-        observation,
-        &[
-            "state_id",
-            "target",
-            "view",
-            "element_query",
-            "screenshot",
-            "coordinate_spaces",
-            "elements",
-        ],
-        &[
-            "state_id",
-            "target",
-            "view",
-            "element_query",
-            "screenshot",
-            "coordinate_spaces",
-            "elements",
-        ],
-    );
-    assert_eq!(observation["properties"]["state_id"], state_id());
-    assert_eq!(observation["properties"]["target"]["type"], "object");
-    assert_eq!(
-        observation["properties"]["view"]["enum"],
-        json!(["full", "visible", "interactive"])
-    );
-    assert_eq!(
-        observation["properties"]["element_query"]["type"],
-        json!(["string", "null"])
-    );
-    assert_eq!(
-        observation["properties"]["screenshot"]["properties"]["coordinate_space"]["const"],
-        "screenshot_png_pixels"
-    );
-    assert_eq!(
-        observation["properties"]["coordinate_spaces"]["type"],
-        "object"
-    );
-    assert_eq!(observation["properties"]["elements"]["type"], "array");
-
-    for name in TOOL_NAMES {
-        let schema = output_schema(name);
-        let error = &schema["oneOf"][1];
-        assert_object(
-            error,
-            &["code", "message", "outcome", "retryable", "recovery"],
-            &["code", "message", "outcome", "retryable", "recovery"],
+fn annotations_match_tool_side_effects() {
+    let read_only = ["list_desktop", "observe", "wait_for"];
+    for tool in tool_definitions() {
+        let annotations = serde_json::to_value(tool.annotations).expect("serialize annotations");
+        let expected_read_only = read_only.contains(&tool.name.as_ref());
+        assert_eq!(annotations["openWorldHint"], true, "{}", tool.name);
+        assert_eq!(
+            annotations["readOnlyHint"], expected_read_only,
+            "{}",
+            tool.name
+        );
+        assert_eq!(
+            annotations["idempotentHint"], expected_read_only,
+            "{}",
+            tool.name
+        );
+        assert_eq!(
+            annotations["destructiveHint"],
+            matches!(tool.name.as_ref(), "activate_window" | "act"),
+            "{}",
+            tool.name
         );
     }
 }
 
-#[test]
-fn image_output_serializes_as_mcp_text_then_png() {
-    let result = ToolOutput::text("state")
-        .with_png_base64("cG5n")
-        .into_mcp_result();
-    assert_eq!(
-        serde_json::to_value(result).expect("serialize result"),
-        json!({
-            "content": [
-                {"type": "text", "text": "state"},
-                {"type": "image", "data": "cG5n", "mimeType": "image/png"},
-            ],
-            "isError": false,
-        })
-    );
-}
-
-fn state_id() -> Value {
-    json!({"type": "string", "pattern": "^s-[0-9a-f]{16}$"})
-}
-
-fn assert_object(schema: &Value, properties: &[&str], required: &[&str]) {
-    assert_eq!(schema["type"], "object");
-    assert_eq!(schema["additionalProperties"], false);
-    assert_eq!(schema["required"], json!(required));
-    let actual = schema["properties"]
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>();
-    assert_eq!(actual, properties.iter().copied().collect());
-}
-
-fn assert_union(schema: &Value, variants: &[(&str, &[&str], &[&str])]) {
-    let actual = schema["oneOf"].as_array().unwrap();
-    assert_eq!(actual.len(), variants.len());
-    for (action, (kind, properties, required)) in actual.iter().zip(variants) {
-        assert_object(action, properties, required);
-        assert_eq!(action["properties"]["type"]["const"], *kind);
+fn assert_closed_objects(value: &Value) {
+    match value {
+        Value::Object(object) => {
+            if object.get("type") == Some(&Value::String("object".into())) {
+                assert_eq!(
+                    object.get("additionalProperties"),
+                    Some(&Value::Bool(false))
+                );
+            }
+            for value in object.values() {
+                assert_closed_objects(value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                assert_closed_objects(value);
+            }
+        }
+        _ => {}
     }
+}
+
+fn assert_required_properties_have_no_defaults(value: &Value, path: &str) {
+    match value {
+        Value::Object(object) => {
+            if let (Some(properties), Some(required)) = (
+                object.get("properties").and_then(Value::as_object),
+                object.get("required").and_then(Value::as_array),
+            ) {
+                for name in required {
+                    let name = name.as_str().expect("required property name");
+                    let property = properties
+                        .get(name)
+                        .unwrap_or_else(|| panic!("{path} requires absent property {name:?}"));
+                    assert!(
+                        property.get("default").is_none(),
+                        "{path}.{name} is required but advertises a default"
+                    );
+                }
+            }
+            for (name, child) in object {
+                assert_required_properties_have_no_defaults(child, &format!("{path}.{name}"));
+            }
+        }
+        Value::Array(values) => {
+            for (index, child) in values.iter().enumerate() {
+                assert_required_properties_have_no_defaults(child, &format!("{path}[{index}]"));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn schema_key_shape(value: &str) -> bool {
+    let tokens = value.split('+').map(str::trim).collect::<Vec<_>>();
+    !tokens.is_empty() && tokens.len() <= 5 && tokens.iter().all(|token| !token.is_empty())
+}
+
+fn discriminants(schema: &Value) -> Vec<&str> {
+    schema["oneOf"]
+        .as_array()
+        .expect("discriminated union")
+        .iter()
+        .map(|variant| {
+            variant["properties"]["type"]["const"]
+                .as_str()
+                .expect("type discriminator")
+        })
+        .collect()
 }

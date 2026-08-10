@@ -31,6 +31,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check native skill synchronization
+        run: bash scripts/check-guidance.sh
+
       - name: Lint all targets
         run: cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
 

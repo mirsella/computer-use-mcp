@@ -9,43 +9,26 @@ pub const MAX_SCROLL_STEPS: u32 = 100;
 pub const MAX_TEXT_LIMIT: usize = 100_000;
 pub const MAX_TREE_NODES: usize = 5_000;
 pub const MAX_TREE_DEPTH: usize = 128;
-pub const MAX_ELEMENT_ID: usize = MAX_TREE_NODES - 1;
 pub const MAX_QUERY_LENGTH: usize = 1_000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApplicationScope {
-    Running,
-    Installed,
-}
+pub const MAX_DRAG_POINTS: usize = 32;
+pub const MAX_KEYBOARD_EVENTS: usize = 8;
+pub const MAX_KEYBOARD_TRANSACTION_TEXT: usize = 4_096;
+pub const MAX_KEYBOARD_MODIFIERS: usize = 4;
+pub const MAX_KEYBOARD_EXPANDED_ACTIONS: usize = 4_096;
+pub const MAX_WAIT_TIMEOUT_MS: u64 = 5_000;
+// The stable interval must fit inside the default wait deadline while still
+// leaving room to acquire at least one fresh frame and observe its metadata.
+pub const MAX_WAIT_STABLE_MS: u64 = 1_500;
+pub const DEFAULT_DESKTOP_PAGE_SIZE: usize = 50;
+pub const MAX_DESKTOP_PAGE_SIZE: usize = 100;
+pub const DEFAULT_ACCESSIBILITY_TEXT_LIMIT: usize = 256;
+pub const DEFAULT_ACCESSIBILITY_MAX_NODES: usize = 250;
+pub const DEFAULT_ACCESSIBILITY_MAX_DEPTH: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TextLimit {
     Count(usize),
     Max,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ObservationView {
-    #[default]
-    Full,
-    Visible,
-    Interactive,
-}
-
-impl ObservationView {
-    pub const ALL: [Self; 3] = [Self::Full, Self::Visible, Self::Interactive];
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Full => "full",
-            Self::Visible => "visible",
-            Self::Interactive => "interactive",
-        }
-    }
-
-    fn parse(value: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|view| view.as_str() == value)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,8 +59,7 @@ pub enum PointerAction {
         count: usize,
     },
     Drag {
-        from: (f64, f64),
-        to: (f64, f64),
+        path: Vec<(f64, f64)>,
     },
     Scroll {
         x: f64,
@@ -87,73 +69,248 @@ pub enum PointerAction {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesktopScope {
+    Windows,
+    Applications,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TargetRef {
+    pub app_instance_id: String,
+    pub window_instance_id: String,
+}
+
+impl TargetRef {
+    pub fn as_json(&self) -> Value {
+        serde_json::json!({
+            "app_instance_id": self.app_instance_id,
+            "window_instance_id": self.window_instance_id,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObserveView {
+    Screenshot,
+    Accessibility,
+    Both,
+}
+
+impl ObserveView {
+    pub const ALL: [Self; 3] = [Self::Screenshot, Self::Accessibility, Self::Both];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Screenshot => "screenshot",
+            Self::Accessibility => "accessibility",
+            Self::Both => "both",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|view| view.as_str() == value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessibilityScope {
+    Full,
+    Visible,
+    Interactive,
+}
+
+impl AccessibilityScope {
+    pub const ALL: [Self; 3] = [Self::Full, Self::Visible, Self::Interactive];
+
+    /// The model-facing default is owned by the accessibility domain.  Schema
+    /// generation and parsing both derive their defaults from this value.
+    pub const DEFAULT: Self = Self::Interactive;
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Visible => "visible",
+            Self::Interactive => "interactive",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|scope| scope.as_str() == value)
+    }
+}
+
+impl Default for AccessibilityScope {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessibilityLimits {
+    pub text: TextLimit,
+    pub nodes: usize,
+    pub depth: usize,
+}
+
+impl Default for AccessibilityLimits {
+    fn default() -> Self {
+        Self {
+            text: TextLimit::Count(DEFAULT_ACCESSIBILITY_TEXT_LIMIT),
+            nodes: DEFAULT_ACCESSIBILITY_MAX_NODES,
+            depth: DEFAULT_ACCESSIBILITY_MAX_DEPTH,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccessibilityRequest {
+    pub scope: AccessibilityScope,
+    pub query: Option<String>,
+    pub limits: AccessibilityLimits,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservationRef {
+    pub observation_id: String,
+    pub frame_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KeyboardPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
-pub enum KeyboardAction {
+pub enum KeyboardEvent {
     Press(String),
     Type(String),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActOperation {
+    Pointer {
+        action: PointerAction,
+    },
+    Semantic {
+        element_id: String,
+        action: ElementAction,
+    },
+    Keyboard {
+        focus: KeyboardPoint,
+        events: Vec<KeyboardEvent>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitCondition {
+    FrameAdvanced {
+        after_frame_id: String,
+    },
+    FrameChanged {
+        after_frame_id: String,
+    },
+    FrameStable {
+        for_ms: u64,
+    },
+    AccessibilityAdvanced {
+        after_observation_id: String,
+    },
+    ElementState {
+        observation_id: String,
+        element_id: String,
+        state: String,
+    },
+    ElementValue {
+        observation_id: String,
+        element_id: String,
+        value: String,
+    },
+}
+
 impl ToolCall {
-    pub(crate) fn waits_for_desktop_session(&self) -> bool {
-        !matches!(
+    pub const fn requires_visual_session(&self) -> bool {
+        match self {
+            Self::ListDesktop { .. }
+            | Self::LaunchApplication { .. }
+            | Self::ActivateWindow { .. } => false,
+            Self::Observe { view, .. } => match view {
+                ObserveView::Screenshot | ObserveView::Both => true,
+                ObserveView::Accessibility => false,
+            },
+            Self::Act { operation, .. } => match operation {
+                ActOperation::Pointer { .. } | ActOperation::Keyboard { .. } => true,
+                ActOperation::Semantic { .. } => false,
+            },
+            Self::WaitFor { condition, .. } => match condition {
+                WaitCondition::FrameAdvanced { .. }
+                | WaitCondition::FrameChanged { .. }
+                | WaitCondition::FrameStable { .. } => true,
+                WaitCondition::AccessibilityAdvanced { .. }
+                | WaitCondition::ElementState { .. }
+                | WaitCondition::ElementValue { .. } => false,
+            },
+        }
+    }
+
+    pub const fn tracks_action(&self) -> bool {
+        matches!(
             self,
-            Self::ListApplications { .. } | Self::LaunchApplication { .. }
+            Self::LaunchApplication { .. } | Self::ActivateWindow { .. } | Self::Act { .. }
         )
     }
 
     pub(crate) fn validate_policy(&self) -> Result<(), RuntimeError> {
-        let Self::Keyboard {
-            action: KeyboardAction::Press(key),
-            ..
-        } = self
-        else {
-            return Ok(());
+        let events = match self {
+            Self::Act {
+                operation: ActOperation::Keyboard { events, .. },
+                ..
+            } => events.as_slice(),
+            _ => &[],
         };
-        let mut parts = key.split('+').map(str::trim);
-        let has_alt = parts.clone().any(|part| part.eq_ignore_ascii_case("alt"));
-        let has_tab = parts.any(|part| part.eq_ignore_ascii_case("tab"));
-        if has_alt && has_tab {
-            return Err(RuntimeError::unsupported_desktop_focus_switch());
+        for key in events.iter().filter_map(|event| match event {
+            KeyboardEvent::Press(key) => Some(key.as_str()),
+            KeyboardEvent::Type(_) => None,
+        }) {
+            let mut parts = key.split('+').map(str::trim);
+            let has_alt = parts.clone().any(|part| part.eq_ignore_ascii_case("alt"));
+            let has_tab = parts.any(|part| part.eq_ignore_ascii_case("tab"));
+            if has_alt && has_tab {
+                return Err(RuntimeError::unsupported_desktop_focus_switch());
+            }
         }
         Ok(())
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum KeyboardFocus {
-    Point((f64, f64)),
-    Element(String),
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub enum ToolCall {
-    ListApplications {
-        scope: ApplicationScope,
+    ListDesktop {
+        scope: DesktopScope,
+        limit: usize,
+        cursor: Option<String>,
     },
     LaunchApplication {
         desktop_id: String,
     },
+    ActivateWindow {
+        target: TargetRef,
+    },
     Observe {
-        target: String,
-        view: ObservationView,
-        query: Option<String>,
-        text_limit: Option<TextLimit>,
-        max_tree_nodes: Option<usize>,
-        max_tree_depth: Option<usize>,
+        target: TargetRef,
+        view: ObserveView,
+        accessibility: Option<AccessibilityRequest>,
     },
-    ActOnElement {
-        state_id: String,
-        element_id: String,
-        action: ElementAction,
+    Act {
+        target: TargetRef,
+        source: ObservationRef,
+        operation: ActOperation,
     },
-    Pointer {
-        state_id: String,
-        action: PointerAction,
-    },
-    Keyboard {
-        state_id: String,
-        focus: KeyboardFocus,
-        action: KeyboardAction,
+    WaitFor {
+        target: TargetRef,
+        condition: WaitCondition,
+        timeout_ms: u64,
     },
 }
 
@@ -162,65 +319,261 @@ pub fn validate_call(
     mut arguments: JsonObject<String, Value>,
 ) -> Result<ToolCall, RuntimeError> {
     let call = match name {
-        "list_applications" => {
+        "list_desktop" => {
             let scope = match required_string(&mut arguments, "scope")?.as_str() {
-                "running" => ApplicationScope::Running,
-                "installed" => ApplicationScope::Installed,
-                _ => return invalid("scope must be \"running\" or \"installed\""),
+                "windows" => DesktopScope::Windows,
+                "applications" => DesktopScope::Applications,
+                _ => return invalid("scope must be \"windows\" or \"applications\""),
             };
-            ToolCall::ListApplications { scope }
+            let limit = match arguments.remove("limit") {
+                None => DEFAULT_DESKTOP_PAGE_SIZE,
+                Some(value) => json_integer(&value)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .filter(|value| (1..=MAX_DESKTOP_PAGE_SIZE).contains(value))
+                    .ok_or_else(|| {
+                        RuntimeError::invalid_arguments(format!(
+                            "argument \"limit\" must be an integer from 1 through {MAX_DESKTOP_PAGE_SIZE}"
+                        ))
+                    })?,
+            };
+            let cursor = match arguments.remove("cursor") {
+                None => None,
+                Some(Value::String(value)) if !value.is_empty() && value.chars().count() <= 128 => {
+                    Some(value)
+                }
+                Some(Value::String(_)) => {
+                    return invalid("argument \"cursor\" must be a non-empty opaque cursor");
+                }
+                Some(_) => return invalid("argument \"cursor\" must be a string"),
+            };
+            ToolCall::ListDesktop {
+                scope,
+                limit,
+                cursor,
+            }
         }
         "launch_application" => ToolCall::LaunchApplication {
             desktop_id: required_desktop_id(&mut arguments, "desktop_id")?,
         },
+        "activate_window" => ToolCall::ActivateWindow {
+            target: required_target(&mut arguments, "target")?,
+        },
         "observe" => ToolCall::Observe {
-            target: required_nonblank(&mut arguments, "target")?,
-            view: optional_observation_view(&mut arguments, "view")?,
-            query: optional_query(&mut arguments, "query")?,
-            text_limit: optional_text_limit(&mut arguments, "text_limit")?,
-            max_tree_nodes: optional_bounded(&mut arguments, "max_tree_nodes", MAX_TREE_NODES)?,
-            max_tree_depth: optional_bounded(&mut arguments, "max_tree_depth", MAX_TREE_DEPTH)?,
+            target: required_target(&mut arguments, "target")?,
+            view: required_observe_view(&mut arguments, "view")?,
+            accessibility: optional_accessibility(&mut arguments, "accessibility")?,
         },
-        "act_on_element" => ToolCall::ActOnElement {
-            state_id: required_state_id(&mut arguments, "state_id")?,
-            element_id: required_element_id(&mut arguments, "element_id")?,
-            action: element_action(required_object(&mut arguments, "action")?)?,
+        "act" => ToolCall::Act {
+            target: required_target(&mut arguments, "target")?,
+            source: required_observation_ref(&mut arguments, "source_observation")?,
+            operation: act_operation(required_object(&mut arguments, "operation")?)?,
         },
-        "pointer" => ToolCall::Pointer {
-            state_id: required_state_id(&mut arguments, "state_id")?,
-            action: pointer_action(required_object(&mut arguments, "action")?)?,
-        },
-        "keyboard" => ToolCall::Keyboard {
-            state_id: required_state_id(&mut arguments, "state_id")?,
-            focus: keyboard_focus(required_object(&mut arguments, "focus")?)?,
-            action: keyboard_action(required_object(&mut arguments, "action")?)?,
+        "wait_for" => ToolCall::WaitFor {
+            target: required_target(&mut arguments, "target")?,
+            condition: wait_condition(required_object(&mut arguments, "condition")?)?,
+            timeout_ms: required_timeout(&mut arguments, "timeout_ms", MAX_WAIT_TIMEOUT_MS)?,
         },
         _ => return invalid(format!("unknown tool {name:?}")),
     };
     reject_unknown(arguments)?;
     call.validate_policy()?;
+    validate_action_source(&call)?;
     Ok(call)
 }
 
-fn element_action(mut object: JsonObject<String, Value>) -> Result<ElementAction, RuntimeError> {
-    let action = match required_string(&mut object, "type")?.as_str() {
-        "invoke" => ElementAction::Invoke,
-        "named" => {
-            let name = required_string(&mut object, "name")?;
-            if name.trim().is_empty() {
-                return invalid("argument \"name\" must not be blank");
-            }
-            ElementAction::Named(name)
-        }
-        "focus" => ElementAction::Focus,
-        "set_value" => ElementAction::SetValue(required_string(&mut object, "value")?),
-        _ => return invalid("element action type must be invoke, named, focus, or set_value"),
+fn validate_action_source(call: &ToolCall) -> Result<(), RuntimeError> {
+    let ToolCall::Act {
+        source,
+        operation: ActOperation::Pointer { .. } | ActOperation::Keyboard { .. },
+        ..
+    } = call
+    else {
+        return Ok(());
     };
-    reject_unknown(object)?;
-    Ok(action)
+    if source.frame_id.is_none() {
+        return invalid(
+            "source_observation.frame_id is required for pointer and keyboard operations",
+        );
+    }
+    Ok(())
 }
 
-fn pointer_action(mut object: JsonObject<String, Value>) -> Result<PointerAction, RuntimeError> {
+fn required_target(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+) -> Result<TargetRef, RuntimeError> {
+    let mut object = required_object(arguments, key)?;
+    let target = TargetRef {
+        app_instance_id: required_opaque_id(&mut object, "app_instance_id", "app")?,
+        window_instance_id: required_opaque_id(&mut object, "window_instance_id", "win")?,
+    };
+    reject_unknown(object)?;
+    Ok(target)
+}
+
+fn required_opaque_id(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+    prefix: &str,
+) -> Result<String, RuntimeError> {
+    let value = required_string(arguments, key)?;
+    if !is_opaque_id(&value, prefix) {
+        return invalid(format!(
+            "argument {key:?} must be an opaque {prefix}- followed by 16 lowercase hexadecimal digits"
+        ));
+    }
+    Ok(value)
+}
+
+fn required_observe_view(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+) -> Result<ObserveView, RuntimeError> {
+    let value = required_string(arguments, key)?;
+    ObserveView::parse(&value).ok_or_else(|| {
+        RuntimeError::invalid_arguments(format!(
+            "argument {key:?} must be screenshot, accessibility, or both"
+        ))
+    })
+}
+
+fn optional_accessibility(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+) -> Result<Option<AccessibilityRequest>, RuntimeError> {
+    let Some(value) = arguments.remove(key) else {
+        return Ok(Some(AccessibilityRequest::default()));
+    };
+    let Value::Object(mut object) = value else {
+        return invalid(format!("argument {key:?} must be an object"));
+    };
+    let scope = match object.remove("scope") {
+        None => AccessibilityScope::default(),
+        Some(Value::String(value)) => AccessibilityScope::parse(&value).ok_or_else(|| {
+            RuntimeError::invalid_arguments(
+                "accessibility.scope must be full, visible, or interactive",
+            )
+        })?,
+        Some(_) => {
+            return invalid("accessibility.scope must be a string");
+        }
+    };
+    let query = match object.remove("query") {
+        None => None,
+        Some(Value::String(value)) => {
+            if value.chars().count() > MAX_QUERY_LENGTH {
+                return invalid(format!(
+                    "accessibility.query must contain at most {MAX_QUERY_LENGTH} characters"
+                ));
+            }
+            let normalized = value.trim();
+            if normalized.is_empty() {
+                return invalid("accessibility.query must not be blank");
+            }
+            Some(normalized.to_owned())
+        }
+        Some(_) => return invalid("accessibility.query must be a string"),
+    };
+    let limits = match object.remove("limits") {
+        None => AccessibilityLimits::default(),
+        Some(Value::Object(mut limits)) => {
+            let text = match limits.remove("text_limit") {
+                None => AccessibilityLimits::default().text,
+                Some(Value::String(value)) if value == "max" => TextLimit::Max,
+                Some(value) => {
+                    let count = json_integer(&value)
+                        .and_then(|count| usize::try_from(count).ok())
+                        .ok_or_else(|| {
+                            RuntimeError::invalid_arguments(
+                                "accessibility.limits.text_limit must be an integer or \"max\"",
+                            )
+                        })?;
+                    if count > MAX_TEXT_LIMIT {
+                        return invalid(format!(
+                            "accessibility.limits.text_limit must not exceed {MAX_TEXT_LIMIT}"
+                        ));
+                    }
+                    TextLimit::Count(count)
+                }
+            };
+            let nodes = optional_bounded(&mut limits, "max_nodes", MAX_TREE_NODES)?
+                .unwrap_or(DEFAULT_ACCESSIBILITY_MAX_NODES);
+            let depth = optional_bounded(&mut limits, "max_depth", MAX_TREE_DEPTH)?
+                .unwrap_or(DEFAULT_ACCESSIBILITY_MAX_DEPTH);
+            reject_unknown(limits)?;
+            AccessibilityLimits { text, nodes, depth }
+        }
+        Some(_) => return invalid("accessibility.limits must be an object"),
+    };
+    reject_unknown(object)?;
+    Ok(Some(AccessibilityRequest {
+        scope,
+        query,
+        limits,
+    }))
+}
+
+fn required_observation_ref(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+) -> Result<ObservationRef, RuntimeError> {
+    let mut object = required_object(arguments, key)?;
+    let observation_id = required_opaque_id(&mut object, "observation_id", "obs")?;
+    let frame_id = match object.remove("frame_id") {
+        Some(Value::Null) | None => None,
+        Some(Value::String(value)) => {
+            if !is_opaque_id(&value, "frame") {
+                return invalid(
+                    "argument \"frame_id\" must be null or an opaque frame- followed by 16 lowercase hexadecimal digits",
+                );
+            }
+            Some(value)
+        }
+        Some(_) => return invalid("argument \"frame_id\" must be null or a string"),
+    };
+    reject_unknown(object)?;
+    Ok(ObservationRef {
+        observation_id,
+        frame_id,
+    })
+}
+
+fn is_opaque_id(value: &str, prefix: &str) -> bool {
+    value.len() == prefix.len() + 1 + 16
+        && value.starts_with(prefix)
+        && value.as_bytes().get(prefix.len()) == Some(&b'-')
+        && value
+            .as_bytes()
+            .get(prefix.len() + 1..)
+            .is_some_and(|bytes| {
+                bytes
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+            })
+}
+
+fn act_operation(mut object: JsonObject<String, Value>) -> Result<ActOperation, RuntimeError> {
+    let operation = match required_string(&mut object, "type")?.as_str() {
+        "pointer" => ActOperation::Pointer {
+            action: act_pointer_action(required_object(&mut object, "action")?)?,
+        },
+        "semantic" => ActOperation::Semantic {
+            element_id: required_opaque_id(&mut object, "element_id", "e")?,
+            action: element_action(required_object(&mut object, "action")?)?,
+        },
+        "keyboard" => ActOperation::Keyboard {
+            focus: keyboard_focus_target(required_object(&mut object, "focus")?)?,
+            events: keyboard_events(&mut object)?,
+        },
+        _ => return invalid("operation.type must be pointer, semantic, or keyboard"),
+    };
+    reject_unknown(object)?;
+    Ok(operation)
+}
+
+fn act_pointer_action(
+    mut object: JsonObject<String, Value>,
+) -> Result<PointerAction, RuntimeError> {
     let action = match required_string(&mut object, "type")?.as_str() {
         "move" => {
             let (x, y) = coordinate_pair(&mut object, "x", "y")?;
@@ -235,10 +588,31 @@ fn pointer_action(mut object: JsonObject<String, Value>) -> Result<PointerAction
                 count: optional_bounded(&mut object, "count", MAX_CLICK_COUNT)?.unwrap_or(1),
             }
         }
-        "drag" => PointerAction::Drag {
-            from: coordinate_pair(&mut object, "from_x", "from_y")?,
-            to: coordinate_pair(&mut object, "to_x", "to_y")?,
-        },
+        "drag" => {
+            let values = required(&mut object, "path")?
+                .as_array()
+                .cloned()
+                .ok_or_else(|| {
+                    RuntimeError::invalid_arguments("pointer drag path must be an array")
+                })?;
+            if !(2..=MAX_DRAG_POINTS).contains(&values.len()) {
+                return invalid(format!(
+                    "pointer drag path must contain 2 through {MAX_DRAG_POINTS} points"
+                ));
+            }
+            let path = values
+                .into_iter()
+                .map(|value| {
+                    let mut point = value.as_object().cloned().ok_or_else(|| {
+                        RuntimeError::invalid_arguments("pointer drag path points must be objects")
+                    })?;
+                    let result = coordinate_pair(&mut point, "x", "y")?;
+                    reject_unknown(point)?;
+                    Ok(result)
+                })
+                .collect::<Result<Vec<_>, RuntimeError>>()?;
+            PointerAction::Drag { path }
+        }
         "scroll" => {
             let direction = required_string(&mut object, "direction")?;
             let steps = optional_bounded(&mut object, "steps", MAX_SCROLL_STEPS)?.unwrap_or(1);
@@ -267,24 +641,173 @@ fn pointer_action(mut object: JsonObject<String, Value>) -> Result<PointerAction
     Ok(action)
 }
 
-fn keyboard_action(mut object: JsonObject<String, Value>) -> Result<KeyboardAction, RuntimeError> {
-    let action = match required_string(&mut object, "type")?.as_str() {
-        "press" => KeyboardAction::Press(required_nonblank(&mut object, "key")?),
-        "type" => KeyboardAction::Type(required_string(&mut object, "text")?),
-        _ => return invalid("keyboard action type must be press or type"),
-    };
-    reject_unknown(object)?;
-    Ok(action)
-}
-
-fn keyboard_focus(mut object: JsonObject<String, Value>) -> Result<KeyboardFocus, RuntimeError> {
-    let focus = if object.contains_key("element_id") {
-        KeyboardFocus::Element(required_element_id(&mut object, "element_id")?)
-    } else {
-        KeyboardFocus::Point(coordinate_pair(&mut object, "x", "y")?)
+fn keyboard_focus_target(
+    mut object: JsonObject<String, Value>,
+) -> Result<KeyboardPoint, RuntimeError> {
+    let focus = match required_string(&mut object, "type")?.as_str() {
+        "point" => {
+            let (x, y) = coordinate_pair(&mut object, "x", "y")?;
+            KeyboardPoint { x, y }
+        }
+        "element" => return invalid("keyboard focus must be a point in the source screenshot PNG"),
+        _ => return invalid("keyboard focus.type must be point"),
     };
     reject_unknown(object)?;
     Ok(focus)
+}
+
+fn keyboard_events(
+    arguments: &mut JsonObject<String, Value>,
+) -> Result<Vec<KeyboardEvent>, RuntimeError> {
+    let values = required(arguments, "events")?
+        .as_array()
+        .cloned()
+        .ok_or_else(|| RuntimeError::invalid_arguments("keyboard events must be an array"))?;
+    if values.is_empty() || values.len() > MAX_KEYBOARD_EVENTS {
+        return invalid(format!(
+            "keyboard events must contain 1 through {MAX_KEYBOARD_EVENTS} events"
+        ));
+    }
+    let kinds = values
+        .iter()
+        .map(|value| {
+            value
+                .as_object()
+                .and_then(|object| object.get("type"))
+                .and_then(Value::as_str)
+        })
+        .collect::<Vec<_>>();
+    let type_count = kinds.iter().filter(|kind| **kind == Some("type")).count();
+    let press_count = kinds.iter().filter(|kind| **kind == Some("press")).count();
+    if type_count > 0 && (type_count != 1 || press_count != 0 || values.len() != 1) {
+        return invalid(
+            "keyboard events must be either press-only or exactly one non-empty type event; mixed press/type transactions are rejected",
+        );
+    }
+    if type_count == 0 && press_count != values.len() {
+        return invalid("keyboard event.type must be press or type");
+    }
+    values
+        .into_iter()
+        .map(|value| {
+            let mut event = value.as_object().cloned().ok_or_else(|| {
+                RuntimeError::invalid_arguments("keyboard events must contain objects")
+            })?;
+            let result = match required_string(&mut event, "type")?.as_str() {
+                "press" => {
+                    let key = bounded_nonblank(
+                        required_string(&mut event, "key")?,
+                        "key",
+                        MAX_QUERY_LENGTH,
+                    )?;
+                    if key.matches('+').count() > MAX_KEYBOARD_MODIFIERS {
+                        return invalid(format!(
+                            "keyboard chords may contain at most {MAX_KEYBOARD_MODIFIERS} modifiers"
+                        ));
+                    }
+                    KeyboardEvent::Press(key)
+                }
+                "type" => {
+                    let text = required_string(&mut event, "text")?;
+                    if text.is_empty() {
+                        return invalid("keyboard type event text must not be empty");
+                    }
+                    if text.chars().count() > MAX_KEYBOARD_TRANSACTION_TEXT {
+                        return invalid(format!(
+                            "keyboard type event text must contain at most {MAX_KEYBOARD_TRANSACTION_TEXT} Unicode scalar values"
+                        ));
+                    }
+                    if text.contains('\0') {
+                        return invalid("keyboard type event text must not contain NUL");
+                    }
+                    KeyboardEvent::Type(text)
+                }
+                _ => return invalid("keyboard event.type must be press or type"),
+            };
+            reject_unknown(event)?;
+            Ok(result)
+        })
+        .collect()
+}
+
+fn wait_condition(mut object: JsonObject<String, Value>) -> Result<WaitCondition, RuntimeError> {
+    let condition = match required_string(&mut object, "type")?.as_str() {
+        "frame_advanced" => WaitCondition::FrameAdvanced {
+            after_frame_id: required_opaque_id(&mut object, "after_frame_id", "frame")?,
+        },
+        "frame_changed" => WaitCondition::FrameChanged {
+            after_frame_id: required_opaque_id(&mut object, "after_frame_id", "frame")?,
+        },
+        "frame_stable" => WaitCondition::FrameStable {
+            for_ms: required_timeout(&mut object, "for_ms", MAX_WAIT_STABLE_MS)?,
+        },
+        "accessibility_advanced" => WaitCondition::AccessibilityAdvanced {
+            after_observation_id: required_opaque_id(&mut object, "after_observation_id", "obs")?,
+        },
+        "element_state" => WaitCondition::ElementState {
+            observation_id: required_opaque_id(&mut object, "observation_id", "obs")?,
+            element_id: required_opaque_id(&mut object, "element_id", "e")?,
+            state: bounded_nonblank(
+                required_string(&mut object, "state")?,
+                "state",
+                MAX_QUERY_LENGTH,
+            )?,
+        },
+        "element_value" => WaitCondition::ElementValue {
+            observation_id: required_opaque_id(&mut object, "observation_id", "obs")?,
+            element_id: required_opaque_id(&mut object, "element_id", "e")?,
+            value: bounded_text(
+                required_string(&mut object, "value")?,
+                "value",
+                MAX_TEXT_LIMIT,
+            )?,
+        },
+        _ => return invalid("condition.type is not a supported wait condition"),
+    };
+    reject_unknown(object)?;
+    Ok(condition)
+}
+
+fn required_timeout(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+    maximum: u64,
+) -> Result<u64, RuntimeError> {
+    let value = json_integer(&required(arguments, key)?).ok_or_else(|| {
+        RuntimeError::invalid_arguments(format!("argument {key:?} must be an integer"))
+    })?;
+    if value > maximum {
+        return invalid(format!(
+            "argument {key:?} must be an integer from 0 through {maximum}"
+        ));
+    }
+    Ok(value)
+}
+
+fn element_action(mut object: JsonObject<String, Value>) -> Result<ElementAction, RuntimeError> {
+    let action = match required_string(&mut object, "type")?.as_str() {
+        "invoke" => ElementAction::Invoke,
+        "named" => {
+            let name = bounded_text(
+                required_string(&mut object, "name")?,
+                "name",
+                MAX_QUERY_LENGTH,
+            )?;
+            if name.trim().is_empty() {
+                return invalid("argument \"name\" must not be blank");
+            }
+            ElementAction::Named(name)
+        }
+        "focus" => ElementAction::Focus,
+        "set_value" => ElementAction::SetValue(bounded_text(
+            required_string(&mut object, "value")?,
+            "value",
+            MAX_TEXT_LIMIT,
+        )?),
+        _ => return invalid("element action type must be invoke, named, focus, or set_value"),
+    };
+    reject_unknown(object)?;
+    Ok(action)
 }
 
 fn required(arguments: &mut JsonObject<String, Value>, key: &str) -> Result<Value, RuntimeError> {
@@ -317,16 +840,22 @@ fn required_string(
         })
 }
 
-fn required_nonblank(
-    arguments: &mut JsonObject<String, Value>,
-    key: &str,
-) -> Result<String, RuntimeError> {
-    let value = required_string(arguments, key)?;
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
+fn bounded_text(value: String, key: &str, maximum: usize) -> Result<String, RuntimeError> {
+    if value.chars().count() > maximum {
+        return invalid(format!(
+            "argument {key:?} must contain at most {maximum} characters"
+        ));
+    }
+    Ok(value)
+}
+
+fn bounded_nonblank(value: String, key: &str, maximum: usize) -> Result<String, RuntimeError> {
+    let value = bounded_text(value, key, maximum)?;
+    let normalized = value.trim();
+    if normalized.is_empty() {
         return invalid(format!("argument {key:?} must not be blank"));
     }
-    Ok(trimmed.to_owned())
+    Ok(normalized.to_owned())
 }
 
 fn required_desktop_id(
@@ -343,61 +872,6 @@ fn required_desktop_id(
         ));
     }
     Ok(value)
-}
-
-fn required_state_id(
-    arguments: &mut JsonObject<String, Value>,
-    key: &str,
-) -> Result<String, RuntimeError> {
-    let value = required_string(arguments, key)?;
-    let valid = value.len() == 18
-        && value.starts_with("s-")
-        && value[2..]
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
-    if !valid {
-        return invalid(format!(
-            "argument {key:?} must match s- followed by 16 lowercase hexadecimal digits"
-        ));
-    }
-    Ok(value)
-}
-
-fn required_element_id(
-    arguments: &mut JsonObject<String, Value>,
-    key: &str,
-) -> Result<String, RuntimeError> {
-    match required(arguments, key)? {
-        Value::String(value)
-            if value.len() <= 4
-                && value.bytes().all(|byte| byte.is_ascii_digit())
-                && value
-                    .parse::<usize>()
-                    .is_ok_and(|value| value <= MAX_ELEMENT_ID) =>
-        {
-            Ok(value)
-        }
-        Value::Number(value) => {
-            let parsed = value.as_u64().or_else(|| {
-                value.as_f64().and_then(|value| {
-                    (value.is_finite()
-                        && value >= 0.0
-                        && value.fract() == 0.0
-                        && value <= MAX_ELEMENT_ID as f64)
-                        .then_some(value as u64)
-                })
-            });
-            match parsed.and_then(|value| usize::try_from(value).ok()) {
-                Some(value) if value <= MAX_ELEMENT_ID => Ok(value.to_string()),
-                _ => invalid(format!(
-                    "argument {key:?} must be an element ID from 0 through {MAX_ELEMENT_ID}"
-                )),
-            }
-        }
-        _ => invalid(format!(
-            "argument {key:?} must be an element ID from 0 through {MAX_ELEMENT_ID}"
-        )),
-    }
 }
 
 fn required_finite(
@@ -450,45 +924,6 @@ fn optional_button(
     }
 }
 
-fn optional_observation_view(
-    arguments: &mut JsonObject<String, Value>,
-    key: &str,
-) -> Result<ObservationView, RuntimeError> {
-    let Some(value) = arguments.remove(key) else {
-        return Ok(ObservationView::default());
-    };
-    value
-        .as_str()
-        .and_then(ObservationView::parse)
-        .ok_or_else(|| {
-            RuntimeError::invalid_arguments(format!(
-                "argument {key:?} must be full, visible, or interactive"
-            ))
-        })
-}
-
-fn optional_query(
-    arguments: &mut JsonObject<String, Value>,
-    key: &str,
-) -> Result<Option<String>, RuntimeError> {
-    let Some(value) = arguments.remove(key) else {
-        return Ok(None);
-    };
-    let query = value.as_str().ok_or_else(|| {
-        RuntimeError::invalid_arguments(format!("argument {key:?} must be a string"))
-    })?;
-    if query.chars().count() > MAX_QUERY_LENGTH {
-        return invalid(format!(
-            "argument {key:?} must contain at most {MAX_QUERY_LENGTH} characters"
-        ));
-    }
-    let query = query.trim();
-    if query.is_empty() {
-        return invalid(format!("argument {key:?} must not be blank"));
-    }
-    Ok(Some(query.to_owned()))
-}
-
 fn optional_bounded<T>(
     arguments: &mut JsonObject<String, Value>,
     key: &str,
@@ -509,29 +944,6 @@ where
             ))
         })?;
     Ok(Some(value))
-}
-
-fn optional_text_limit(
-    arguments: &mut JsonObject<String, Value>,
-    key: &str,
-) -> Result<Option<TextLimit>, RuntimeError> {
-    let Some(value) = arguments.remove(key) else {
-        return Ok(None);
-    };
-    if value.as_str() == Some("max") {
-        return Ok(Some(TextLimit::Max));
-    }
-    let count = json_integer(&value)
-        .and_then(|value| usize::try_from(value).ok())
-        .ok_or_else(|| {
-            RuntimeError::invalid_arguments(format!(
-                "argument {key:?} must be an integer or \"max\""
-            ))
-        })?;
-    if count > MAX_TEXT_LIMIT {
-        return invalid(format!("argument {key:?} must not exceed {MAX_TEXT_LIMIT}"));
-    }
-    Ok(Some(TextLimit::Count(count)))
 }
 
 fn json_integer(value: &Value) -> Option<u64> {

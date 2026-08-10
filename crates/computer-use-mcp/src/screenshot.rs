@@ -7,17 +7,21 @@ use crate::{
     accessibility::{ObjectId, Snapshot},
     capture::{CaptureBackend, CaptureSession, FrameMetadata, OwnedFrame, PipeWireCapture},
     encoder,
-    geometry::PixelRect,
     input::{
-        GeneratedInputAction, backend::InputBackend, coordinates::ValidatedMapping,
-        eis::ReisInputBackend, keyboard_input, pointer,
+        GeneratedInputAction,
+        backend::{ActionProgress, InputBackend, InputError},
+        coordinates::ValidatedMapping,
+        eis::ReisInputBackend,
+        keyboard_input, pointer,
     },
     portal::{PortalBackend, PortalSessionLease, PortalStream, XdgPortalBackend},
-    validation::{KeyboardFocus, PointerAction},
+    runtime::PostStatus,
+    validation::{KeyboardPoint, PointerAction},
 };
 
 pub(crate) const SESSION_UNAVAILABLE: &str =
     "desktop session is unavailable; disable and re-enable the MCP to request KDE approval again";
+const FRAME_WAIT_BOUND: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenshotError(pub String);
@@ -29,6 +33,22 @@ impl std::fmt::Display for ScreenshotError {
 }
 
 impl std::error::Error for ScreenshotError {}
+
+impl ScreenshotError {
+    pub fn post_status(&self) -> PostStatus {
+        if self.0 == SESSION_UNAVAILABLE {
+            PostStatus::SessionUnavailable
+        } else if self.0.to_ascii_lowercase().contains("timed out") {
+            PostStatus::Timeout
+        } else if self.0.to_ascii_lowercase().contains("stream")
+            || self.0.to_ascii_lowercase().contains("portal")
+        {
+            PostStatus::StreamDegraded
+        } else {
+            PostStatus::CaptureFailed
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScreenshotMapping {
@@ -49,12 +69,49 @@ pub struct ScreenshotObservation {
     pub mapping: ScreenshotMapping,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameWaitCondition {
+    Advanced {
+        after_generation: u64,
+    },
+    Changed {
+        after_generation: u64,
+        after_change_epoch: u64,
+    },
+    Stable {
+        after_generation: u64,
+        after_change_epoch: u64,
+        after_format_generation: u64,
+        for_duration: Duration,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameWaitEvidence {
+    #[cfg(test)]
+    pub metadata: FrameMetadata,
+    pub mapping: ScreenshotMapping,
+    pub changed: Option<bool>,
+    pub stable_for_ms: Option<u64>,
+}
+
 pub trait ScreenshotProvider: Send + Sync + 'static {
     fn prepare(&self) -> impl Future<Output = Result<(), ScreenshotError>> + Send + '_;
     fn capture<'a>(
         &'a self,
         snapshot: &'a Snapshot,
     ) -> impl Future<Output = Result<ScreenshotObservation, ScreenshotError>> + Send + 'a;
+    fn wait_for_frame<'a>(
+        &'a self,
+        _condition: FrameWaitCondition,
+        _mapping: &'a ScreenshotMapping,
+    ) -> impl Future<Output = Result<FrameWaitEvidence, ScreenshotError>> + Send + 'a {
+        async {
+            Err(ScreenshotError(
+                "frame wait is unavailable for this screenshot backend".into(),
+            ))
+        }
+    }
     fn prepare_input<'a>(
         &'a self,
         _snapshot: &'a Snapshot,
@@ -68,13 +125,42 @@ pub trait ScreenshotProvider: Send + Sync + 'static {
         snapshot: &'a Snapshot,
         mapping: &'a ScreenshotMapping,
         action: GeneratedInputAction,
-    ) -> impl Future<Output = Result<(), String>> + Send + 'a;
+        progress: Arc<ActionProgress>,
+    ) -> impl Future<Output = Result<(), InputError>> + Send + 'a;
     fn cleanup_input(&self) -> impl Future<Output = Result<(), String>> + Send + '_ {
         async { Ok(()) }
     }
     fn shutdown_input(&self) -> impl Future<Output = Result<(), String>> + Send + '_ {
         self.cleanup_input()
     }
+}
+
+fn update_stability(
+    metadata: &FrameMetadata,
+    baseline_change_epoch: &mut u64,
+    baseline_format_generation: &mut u64,
+    last_hash: &mut Option<u64>,
+    stable_since: &mut Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+    for_duration: Duration,
+) -> bool {
+    if metadata.change_epoch != *baseline_change_epoch
+        || metadata.format_generation != *baseline_format_generation
+    {
+        // A transient change or format renegotiation resets the interval even
+        // if the next pixels happen to hash back to the old content.
+        *baseline_change_epoch = metadata.change_epoch;
+        *baseline_format_generation = metadata.format_generation;
+        *last_hash = Some(metadata.content_hash);
+        *stable_since = Some(now);
+    } else if *last_hash == Some(metadata.content_hash) {
+        stable_since.get_or_insert(now);
+    } else {
+        *last_hash = Some(metadata.content_hash);
+        *stable_since = Some(now);
+    }
+    stable_since
+        .is_some_and(|since| for_duration.is_zero() || now.duration_since(since) >= for_duration)
 }
 
 #[derive(Debug, Default)]
@@ -97,8 +183,11 @@ impl ScreenshotProvider for NoScreenshots {
         _snapshot: &'a Snapshot,
         _mapping: &'a ScreenshotMapping,
         _action: GeneratedInputAction,
-    ) -> Result<(), String> {
-        Err("generated input requires a live screenshot provider".into())
+        _progress: Arc<ActionProgress>,
+    ) -> Result<(), InputError> {
+        Err(InputError::SessionUnavailable(
+            "generated input requires a live screenshot provider".into(),
+        ))
     }
 }
 
@@ -146,7 +235,7 @@ struct ActiveCapture {
     session: Arc<PortalSessionLease>,
     stream: PortalStream,
     input: Option<Arc<ReisInputBackend>>,
-    input_frame_generation: Option<u64>,
+    health_failure: Option<String>,
 }
 
 fn terminal_failure(active: &ActiveCapture) -> Option<String> {
@@ -155,6 +244,48 @@ fn terminal_failure(active: &ActiveCapture) -> Option<String> {
         .is_closed()
         .then(|| "portal session closed".to_owned())
         .or_else(|| active.capture.failure())
+        .or_else(|| active.health_failure.clone())
+}
+
+async fn latest_frame_checked(
+    state: &mut CaptureState,
+    after_generation: Option<u64>,
+    wait: Duration,
+) -> Result<OwnedFrame, ScreenshotError> {
+    if state.active().is_none() {
+        return Err(session_unavailable());
+    }
+    if state
+        .active()
+        .is_some_and(|active| active.session.is_closed())
+    {
+        exhaust_capture(state, "portal session closed during frame wait").await;
+        return Err(session_unavailable());
+    }
+    let result = {
+        let active = state.active_mut().ok_or_else(session_unavailable)?;
+        active.capture.latest_after(after_generation, wait).await
+    };
+    if let Some(reason) = state.active().and_then(terminal_failure) {
+        eprintln!(
+            "computer-use-mcp: desktop session became unavailable during frame wait: {reason}"
+        );
+        exhaust_capture(
+            state,
+            "desktop session became unavailable during frame wait",
+        )
+        .await;
+        return Err(session_unavailable());
+    }
+    let frame = result.map_err(ScreenshotError)?;
+    if frame.metadata.stream_health == crate::capture::StreamHealth::Failed {
+        eprintln!(
+            "computer-use-mcp: capture returned a terminal failed-health frame during frame wait"
+        );
+        exhaust_capture(state, "capture stream health failed during frame wait").await;
+        return Err(session_unavailable());
+    }
+    Ok(frame)
 }
 
 enum CaptureState {
@@ -231,7 +362,7 @@ where
                 session: connection.session,
                 stream: connection.stream,
                 input: None,
-                input_frame_generation: None,
+                health_failure: None,
             })
         }
         .await;
@@ -251,7 +382,7 @@ where
         snapshot: &'a Snapshot,
     ) -> Result<ScreenshotObservation, ScreenshotError> {
         let mut state = self.state.lock().await;
-        let result = async {
+        let result: Result<ScreenshotObservation, ScreenshotError> = async {
             let active = state.active_mut().ok_or_else(session_unavailable)?;
             if active.session.is_closed() {
                 return Err(session_unavailable());
@@ -267,24 +398,9 @@ where
                 .await
                 .map_err(ScreenshotError)?;
             let source = frame.metadata;
-            let (width, height) = if source.transform.swaps_axes() {
-                (source.crop.height, source.crop.width)
-            } else {
-                (source.crop.width, source.crop.height)
-            };
-            let encoded = encoder::encode(
-                frame.rgba,
-                source.size,
-                source.crop,
-                source.transform,
-                PixelRect {
-                    x: 0,
-                    y: 0,
-                    width,
-                    height,
-                },
-            )
-            .map_err(ScreenshotError)?;
+            let encoded =
+                encoder::encode_frame(frame.rgba, source.size, source.crop, source.transform)
+                    .map_err(ScreenshotError)?;
             if active.session.is_closed() {
                 return Err(session_unavailable());
             }
@@ -317,6 +433,130 @@ where
         result
     }
 
+    async fn wait_for_frame(
+        &self,
+        condition: FrameWaitCondition,
+        mapping: &ScreenshotMapping,
+    ) -> Result<FrameWaitEvidence, ScreenshotError> {
+        let mut state = self.state.lock().await;
+        let Some(active) = state.active() else {
+            return Err(session_unavailable());
+        };
+        if active.session.is_closed()
+            || active.session.identity() != mapping.portal_session_identity
+            || active.session.generation() != mapping.portal_session_generation
+            || active.stream != mapping.stream
+        {
+            eprintln!(
+                "computer-use-mcp: refusing frame wait with a stale visual binding: session or stream changed"
+            );
+            return Err(session_unavailable());
+        }
+        if mapping.source.stream_health == crate::capture::StreamHealth::Failed {
+            return Err(session_unavailable());
+        }
+        let mut stable_elapsed_ms = None;
+        let frame = match condition {
+            FrameWaitCondition::Advanced { after_generation } => {
+                latest_frame_checked(&mut state, Some(after_generation), FRAME_WAIT_BOUND).await?
+            }
+            FrameWaitCondition::Changed {
+                after_generation,
+                after_change_epoch,
+            } => {
+                let deadline = tokio::time::Instant::now() + FRAME_WAIT_BOUND;
+                let mut generation = after_generation;
+                loop {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(ScreenshotError(
+                            "timed out waiting for a changed frame".into(),
+                        ));
+                    }
+                    let frame =
+                        latest_frame_checked(&mut state, Some(generation), remaining).await?;
+                    generation = frame.metadata.generation;
+                    if frame.metadata.change_epoch > after_change_epoch {
+                        break frame;
+                    }
+                }
+            }
+            FrameWaitCondition::Stable {
+                after_generation,
+                after_change_epoch,
+                after_format_generation,
+                for_duration,
+            } => {
+                let deadline = tokio::time::Instant::now() + FRAME_WAIT_BOUND;
+                let mut generation = after_generation;
+                let mut change_epoch = after_change_epoch;
+                let mut format_generation = after_format_generation;
+                let mut last_hash = None;
+                let mut stable_since = None;
+                loop {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(ScreenshotError(
+                            "timed out waiting for a stable frame with fresh evidence".into(),
+                        ));
+                    }
+                    let frame =
+                        latest_frame_checked(&mut state, Some(generation), remaining).await?;
+                    generation = frame.metadata.generation;
+                    let now = tokio::time::Instant::now();
+                    if update_stability(
+                        &frame.metadata,
+                        &mut change_epoch,
+                        &mut format_generation,
+                        &mut last_hash,
+                        &mut stable_since,
+                        now,
+                        for_duration,
+                    ) {
+                        stable_elapsed_ms = stable_since.map(|since| {
+                            now.duration_since(since)
+                                .as_millis()
+                                .min(u128::from(u64::MAX)) as u64
+                        });
+                        break frame;
+                    }
+                }
+            }
+        };
+        let stable_for_ms = match condition {
+            FrameWaitCondition::Stable { .. } => stable_elapsed_ms,
+            _ => None,
+        };
+        let mut bound_mapping = mapping.clone();
+        let encoded = encoder::encode_frame(
+            frame.rgba,
+            frame.metadata.size,
+            frame.metadata.crop,
+            frame.metadata.transform,
+        )
+        .map_err(ScreenshotError)?;
+        bound_mapping.source = frame.metadata;
+        bound_mapping.output_size = encoded.size;
+        Ok(FrameWaitEvidence {
+            changed: match condition {
+                FrameWaitCondition::Changed { .. } => Some(true),
+                FrameWaitCondition::Stable {
+                    after_change_epoch,
+                    after_format_generation,
+                    ..
+                } => Some(
+                    frame.metadata.change_epoch != after_change_epoch
+                        || frame.metadata.format_generation != after_format_generation,
+                ),
+                FrameWaitCondition::Advanced { .. } => frame.metadata.changed_from_previous,
+            },
+            #[cfg(test)]
+            metadata: frame.metadata,
+            mapping: bound_mapping,
+            stable_for_ms,
+        })
+    }
+
     async fn prepare_input<'a>(
         &'a self,
         snapshot: &'a Snapshot,
@@ -324,20 +564,40 @@ where
         action: &'a GeneratedInputAction,
     ) -> Result<(), String> {
         let mut state = self.state.lock().await;
-        let active = state
-            .active_mut()
-            .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?;
-        if active.session.is_closed() {
+        if state
+            .active()
+            .is_none_or(|active| active.session.is_closed())
+        {
             exhaust_capture(&mut state, "portal session closed before input preparation").await;
             return Err(SESSION_UNAVAILABLE.into());
         }
-        ValidatedMapping::new(snapshot, mapping, &active.session, &active.stream)?;
-        validate_current_capture(active, mapping).await?;
-        let keyboard_required = matches!(action, GeneratedInputAction::Keyboard { .. });
-        let connected_now = active.input.is_none();
+        {
+            let active = state
+                .active()
+                .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?;
+            ValidatedMapping::new(snapshot, mapping, &active.session, &active.stream)?;
+        }
+        validate_current_capture_state(&mut state, mapping, "before input preparation").await?;
+        let keyboard_required = matches!(action, GeneratedInputAction::KeyboardTransaction { .. });
+        let connected_now = state
+            .active()
+            .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
+            .input
+            .is_none();
         if connected_now {
-            match ReisInputBackend::connect(Arc::clone(&active.session), &mapping.stream).await {
-                Ok(input) => active.input = Some(input),
+            let session = Arc::clone(
+                &state
+                    .active()
+                    .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
+                    .session,
+            );
+            match ReisInputBackend::connect(session, &mapping.stream).await {
+                Ok(input) => {
+                    state
+                        .active_mut()
+                        .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
+                        .input = Some(input)
+                }
                 Err(error) => {
                     exhaust_capture(&mut state, "EIS setup failed").await;
                     return Err(format!("{SESSION_UNAVAILABLE}: EIS setup failed: {error}"));
@@ -345,18 +605,50 @@ where
             }
         }
         if connected_now {
-            validate_current_capture(active, mapping).await?;
+            validate_current_capture_state(&mut state, mapping, "after EIS setup").await?;
         }
-        let input = active
+        let input = state
+            .active()
+            .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
             .input
             .as_ref()
             .ok_or_else(|| "EIS backend disappeared after setup".to_owned())?;
-        let region = input.wait_for_action(keyboard_required).await?;
-        ValidatedMapping::new(snapshot, mapping, &active.session, &active.stream)?
+        let input = Arc::clone(input);
+        let region = match input.wait_for_action(keyboard_required).await {
+            Ok(region) => region,
+            Err(error) => {
+                if state.active().and_then(terminal_failure).is_some() {
+                    exhaust_capture(&mut state, "desktop session failed while preparing input")
+                        .await;
+                    return Err(SESSION_UNAVAILABLE.into());
+                }
+                return Err(error);
+            }
+        };
+        if let Some(failure) = state.active().and_then(terminal_failure) {
+            exhaust_capture(&mut state, "desktop session failed while preparing input").await;
+            return Err(format!("{SESSION_UNAVAILABLE}: {failure}"));
+        }
+        validate_current_capture_state(&mut state, mapping, "after EIS synchronization").await?;
+        let active = state
+            .active()
+            .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?;
+        let mapper = ValidatedMapping::new(snapshot, mapping, &active.session, &active.stream)?
             .eis_mapper(region)?;
         require_action_capabilities(input.as_ref(), action)?;
-        if let GeneratedInputAction::Keyboard { action, .. } = action {
-            keyboard_input::preflight(input, action)?;
+        match action {
+            GeneratedInputAction::Pointer(action) => preflight_pointer(&mapper, action)?,
+            GeneratedInputAction::KeyboardTransaction { focus, events } => {
+                let focus = mapper.point(focus.x, focus.y)?;
+                keyboard_input::preflight_transaction(
+                    &input,
+                    KeyboardPoint {
+                        x: focus.0,
+                        y: focus.1,
+                    },
+                    events,
+                )?;
+            }
         }
         Ok(())
     }
@@ -366,47 +658,45 @@ where
         snapshot: &'a Snapshot,
         mapping: &'a ScreenshotMapping,
         action: GeneratedInputAction,
-    ) -> Result<(), String> {
+        progress: Arc<ActionProgress>,
+    ) -> Result<(), InputError> {
         let mut state = self.state.lock().await;
-        let active = state
-            .active_mut()
-            .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?;
-        if active.session.is_closed() {
+        if state
+            .active()
+            .is_none_or(|active| active.session.is_closed())
+        {
             exhaust_capture(&mut state, "portal session closed before generated input").await;
-            return Err(SESSION_UNAVAILABLE.into());
+            return Err(InputError::SessionUnavailable(SESSION_UNAVAILABLE.into()));
         }
-        let semantic_keyboard = matches!(
-            &action,
-            GeneratedInputAction::Keyboard {
-                focus: KeyboardFocus::Element(_),
-                ..
-            }
-        );
-        if !semantic_keyboard {
+        {
+            let active = state
+                .active()
+                .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?;
             ValidatedMapping::new(snapshot, mapping, &active.session, &active.stream)?;
-            if let Err(error) = validate_current_capture(active, mapping).await {
-                eprintln!("computer-use-mcp: invalidating capture before input: {error}");
-                exhaust_capture(&mut state, "capture validation failed before input").await;
-                return Err(error);
-            }
         }
-        let input = active
+        validate_current_capture_state(&mut state, mapping, "before input dispatch").await?;
+        let input = state
+            .active()
+            .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
             .input
             .as_ref()
             .ok_or_else(|| "EIS input was not prepared for this action".to_owned())?
             .clone();
         let backend: Arc<dyn InputBackend> = input.clone();
+        let active = state
+            .active()
+            .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?;
         let validated = ValidatedMapping::new(snapshot, mapping, &active.session, &active.stream)?;
         let region = input.region()?;
         let mapper = validated.eis_mapper(region)?;
         require_action_capabilities(input.as_ref(), &action)?;
 
-        let result = async {
+        let result: Result<(), String> = async {
             match action {
                 GeneratedInputAction::Pointer(action) => match action {
                     PointerAction::Move { x, y } => {
                         let (x, y) = mapper.point(x, y)?;
-                        pointer::move_pointer(backend, x, y).await?;
+                        pointer::move_pointer(backend, x, y, Arc::clone(&progress)).await?;
                     }
                     PointerAction::Click {
                         x,
@@ -415,12 +705,14 @@ where
                         count,
                     } => {
                         let (x, y) = mapper.point(x, y)?;
-                        pointer::click(backend, x, y, button, count).await?;
+                        pointer::click(backend, x, y, button, count, Arc::clone(&progress)).await?;
                     }
-                    PointerAction::Drag { from, to } => {
-                        let from = mapper.point(from.0, from.1)?;
-                        let to = mapper.point(to.0, to.1)?;
-                        pointer::drag(backend, from, to).await?;
+                    PointerAction::Drag { path } => {
+                        let path = path
+                            .into_iter()
+                            .map(|point| mapper.point(point.0, point.1))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        pointer::drag_path(backend, path, Arc::clone(&progress)).await?;
                     }
                     PointerAction::Scroll {
                         x,
@@ -429,26 +721,29 @@ where
                         delta_y,
                     } => {
                         let (x, y) = mapper.point(x, y)?;
-                        pointer::scroll(backend, x, y, delta_x, delta_y).await?;
+                        pointer::scroll(backend, x, y, delta_x, delta_y, Arc::clone(&progress))
+                            .await?;
                     }
                 },
-                GeneratedInputAction::Keyboard { focus, action } => {
-                    let focus = match focus {
-                        KeyboardFocus::Point((x, y)) => Some(mapper.point(x, y)?),
-                        KeyboardFocus::Element(_) => None,
+                GeneratedInputAction::KeyboardTransaction { focus, events } => {
+                    let focus = mapper.point(focus.x, focus.y)?;
+                    let focus = KeyboardPoint {
+                        x: focus.0,
+                        y: focus.1,
                     };
-                    keyboard_input::perform(input, focus, action).await?;
+                    keyboard_input::perform_transaction(
+                        input,
+                        focus,
+                        events,
+                        Arc::clone(&progress),
+                    )
+                    .await?;
                 }
             }
             Ok(())
         }
         .await;
-        if let Some(reason) = state.active().and_then(terminal_failure) {
-            eprintln!("computer-use-mcp: desktop session became unavailable: {reason}");
-            exhaust_capture(&mut state, "desktop session failed during generated input").await;
-            return Err(format!("{SESSION_UNAVAILABLE}: {reason}"));
-        }
-        result
+        result.map_err(InputError::from)
     }
 
     async fn cleanup_input(&self) -> Result<(), String> {
@@ -495,7 +790,7 @@ async fn close_active(active: ActiveCapture, reason: &str) -> Result<(), String>
         session,
         stream: _,
         input,
-        input_frame_generation: _,
+        health_failure: _,
     } = active;
     let cleanup = match input.as_ref() {
         Some(input) => tokio::time::timeout(Duration::from_secs(2), input.cleanup_barrier())
@@ -527,38 +822,76 @@ async fn close_startup_session(session: &PortalSessionLease, reason: &str) {
     }
 }
 
-async fn validate_current_capture(
+fn validate_current_capture(
     active: &mut ActiveCapture,
     mapping: &ScreenshotMapping,
 ) -> Result<(), String> {
-    let after_generation = active
-        .input_frame_generation
-        .unwrap_or(mapping.source.generation)
-        .max(mapping.source.generation);
-    let frame = active
-        .capture
-        .latest_after(Some(after_generation), Duration::from_millis(250))
-        .await?;
-    verify_current_frame_metadata(&frame, mapping)?;
-    active.input_frame_generation = Some(frame.metadata.generation);
+    let metadata = match active.capture.current_metadata() {
+        Ok(Some(metadata)) => metadata,
+        Ok(None) => {
+            return Err(
+                "capture has no currently committed complete frame; refusing generated input"
+                    .into(),
+            );
+        }
+        Err(error) => {
+            if let Some(reason) = terminal_failure(active) {
+                active.health_failure = Some(reason);
+            }
+            return Err(error);
+        }
+    };
+    if metadata.stream_health == crate::capture::StreamHealth::Failed {
+        let reason = "capture stream health is failed".to_owned();
+        active.health_failure = Some(reason.clone());
+        return Err(reason);
+    }
+    if metadata.stream_health == crate::capture::StreamHealth::Degraded {
+        return Err("capture stream health is degraded; refusing generated input".into());
+    }
+    verify_current_frame_metadata(&metadata, mapping)?;
     Ok(())
 }
 
+async fn validate_current_capture_state(
+    state: &mut CaptureState,
+    mapping: &ScreenshotMapping,
+    reason: &str,
+) -> Result<(), String> {
+    let result = {
+        let active = state
+            .active_mut()
+            .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?;
+        validate_current_capture(active, mapping)
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Some(failure) = state.active().and_then(terminal_failure) {
+                eprintln!("computer-use-mcp: desktop session became unavailable: {failure}");
+                exhaust_capture(state, reason).await;
+                return Err(format!("{SESSION_UNAVAILABLE}: {failure}"));
+            }
+            eprintln!(
+                "computer-use-mcp: generated input frame validation failed {reason}: {error}"
+            );
+            Err(error)
+        }
+    }
+}
+
 fn verify_current_frame_metadata(
-    frame: &OwnedFrame,
+    metadata: &FrameMetadata,
     mapping: &ScreenshotMapping,
 ) -> Result<(), String> {
-    if frame.metadata.format_generation != mapping.source.format_generation
-        || frame.metadata.size != mapping.source.size
-        || frame.metadata.crop != mapping.source.crop
-        || frame.metadata.transform != mapping.source.transform
+    if metadata.format_generation != mapping.source.format_generation
+        || metadata.size != mapping.source.size
+        || metadata.crop != mapping.source.crop
+        || metadata.transform != mapping.source.transform
     {
         return Err(format!(
             "PipeWire stream metadata renegotiated after screenshot: format_generation={} size={:?} crop={:?} transform={:?}",
-            frame.metadata.format_generation,
-            frame.metadata.size,
-            frame.metadata.crop,
-            frame.metadata.transform
+            metadata.format_generation, metadata.size, metadata.crop, metadata.transform
         ));
     }
     Ok(())
@@ -574,11 +907,28 @@ fn require_action_capabilities(
             (true, false, false)
         }
         GeneratedInputAction::Pointer(PointerAction::Scroll { .. }) => (false, true, false),
-        GeneratedInputAction::Keyboard { focus, .. } => {
-            (matches!(focus, KeyboardFocus::Point(_)), false, true)
-        }
+        GeneratedInputAction::KeyboardTransaction { .. } => (false, false, true),
     };
     backend.require_capabilities(button, scroll, keyboard)
+}
+
+fn preflight_pointer(
+    mapper: &crate::input::coordinates::AbsoluteMapper,
+    action: &PointerAction,
+) -> Result<(), String> {
+    match action {
+        PointerAction::Move { x, y }
+        | PointerAction::Click { x, y, .. }
+        | PointerAction::Scroll { x, y, .. } => {
+            mapper.point(*x, *y)?;
+        }
+        PointerAction::Drag { path } => {
+            for point in path {
+                mapper.point(point.0, point.1)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -627,6 +977,10 @@ mod tests {
         markers: StdMutex<Vec<u8>>,
         failures: StdMutex<Vec<Arc<StdMutex<Option<String>>>>>,
         drops: AtomicUsize,
+        never_fresh: AtomicUsize,
+        failed_health: AtomicUsize,
+        format_generation: AtomicUsize,
+        current_metadata_checks: AtomicUsize,
     }
 
     struct FakeCaptureBackend(Arc<FakeCaptureState>);
@@ -650,6 +1004,7 @@ mod tests {
             Ok(Box::new(FakeCaptureSession {
                 failure,
                 drops: Arc::clone(&self.0),
+                never_fresh: self.0.never_fresh.load(Ordering::Acquire) != 0,
             }))
         }
     }
@@ -657,6 +1012,7 @@ mod tests {
     struct FakeCaptureSession {
         failure: Arc<StdMutex<Option<String>>>,
         drops: Arc<FakeCaptureState>,
+        never_fresh: bool,
     }
 
     impl CaptureSession for FakeCaptureSession {
@@ -669,30 +1025,38 @@ mod tests {
             self.failure.lock().unwrap().clone()
         }
 
+        fn current_metadata(&self) -> Result<Option<FrameMetadata>, String> {
+            self.drops
+                .current_metadata_checks
+                .fetch_add(1, Ordering::AcqRel);
+            if let Some(error) = self.failure() {
+                return Err(error);
+            }
+            Ok(Some(fake_metadata(
+                1,
+                self.drops.format_generation.load(Ordering::Acquire).max(1) as u64,
+                self.drops.failed_health.load(Ordering::Acquire) != 0,
+            )))
+        }
+
         fn latest_after(
             &mut self,
             after_generation: Option<u64>,
             _wait: Duration,
         ) -> CaptureFuture<'_, OwnedFrame> {
             let failure = self.failure();
+            let never_fresh = self.never_fresh;
+            let failed_health = self.drops.failed_health.load(Ordering::Acquire) != 0;
             Box::pin(async move {
                 if let Some(error) = failure {
                     return Err(error);
                 }
+                if never_fresh {
+                    return Err("timed out waiting for a complete frame".into());
+                }
                 let generation = after_generation.unwrap_or(0) + 1;
                 Ok(OwnedFrame {
-                    metadata: FrameMetadata {
-                        generation,
-                        format_generation: 1,
-                        size: (2, 2),
-                        crop: PixelRect {
-                            x: 0,
-                            y: 0,
-                            width: 2,
-                            height: 2,
-                        },
-                        transform: Transform::Normal,
-                    },
+                    metadata: fake_metadata(generation, 1, failed_health),
                     rgba: vec![255; 16],
                 })
             })
@@ -702,6 +1066,38 @@ mod tests {
     impl Drop for FakeCaptureSession {
         fn drop(&mut self) {
             self.drops.drops.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn fake_metadata(
+        generation: u64,
+        format_generation: u64,
+        failed_health: bool,
+    ) -> FrameMetadata {
+        FrameMetadata {
+            generation,
+            format_generation,
+            source_sequence: Some(generation),
+            pts_ns: Some(i64::try_from(generation).unwrap_or_default()),
+            arrival_monotonic_ns: generation,
+            size: (2, 2),
+            crop: PixelRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+            transform: Transform::Normal,
+            timestamp_authority: crate::capture::TimestampAuthority::SpaHeader,
+            stream_health: if failed_health {
+                crate::capture::StreamHealth::Failed
+            } else {
+                crate::capture::StreamHealth::Healthy
+            },
+            content_hash: 0,
+            change_epoch: 0,
+            changed_from_previous: None,
+            sequence_gap: None,
         }
     }
 
@@ -772,8 +1168,7 @@ mod tests {
             path: "/window".into(),
         };
         Snapshot {
-            app_query: "test".into(),
-            view: crate::validation::ObservationView::Full,
+            view: crate::validation::AccessibilityScope::Full,
             element_query: None,
             app: AppInfo {
                 object: ObjectId {
@@ -791,6 +1186,7 @@ mod tests {
             },
             generation: 1,
             elements: Vec::new(),
+            element_ids: Vec::new(),
             node_limit_reached: false,
             depth_limit_reached: false,
             limits: SnapshotLimits {
@@ -798,6 +1194,60 @@ mod tests {
                 nodes: 10,
                 depth: 10,
             },
+            target_ref: None,
+            accessibility_ready: true,
+            accessibility_reason: None,
+            requires_atspi_revalidation: true,
+            screenshot_requested: true,
+        }
+    }
+
+    fn test_mapping() -> ScreenshotMapping {
+        let crop = PixelRect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
+        ScreenshotMapping {
+            app_pid: 5,
+            app_identity: ObjectId {
+                bus_name: ":1.5".into(),
+                path: "/app".into(),
+            },
+            window_identity: ObjectId {
+                bus_name: ":1.5".into(),
+                path: "/window".into(),
+            },
+            accessibility_generation: 1,
+            portal_session_identity: "/session/test".into(),
+            portal_session_generation: 1,
+            stream: PortalStream {
+                stream_index: 0,
+                node_id: 10,
+                pipewire_serial: Some(20),
+                id: Some("stream".into()),
+                mapping_id: Some("mapping".into()),
+                position: Some((0, 0)),
+                logical_size: Some((2, 2)),
+            },
+            source: FrameMetadata {
+                generation: 0,
+                format_generation: 1,
+                source_sequence: Some(0),
+                pts_ns: Some(0),
+                arrival_monotonic_ns: 0,
+                size: (2, 2),
+                crop,
+                transform: Transform::Normal,
+                timestamp_authority: crate::capture::TimestampAuthority::SpaHeader,
+                stream_health: crate::capture::StreamHealth::Healthy,
+                content_hash: 0,
+                change_epoch: 0,
+                changed_from_previous: None,
+                sequence_gap: None,
+            },
+            output_size: (2, 2),
         }
     }
 
@@ -824,6 +1274,204 @@ mod tests {
         assert!(coordinator.capture(&test_snapshot()).await.is_err());
         assert_terminal(&coordinator).await;
         assert_eq!(coordinator.portal.establishes.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn stable_wait_requires_fresh_frame_evidence() {
+        let (connection, _) = test_connection(1, 11);
+        let capture_state = Arc::new(FakeCaptureState::default());
+        capture_state.never_fresh.store(1, Ordering::Release);
+        let coordinator = test_coordinator([connection], Arc::clone(&capture_state));
+        coordinator.prepare().await.unwrap();
+        let error = coordinator
+            .wait_for_frame(
+                FrameWaitCondition::Stable {
+                    after_generation: 0,
+                    after_change_epoch: 0,
+                    after_format_generation: 1,
+                    for_duration: Duration::from_millis(50),
+                },
+                &test_mapping(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.0.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn frame_wait_binds_the_new_frame_to_the_existing_visual_mapping() {
+        let (connection, _) = test_connection(1, 11);
+        let coordinator = test_coordinator([connection], Arc::new(FakeCaptureState::default()));
+        coordinator.prepare().await.unwrap();
+        let evidence = coordinator
+            .wait_for_frame(
+                FrameWaitCondition::Advanced {
+                    after_generation: 0,
+                },
+                &test_mapping(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(evidence.metadata.generation, 1);
+        assert_eq!(evidence.mapping.source.generation, 1);
+        assert_eq!(evidence.mapping.source.format_generation, 1);
+        assert_eq!(evidence.mapping.output_size, (2, 2));
+    }
+
+    #[tokio::test]
+    async fn terminal_failed_stream_health_exhausts_before_generated_input() {
+        let (connection, _) = test_connection(1, 11);
+        let capture_state = Arc::new(FakeCaptureState::default());
+        capture_state.failed_health.store(1, Ordering::Release);
+        let coordinator = test_coordinator([connection], Arc::clone(&capture_state));
+        coordinator.prepare().await.unwrap();
+        let error = coordinator
+            .prepare_input(
+                &test_snapshot(),
+                &test_mapping(),
+                &GeneratedInputAction::Pointer(PointerAction::Move { x: 1.0, y: 1.0 }),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("disable and re-enable the MCP"));
+        assert_terminal(&coordinator).await;
+    }
+
+    #[tokio::test]
+    async fn repeated_input_validation_reuses_static_source_mapping_without_newer_frame() {
+        let (connection, _) = test_connection(1, 11);
+        let capture_state = Arc::new(FakeCaptureState::default());
+        let coordinator = test_coordinator([connection], Arc::clone(&capture_state));
+        coordinator.prepare().await.unwrap();
+        let mapping = test_mapping();
+
+        let mut state = coordinator.state.lock().await;
+        validate_current_capture_state(&mut state, &mapping, "static source validation")
+            .await
+            .unwrap();
+        validate_current_capture_state(&mut state, &mapping, "repeated static source validation")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            capture_state
+                .current_metadata_checks
+                .load(Ordering::Acquire),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_frame_delivery_does_not_block_fresh_source_input_validation() {
+        let (connection, _) = test_connection(1, 11);
+        let capture_state = Arc::new(FakeCaptureState::default());
+        capture_state.never_fresh.store(1, Ordering::Release);
+        let coordinator = test_coordinator([connection], Arc::clone(&capture_state));
+        coordinator.prepare().await.unwrap();
+
+        let mut state = coordinator.state.lock().await;
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            validate_current_capture_state(&mut state, &test_mapping(), "slow frame validation"),
+        )
+        .await
+        .expect("pre-dispatch validation must not wait for a later complete frame")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn input_validation_rejects_current_format_generation_change() {
+        let (connection, _) = test_connection(1, 11);
+        let capture_state = Arc::new(FakeCaptureState::default());
+        capture_state.format_generation.store(2, Ordering::Release);
+        let coordinator = test_coordinator([connection], capture_state);
+        coordinator.prepare().await.unwrap();
+
+        let mut state = coordinator.state.lock().await;
+        let error = validate_current_capture_state(
+            &mut state,
+            &test_mapping(),
+            "format generation validation",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("renegotiated"));
+    }
+
+    #[test]
+    fn stability_resets_on_transient_change_and_format_renegotiation() {
+        let mut change_epoch = 0;
+        let mut format_generation = 1;
+        let mut last_hash = None;
+        let mut stable_since = None;
+        let start = tokio::time::Instant::now();
+        let frame = |generation, format_generation, change_epoch, content_hash| FrameMetadata {
+            generation,
+            format_generation,
+            source_sequence: Some(generation),
+            pts_ns: Some(generation as i64),
+            arrival_monotonic_ns: generation,
+            size: (2, 2),
+            crop: PixelRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+            transform: Transform::Normal,
+            timestamp_authority: crate::capture::TimestampAuthority::SpaHeader,
+            stream_health: crate::capture::StreamHealth::Healthy,
+            content_hash,
+            change_epoch,
+            changed_from_previous: None,
+            sequence_gap: None,
+        };
+
+        assert!(!update_stability(
+            &frame(1, 1, 0, 7),
+            &mut change_epoch,
+            &mut format_generation,
+            &mut last_hash,
+            &mut stable_since,
+            start,
+            Duration::from_millis(50),
+        ));
+        assert!(update_stability(
+            &frame(2, 1, 0, 7),
+            &mut change_epoch,
+            &mut format_generation,
+            &mut last_hash,
+            &mut stable_since,
+            start + Duration::from_millis(60),
+            Duration::from_millis(50),
+        ));
+        assert!(!update_stability(
+            &frame(3, 1, 1, 7),
+            &mut change_epoch,
+            &mut format_generation,
+            &mut last_hash,
+            &mut stable_since,
+            start + Duration::from_millis(61),
+            Duration::from_millis(50),
+        ));
+        assert!(!update_stability(
+            &frame(4, 2, 1, 7),
+            &mut change_epoch,
+            &mut format_generation,
+            &mut last_hash,
+            &mut stable_since,
+            start + Duration::from_millis(62),
+            Duration::from_millis(50),
+        ));
+        assert!(update_stability(
+            &frame(5, 2, 1, 7),
+            &mut change_epoch,
+            &mut format_generation,
+            &mut last_hash,
+            &mut stable_since,
+            start + Duration::from_millis(120),
+            Duration::from_millis(50),
+        ));
     }
 
     #[tokio::test]
@@ -857,23 +1505,20 @@ mod tests {
         assert_eq!(observation.mapping.source.generation, 2);
         assert_eq!(observation.mapping.portal_session_generation, 9);
         assert_eq!(observation.mapping.output_size, (2, 2));
-        let matching = OwnedFrame {
-            metadata: FrameMetadata {
-                generation: observation.mapping.source.generation + 1,
-                ..observation.mapping.source
-            },
-            rgba: vec![0; 16],
+        let matching = FrameMetadata {
+            generation: observation.mapping.source.generation + 1,
+            ..observation.mapping.source
         };
         assert!(verify_current_frame_metadata(&matching, &observation.mapping).is_ok());
-        let mut same_geometry_new_format = matching.clone();
-        same_geometry_new_format.metadata.format_generation += 1;
+        let mut same_geometry_new_format = matching;
+        same_geometry_new_format.format_generation += 1;
         assert!(
             verify_current_frame_metadata(&same_geometry_new_format, &observation.mapping)
                 .unwrap_err()
                 .contains("renegotiated")
         );
         let mut renegotiated = matching;
-        renegotiated.metadata.size.0 = 3;
+        renegotiated.size.0 = 3;
         assert!(
             verify_current_frame_metadata(&renegotiated, &observation.mapping)
                 .unwrap_err()
