@@ -39,6 +39,7 @@ impl<'a> ValidatedMapping<'a> {
 #[derive(Debug)]
 pub(crate) enum EisRoute {
     MappingId(String),
+    UniqueResumedRegion,
     ExactGeometry {
         position: (u32, u32),
         size: (u32, u32),
@@ -50,11 +51,11 @@ impl EisRoute {
         if let Some(mapping_id) = &stream.mapping_id {
             return Ok(Self::MappingId(mapping_id.clone()));
         }
-        let position = stream.position.ok_or(
-            "monitor stream omitted mapping_id and position; generated input cannot be bound to the approved monitor",
-        )?;
+        let Some(position) = stream.position else {
+            return Ok(Self::UniqueResumedRegion);
+        };
         let size = stream.logical_size.ok_or(
-            "monitor stream omitted mapping_id and logical size; generated input cannot be bound to the approved monitor",
+            "monitor stream omitted mapping_id and logical size; generated input cannot be bound by exact geometry",
         )?;
         let nonnegative = |(first, second), error: &str| {
             Ok::<_, String>((
@@ -81,6 +82,7 @@ impl EisRoute {
     pub(crate) fn matches(&self, region: &EisRegion) -> bool {
         match self {
             Self::MappingId(mapping_id) => region.mapping_id.as_deref() == Some(mapping_id),
+            Self::UniqueResumedRegion => true,
             Self::ExactGeometry { position, size } => {
                 region.position == *position && region.size == *size
             }
@@ -353,12 +355,16 @@ mod tests {
     }
 
     #[test]
-    fn missing_mapping_id_requires_usable_exact_geometry() {
+    fn missing_mapping_metadata_uses_unique_resumed_region() {
         let (_, mut mapping, _) = fixture();
         mapping.stream.mapping_id = None;
         mapping.stream.position = None;
-        let error = EisRoute::from_stream(&mapping.stream).unwrap_err();
-        assert!(error.contains("omitted mapping_id and position"));
+        let route = EisRoute::from_stream(&mapping.stream).unwrap();
+        assert!(route.matches(&EisRegion {
+            position: (800, 200),
+            size: (1200, 900),
+            mapping_id: None,
+        }));
 
         mapping.stream.position = Some((-1, 0));
         let error = EisRoute::from_stream(&mapping.stream).unwrap_err();

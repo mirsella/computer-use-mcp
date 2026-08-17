@@ -263,6 +263,10 @@ impl ReisInputBackend {
                 "computer-use-mcp: ScreenCast stream has no mapping_id; binding EIS input by exact geometry at ({}, {}) with size {}x{}",
                 position.0, position.1, size.0, size.1
             );
+        } else if matches!(&route, EisRoute::UniqueResumedRegion) {
+            eprintln!(
+                "computer-use-mcp: ScreenCast stream has no routing metadata; binding EIS input to the unique resumed monitor region"
+            );
         }
         let attempt = EisAttemptGuard::new(Arc::clone(&session))?;
         let socket = session.connect_to_eis().await?;

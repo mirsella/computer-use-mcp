@@ -1535,24 +1535,4 @@ mod tests {
         let observation = coordinator.capture(&test_snapshot()).await.unwrap();
         assert_eq!(observation.mapping.stream.position, None);
     }
-
-    #[tokio::test]
-    async fn generated_input_without_mapping_id_requires_exact_geometry() {
-        let (mut connection, _) = test_connection(9, 44);
-        connection.stream.mapping_id = None;
-        connection.stream.position = None;
-        let coordinator = test_coordinator([connection], Arc::new(FakeCaptureState::default()));
-        coordinator.prepare().await.unwrap();
-        let snapshot = test_snapshot();
-        let observation = coordinator.capture(&snapshot).await.unwrap();
-        let error = coordinator
-            .prepare_input(
-                &snapshot,
-                &observation.mapping,
-                &GeneratedInputAction::Pointer(PointerAction::Move { x: 0.0, y: 0.0 }),
-            )
-            .await
-            .unwrap_err();
-        assert!(error.contains("omitted mapping_id and position"));
-    }
 }
