@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt::Write as _,
     io::{Read, Seek},
     os::unix::net::UnixStream,
     sync::{
@@ -51,6 +52,12 @@ struct DeviceState {
 }
 
 impl DeviceState {
+    fn start_emulating(&mut self, serial: u32) {
+        self.device.device().start_emulating(serial, self.sequence);
+        self.sequence = self.sequence.wrapping_add(1);
+        self.emulating = true;
+    }
+
     fn is_usable_keyboard(&self) -> bool {
         self.keymap.is_some() && self.device.interface::<ei::Keyboard>().is_some()
     }
@@ -118,18 +125,19 @@ impl EisState {
         ambiguous_noun: &str,
         mut matches: impl FnMut(&DeviceState) -> bool,
     ) -> Result<Option<u64>, String> {
-        let mut matched = Vec::new();
+        let mut first = None;
+        let mut count = 0;
         for (&id, state) in &self.devices {
             if matches(state) {
-                matched.push(id);
+                first.get_or_insert(id);
+                count += 1;
             }
         }
-        match matched.as_slice() {
-            [] => Ok(None),
-            [id] => Ok(Some(*id)),
-            many => Err(format!(
-                "{} {ambiguous_noun}; refusing ambiguous input",
-                many.len()
+        match (first, count) {
+            (None, 0) => Ok(None),
+            (Some(id), 1) => Ok(Some(id)),
+            (_, count) => Err(format!(
+                "{count} {ambiguous_noun}; refusing ambiguous input"
             )),
         }
     }
@@ -252,27 +260,32 @@ fn describe_keyboards(
     seat: Option<&reis::event::Seat>,
     devices: &HashMap<u64, DeviceState>,
 ) -> String {
-    let mut details = Vec::new();
+    let mut details = String::new();
     for (id, state) in devices {
         if state.device.interface::<ei::Keyboard>().is_none() {
             continue;
         }
-        let mut line = format!(
+        if !details.is_empty() {
+            details.push_str("; ");
+        }
+        write!(
+            details,
             "device {id}: resumed={} keymap={} modifiers={} synchronized={}",
             state.resumed,
             state.keymap.is_some(),
             state.modifiers.is_some(),
             state.modifiers_synced
-        );
+        )
+        .expect("writing keyboard diagnostics to a String cannot fail");
         if let Some(seat) = seat {
-            line.push_str(&format!(" same_seat={}", state.device.seat() == seat));
+            write!(details, " same_seat={}", state.device.seat() == seat)
+                .expect("writing keyboard diagnostics to a String cannot fail");
         }
-        details.push(line);
     }
     if details.is_empty() {
         "no EIS keyboard device was advertised".to_owned()
     } else {
-        details.join("; ")
+        details
     }
 }
 
@@ -320,10 +333,10 @@ pub struct ResolvedPointerBinding {
 
 fn sort_regions(regions: &mut [EisRegion]) {
     regions.sort_by(|first, second| {
-        (first.position, first.size, first.mapping_id.clone()).cmp(&(
+        (first.position, first.size, first.mapping_id.as_deref()).cmp(&(
             second.position,
             second.size,
-            second.mapping_id.clone(),
+            second.mapping_id.as_deref(),
         ))
     });
 }
@@ -331,22 +344,24 @@ fn sort_regions(regions: &mut [EisRegion]) {
 /// List every matching region so the ambiguity can be diagnosed from the
 /// error alone (multi-monitor KWin setups may advertise duplicate regions).
 fn ambiguous_regions_error(route: &EisRoute, matched: &[MatchedPointerRegion]) -> String {
-    let details = matched
-        .iter()
-        .map(|candidate| {
-            format!(
-                "device {} gen={} region=({},{}) {}x{} mapping_id={:?}",
-                candidate.device_id,
-                candidate.resume_generation,
-                candidate.region.position.0,
-                candidate.region.position.1,
-                candidate.region.size.0,
-                candidate.region.size.1,
-                candidate.region.mapping_id,
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
+    let mut details = String::new();
+    for (index, candidate) in matched.iter().enumerate() {
+        if index != 0 {
+            details.push_str("; ");
+        }
+        write!(
+            details,
+            "device {} gen={} region=({},{}) {}x{} mapping_id={:?}",
+            candidate.device_id,
+            candidate.resume_generation,
+            candidate.region.position.0,
+            candidate.region.position.1,
+            candidate.region.size.0,
+            candidate.region.size.1,
+            candidate.region.mapping_id,
+        )
+        .expect("writing EIS region diagnostics to a String cannot fail");
+    }
     format!(
         "multiple resumed EIS regions match the selected monitor stream (route={route:?}); refusing ambiguous input: {details}"
     )
@@ -971,12 +986,7 @@ impl ReisInputBackend {
                     .get_mut(&binding.pointer_id)
                     .ok_or("selected EIS pointer disappeared")?;
                 if !device.emulating {
-                    device
-                        .device
-                        .device()
-                        .start_emulating(connection.serial(), device.sequence);
-                    device.sequence = device.sequence.wrapping_add(1);
-                    device.emulating = true;
+                    device.start_emulating(connection.serial());
                 }
             }
             InputMode::FocusedKeyboard => {
@@ -1019,12 +1029,7 @@ impl ReisInputBackend {
             if matches!(event, InputEvent::Keycode { .. }) {
                 ensure_safe_physical_modifiers(device)?;
             }
-            device
-                .device
-                .device()
-                .start_emulating(connection.serial(), device.sequence);
-            device.sequence = device.sequence.wrapping_add(1);
-            device.emulating = true;
+            device.start_emulating(connection.serial());
         }
         match event {
             InputEvent::Absolute { x, y } => device
@@ -1087,24 +1092,17 @@ impl ReisInputBackend {
             .connection
             .clone()
             .ok_or("EIS connection is not ready")?;
-        let active = state
-            .devices
-            .iter()
-            .filter_map(|(&id, device)| device.emulating.then_some(id))
-            .collect::<Vec<_>>();
-        for id in &active {
-            let device = state
-                .devices
-                .get(id)
-                .ok_or("emulating EIS device disappeared")?;
-            device.device.device().stop_emulating(connection.serial());
+        for device in state.devices.values() {
+            if device.emulating {
+                device.device.device().stop_emulating(connection.serial());
+            }
         }
         connection
             .flush()
             .map_err(|error| format!("cannot stop EIS emulation: {error}"))?;
         let mut keyboard = None;
-        for id in active {
-            if let Some(device) = state.devices.get_mut(&id) {
+        for (&id, device) in &mut state.devices {
+            if device.emulating {
                 device.emulating = false;
                 if device.device.interface::<ei::Keyboard>().is_some() {
                     device.modifiers_synced = false;
@@ -1162,14 +1160,12 @@ impl InputBackend for ReisInputBackend {
                 .map(|state| state.devices.values().any(|device| device.emulating))
                 .unwrap_or(true);
             if result.is_ok() || sequence_open {
-                self.cleanup
+                let mut cleanup = self
+                    .cleanup
                     .lock()
-                    .map_err(|_| "EIS cleanup mutex poisoned".to_owned())?
-                    .sequence_pending = true;
-                self.cleanup
-                    .lock()
-                    .map_err(|_| "EIS cleanup mutex poisoned".to_owned())?
-                    .mode = cleanup_mode;
+                    .map_err(|_| "EIS cleanup mutex poisoned".to_owned())?;
+                cleanup.sequence_pending = true;
+                cleanup.mode = cleanup_mode;
             }
             result
         })

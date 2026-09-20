@@ -1145,30 +1145,19 @@ enum WaylandCommand {
         reply: oneshot::Sender<Result<(), BackendError>>,
         cancel: Arc<std::sync::atomic::AtomicBool>,
     },
-    SetMinimized {
+    Window {
         uuid: String,
-        minimized: bool,
-        reply: oneshot::Sender<Result<(), BackendError>>,
-        cancel: Arc<std::sync::atomic::AtomicBool>,
-    },
-    SetMaximized {
-        uuid: String,
-        maximized: bool,
-        reply: oneshot::Sender<Result<(), BackendError>>,
-        cancel: Arc<std::sync::atomic::AtomicBool>,
-    },
-    SetFullscreen {
-        uuid: String,
-        fullscreen: bool,
-        reply: oneshot::Sender<Result<(), BackendError>>,
-        cancel: Arc<std::sync::atomic::AtomicBool>,
-    },
-    Close {
-        uuid: String,
+        operation: WindowOperation,
         reply: oneshot::Sender<Result<(), BackendError>>,
         cancel: Arc<std::sync::atomic::AtomicBool>,
     },
     Shutdown(oneshot::Sender<Result<(), BackendError>>),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WindowOperation {
+    SetState { flag: u32, enabled: bool },
+    Close,
 }
 
 impl WaylandCatalog {
@@ -1188,8 +1177,7 @@ impl WaylandCatalog {
     }
 
     pub async fn snapshot(&self) -> Result<CompositorSnapshot, BackendError> {
-        let standard = self.standard.snapshot().await;
-        let kde = self.kde.snapshot().await;
+        let (standard, kde) = tokio::join!(self.standard.snapshot(), self.kde.snapshot());
         Ok(aggregate_snapshots(standard, kde))
     }
 
@@ -1204,48 +1192,45 @@ impl WaylandCatalog {
     /// Request a minimized state change on the KDE thread.
     pub async fn set_minimized(&self, uuid: String, minimized: bool) -> Result<(), BackendError> {
         self.kde
-            .window_request(|reply, cancel| WaylandCommand::SetMinimized {
+            .window_request(
                 uuid,
-                minimized,
-                reply,
-                cancel,
-            })
+                WindowOperation::SetState {
+                    flag: KDE_STATE_MINIMIZED,
+                    enabled: minimized,
+                },
+            )
             .await
     }
 
     /// Request a maximized state change on the KDE thread.
     pub async fn set_maximized(&self, uuid: String, maximized: bool) -> Result<(), BackendError> {
         self.kde
-            .window_request(|reply, cancel| WaylandCommand::SetMaximized {
+            .window_request(
                 uuid,
-                maximized,
-                reply,
-                cancel,
-            })
+                WindowOperation::SetState {
+                    flag: KDE_STATE_MAXIMIZED,
+                    enabled: maximized,
+                },
+            )
             .await
     }
 
     /// Request a fullscreen state change on the KDE thread.
     pub async fn set_fullscreen(&self, uuid: String, fullscreen: bool) -> Result<(), BackendError> {
         self.kde
-            .window_request(|reply, cancel| WaylandCommand::SetFullscreen {
+            .window_request(
                 uuid,
-                fullscreen,
-                reply,
-                cancel,
-            })
+                WindowOperation::SetState {
+                    flag: KDE_STATE_FULLSCREEN,
+                    enabled: fullscreen,
+                },
+            )
             .await
     }
 
     /// Request a window close on the KDE thread.
     pub async fn close_window(&self, uuid: String) -> Result<(), BackendError> {
-        self.kde
-            .window_request(|reply, cancel| WaylandCommand::Close {
-                uuid,
-                reply,
-                cancel,
-            })
-            .await
+        self.kde.window_request(uuid, WindowOperation::Close).await
     }
 
     pub async fn shutdown(&self) -> Result<(), BackendError> {
@@ -1392,10 +1377,8 @@ impl BackendThread {
     /// confirm the outcome with a follow-up snapshot.
     async fn window_request(
         &self,
-        build: impl FnOnce(
-            oneshot::Sender<Result<(), BackendError>>,
-            Arc<std::sync::atomic::AtomicBool>,
-        ) -> WaylandCommand,
+        uuid: String,
+        operation: WindowOperation,
     ) -> Result<(), BackendError> {
         let (reply, result) = oneshot::channel();
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1407,7 +1390,15 @@ impl BackendThread {
                 "Wayland catalog wake channel is unavailable".into(),
             ));
         };
-        if let Err(error) = self.send_with_wake(build(reply, cancel), false) {
+        if let Err(error) = self.send_with_wake(
+            WaylandCommand::Window {
+                uuid,
+                operation,
+                reply,
+                cancel,
+            },
+            false,
+        ) {
             drop(cancellation);
             return Err(error);
         }
@@ -1748,10 +1739,7 @@ fn drain_without_wayland(
                 let _ = reply.send(Ok(snapshot.clone()));
             }
             Ok(WaylandCommand::Activate { reply, .. })
-            | Ok(WaylandCommand::SetMinimized { reply, .. })
-            | Ok(WaylandCommand::SetMaximized { reply, .. })
-            | Ok(WaylandCommand::SetFullscreen { reply, .. })
-            | Ok(WaylandCommand::Close { reply, .. }) => {
+            | Ok(WaylandCommand::Window { reply, .. }) => {
                 let _ = reply.send(Err(error.clone()));
             }
             Ok(WaylandCommand::Shutdown(reply)) => {
@@ -2401,9 +2389,9 @@ fn process_commands(
                     cancel,
                 });
             }
-            WaylandCommand::SetMinimized {
+            WaylandCommand::Window {
                 uuid,
-                minimized,
+                operation,
                 reply,
                 cancel,
             } => {
@@ -2413,58 +2401,12 @@ fn process_commands(
                     )));
                     continue;
                 }
-                let outcome =
-                    set_kde_window_state(&mut runtime.state, &uuid, KDE_STATE_MINIMIZED, minimized);
-                queue_window_request(&mut runtime.state, reply, cancel, outcome);
-            }
-            WaylandCommand::SetMaximized {
-                uuid,
-                maximized,
-                reply,
-                cancel,
-            } => {
-                if cancel.load(std::sync::atomic::Ordering::Acquire) {
-                    let _ = reply.send(Err(BackendError::Unavailable(
-                        "KDE window request was cancelled before dispatch".into(),
-                    )));
-                    continue;
-                }
-                let outcome =
-                    set_kde_window_state(&mut runtime.state, &uuid, KDE_STATE_MAXIMIZED, maximized);
-                queue_window_request(&mut runtime.state, reply, cancel, outcome);
-            }
-            WaylandCommand::SetFullscreen {
-                uuid,
-                fullscreen,
-                reply,
-                cancel,
-            } => {
-                if cancel.load(std::sync::atomic::Ordering::Acquire) {
-                    let _ = reply.send(Err(BackendError::Unavailable(
-                        "KDE window request was cancelled before dispatch".into(),
-                    )));
-                    continue;
-                }
-                let outcome = set_kde_window_state(
-                    &mut runtime.state,
-                    &uuid,
-                    KDE_STATE_FULLSCREEN,
-                    fullscreen,
-                );
-                queue_window_request(&mut runtime.state, reply, cancel, outcome);
-            }
-            WaylandCommand::Close {
-                uuid,
-                reply,
-                cancel,
-            } => {
-                if cancel.load(std::sync::atomic::Ordering::Acquire) {
-                    let _ = reply.send(Err(BackendError::Unavailable(
-                        "KDE window request was cancelled before dispatch".into(),
-                    )));
-                    continue;
-                }
-                let outcome = close_kde_window(&mut runtime.state, &uuid);
+                let outcome = match operation {
+                    WindowOperation::SetState { flag, enabled } => {
+                        set_kde_window_state(&mut runtime.state, &uuid, flag, enabled)
+                    }
+                    WindowOperation::Close => close_kde_window(&mut runtime.state, &uuid),
+                };
                 queue_window_request(&mut runtime.state, reply, cancel, outcome);
             }
             WaylandCommand::Shutdown(reply) => {
@@ -2943,54 +2885,89 @@ mod tests {
         let (backend, receiver, _wake_reader) = window_command_thread();
         let (min_reply, _min_result) = oneshot::channel();
         backend
-            .send(WaylandCommand::SetMinimized {
+            .send(WaylandCommand::Window {
                 uuid: "u-min".into(),
-                minimized: true,
+                operation: WindowOperation::SetState {
+                    flag: KDE_STATE_MINIMIZED,
+                    enabled: true,
+                },
                 reply: min_reply,
                 cancel: uncancelled(),
             })
             .unwrap();
         let (max_reply, _max_result) = oneshot::channel();
         backend
-            .send(WaylandCommand::SetMaximized {
+            .send(WaylandCommand::Window {
                 uuid: "u-max".into(),
-                maximized: false,
+                operation: WindowOperation::SetState {
+                    flag: KDE_STATE_MAXIMIZED,
+                    enabled: false,
+                },
                 reply: max_reply,
                 cancel: uncancelled(),
             })
             .unwrap();
         let (full_reply, _full_result) = oneshot::channel();
         backend
-            .send(WaylandCommand::SetFullscreen {
+            .send(WaylandCommand::Window {
                 uuid: "u-full".into(),
-                fullscreen: true,
+                operation: WindowOperation::SetState {
+                    flag: KDE_STATE_FULLSCREEN,
+                    enabled: true,
+                },
                 reply: full_reply,
                 cancel: uncancelled(),
             })
             .unwrap();
         let (close_reply, _close_result) = oneshot::channel();
         backend
-            .send(WaylandCommand::Close {
+            .send(WaylandCommand::Window {
                 uuid: "u-close".into(),
+                operation: WindowOperation::Close,
                 reply: close_reply,
                 cancel: uncancelled(),
             })
             .unwrap();
         assert!(matches!(
             receiver.try_recv(),
-            Ok(WaylandCommand::SetMinimized { uuid, minimized: true, .. }) if uuid == "u-min"
+            Ok(WaylandCommand::Window {
+                uuid,
+                operation: WindowOperation::SetState {
+                    flag: KDE_STATE_MINIMIZED,
+                    enabled: true,
+                },
+                ..
+            }) if uuid == "u-min"
         ));
         assert!(matches!(
             receiver.try_recv(),
-            Ok(WaylandCommand::SetMaximized { uuid, maximized: false, .. }) if uuid == "u-max"
+            Ok(WaylandCommand::Window {
+                uuid,
+                operation: WindowOperation::SetState {
+                    flag: KDE_STATE_MAXIMIZED,
+                    enabled: false,
+                },
+                ..
+            }) if uuid == "u-max"
         ));
         assert!(matches!(
             receiver.try_recv(),
-            Ok(WaylandCommand::SetFullscreen { uuid, fullscreen: true, .. }) if uuid == "u-full"
+            Ok(WaylandCommand::Window {
+                uuid,
+                operation: WindowOperation::SetState {
+                    flag: KDE_STATE_FULLSCREEN,
+                    enabled: true,
+                },
+                ..
+            }) if uuid == "u-full"
         ));
         assert!(matches!(
             receiver.try_recv(),
-            Ok(WaylandCommand::Close { uuid, .. }) if uuid == "u-close"
+            Ok(WaylandCommand::Window {
+                uuid,
+                operation: WindowOperation::Close,
+                ..
+            }) if uuid == "u-close"
         ));
     }
 
@@ -2998,26 +2975,36 @@ mod tests {
     fn failed_backend_rejects_window_state_commands_with_its_error() {
         type StateCommandBuilder = fn(oneshot::Sender<Result<(), BackendError>>) -> WaylandCommand;
         let builders: [StateCommandBuilder; 4] = [
-            |reply| WaylandCommand::SetMinimized {
+            |reply| WaylandCommand::Window {
                 uuid: "u".into(),
-                minimized: true,
+                operation: WindowOperation::SetState {
+                    flag: KDE_STATE_MINIMIZED,
+                    enabled: true,
+                },
                 reply,
                 cancel: uncancelled(),
             },
-            |reply| WaylandCommand::SetMaximized {
+            |reply| WaylandCommand::Window {
                 uuid: "u".into(),
-                maximized: true,
+                operation: WindowOperation::SetState {
+                    flag: KDE_STATE_MAXIMIZED,
+                    enabled: true,
+                },
                 reply,
                 cancel: uncancelled(),
             },
-            |reply| WaylandCommand::SetFullscreen {
+            |reply| WaylandCommand::Window {
                 uuid: "u".into(),
-                fullscreen: true,
+                operation: WindowOperation::SetState {
+                    flag: KDE_STATE_FULLSCREEN,
+                    enabled: true,
+                },
                 reply,
                 cancel: uncancelled(),
             },
-            |reply| WaylandCommand::Close {
+            |reply| WaylandCommand::Window {
                 uuid: "u".into(),
+                operation: WindowOperation::Close,
                 reply,
                 cancel: uncancelled(),
             },
@@ -3148,9 +3135,12 @@ mod tests {
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let (reply, result) = oneshot::channel();
         command
-            .send(WaylandCommand::SetMinimized {
+            .send(WaylandCommand::Window {
                 uuid: "uuid-1".into(),
-                minimized: true,
+                operation: WindowOperation::SetState {
+                    flag: KDE_STATE_MINIMIZED,
+                    enabled: true,
+                },
                 reply,
                 cancel,
             })
@@ -3186,9 +3176,12 @@ mod tests {
         let cancel = uncancelled();
         let (reply, mut result) = oneshot::channel();
         command
-            .send(WaylandCommand::SetMinimized {
+            .send(WaylandCommand::Window {
                 uuid: "uuid-1".into(),
-                minimized: true,
+                operation: WindowOperation::SetState {
+                    flag: KDE_STATE_MINIMIZED,
+                    enabled: true,
+                },
                 reply,
                 cancel: Arc::clone(&cancel),
             })
@@ -3217,9 +3210,12 @@ mod tests {
         let (reply, result) = oneshot::channel();
         let (command, receiver) = std::sync::mpsc::channel();
         command
-            .send(WaylandCommand::SetMinimized {
+            .send(WaylandCommand::Window {
                 uuid: "uuid-1".into(),
-                minimized: false,
+                operation: WindowOperation::SetState {
+                    flag: KDE_STATE_MINIMIZED,
+                    enabled: false,
+                },
                 reply,
                 cancel: Arc::clone(&cancel),
             })

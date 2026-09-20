@@ -403,6 +403,61 @@ impl CaptureState {
     }
 }
 
+async fn require_active_session(state: &mut CaptureState, reason: &str) -> Result<(), String> {
+    if state
+        .active()
+        .is_none_or(|active| active.session.is_closed())
+    {
+        exhaust_capture(state, reason).await;
+        return Err(SESSION_UNAVAILABLE.into());
+    }
+    Ok(())
+}
+
+async fn ensure_eis_input(
+    state: &mut CaptureState,
+    stream: &PortalStream,
+) -> Result<(Arc<ReisInputBackend>, bool), String> {
+    let Some(active) = state.active() else {
+        return Err(SESSION_UNAVAILABLE.into());
+    };
+    let Some(input) = active.input.as_ref() else {
+        let session = Arc::clone(&active.session);
+        let input = match ReisInputBackend::connect(session, stream).await {
+            Ok(input) => input,
+            Err(error) => {
+                exhaust_capture(state, "EIS setup failed").await;
+                return Err(format!("{SESSION_UNAVAILABLE}: EIS setup failed: {error}"));
+            }
+        };
+        state
+            .active_mut()
+            .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
+            .input = Some(Arc::clone(&input));
+        return Ok((input, true));
+    };
+    Ok((Arc::clone(input), false))
+}
+
+fn prepared_input(
+    state: &CaptureState,
+) -> Result<
+    (
+        Arc<ReisInputBackend>,
+        Option<Arc<crate::portal::ClipboardController>>,
+    ),
+    String,
+> {
+    let active = state
+        .active()
+        .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?;
+    let input = active
+        .input
+        .as_ref()
+        .ok_or_else(|| "EIS input was not prepared for this action".to_owned())?;
+    Ok((Arc::clone(input), active.session.clipboard()))
+}
+
 impl<P, C> ScreenshotProvider for ScreenshotCoordinator<P, C>
 where
     P: PortalBackend,
@@ -828,13 +883,8 @@ where
         // the fresh evidence is stored below and read after dispatch.
         self.clear_eis_evidence();
         let mut state = self.state.lock().await;
-        if state
-            .active()
-            .is_none_or(|active| active.session.is_closed())
-        {
-            exhaust_capture(&mut state, "portal session closed before input preparation").await;
-            return Err(SESSION_UNAVAILABLE.into());
-        }
+        require_active_session(&mut state, "portal session closed before input preparation")
+            .await?;
         {
             let active = state
                 .active()
@@ -846,41 +896,10 @@ where
             action,
             GeneratedInputAction::KeyboardTransaction { .. } | GeneratedInputAction::Paste { .. }
         );
-        let connected_now = state
-            .active()
-            .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
-            .input
-            .is_none();
-        if connected_now {
-            let session = Arc::clone(
-                &state
-                    .active()
-                    .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
-                    .session,
-            );
-            match ReisInputBackend::connect(session, &mapping.stream).await {
-                Ok(input) => {
-                    state
-                        .active_mut()
-                        .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
-                        .input = Some(input)
-                }
-                Err(error) => {
-                    exhaust_capture(&mut state, "EIS setup failed").await;
-                    return Err(format!("{SESSION_UNAVAILABLE}: EIS setup failed: {error}"));
-                }
-            }
-        }
+        let (input, connected_now) = ensure_eis_input(&mut state, &mapping.stream).await?;
         if connected_now {
             validate_current_capture_state(&mut state, mapping, "after EIS setup").await?;
         }
-        let input = state
-            .active()
-            .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
-            .input
-            .as_ref()
-            .ok_or_else(|| "EIS backend disappeared after setup".to_owned())?;
-        let input = Arc::clone(input);
         let points = action_png_points(action)?;
         let window_cropped = mapping.window_crop_source.is_some();
         let stream_extent = StreamExtent::from_portal_stream(&mapping.stream);
@@ -930,11 +949,10 @@ where
             } => {
                 let focus = mapper.point(focus.x, focus.y)?;
                 keyboard_input::preflight_transaction(
-                    &input,
-                    KeyboardPoint {
+                    Some(KeyboardPoint {
                         x: focus.0,
                         y: focus.1,
-                    },
+                    }),
                     events,
                 )?;
             }
@@ -949,12 +967,11 @@ where
                 };
                 if clipboard_available {
                     keyboard_input::preflight_transaction(
-                        &input,
-                        focus,
+                        Some(focus),
                         &[KeyboardEvent::Press("CTRL+V".into())],
                     )?;
                 } else {
-                    keyboard_input::preflight_paste(&input, focus, text).map(drop)?;
+                    keyboard_input::preflight_paste(Some(focus), text).map(drop)?;
                 }
             }
             GeneratedInputAction::KeyboardTransaction { .. }
@@ -979,13 +996,9 @@ where
             .lock()
             .expect("paste delivery mutex poisoned") = None;
         let mut state = self.state.lock().await;
-        if state
-            .active()
-            .is_none_or(|active| active.session.is_closed())
-        {
-            exhaust_capture(&mut state, "portal session closed before generated input").await;
-            return Err(InputError::SessionUnavailable(SESSION_UNAVAILABLE.into()));
-        }
+        require_active_session(&mut state, "portal session closed before generated input")
+            .await
+            .map_err(InputError::from)?;
         {
             let active = state
                 .active()
@@ -993,18 +1006,11 @@ where
             ValidatedMapping::new(snapshot, mapping, &active.session, &active.stream)?;
         }
         validate_current_capture_state(&mut state, mapping, "before input dispatch").await?;
-        let input = state
-            .active()
-            .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
-            .input
-            .as_ref()
-            .ok_or_else(|| "EIS input was not prepared for this action".to_owned())?
-            .clone();
+        let (input, clipboard) = prepared_input(&state)?;
         let backend: Arc<dyn InputBackend> = input.clone();
         let active = state
             .active()
             .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?;
-        let clipboard = active.session.clipboard();
         let validated = ValidatedMapping::new(snapshot, mapping, &active.session, &active.stream)?;
         let points = action_png_points(&action)?;
         let stream_extent = StreamExtent::from_portal_stream(&mapping.stream);
@@ -1063,7 +1069,7 @@ where
                     };
                     keyboard_input::perform_transaction(
                         input,
-                        focus,
+                        Some(focus),
                         events,
                         Arc::clone(&progress),
                     )
@@ -1121,59 +1127,22 @@ where
             return Err("focused-element input requires semantic focus".into());
         }
         let mut state = self.state.lock().await;
-        if state
-            .active()
-            .is_none_or(|active| active.session.is_closed())
-        {
-            exhaust_capture(
-                &mut state,
-                "portal session closed before focused input preparation",
-            )
-            .await;
-            return Err(SESSION_UNAVAILABLE.into());
-        }
+        require_active_session(
+            &mut state,
+            "portal session closed before focused input preparation",
+        )
+        .await?;
         // No screenshot mapping is consulted: the target window may live on
         // a virtual desktop screenshots cannot see. EIS keystrokes land in
         // the focused window, so only a live session, keyboard capability,
         // and text bounds are required. The stream below only identifies the
         // portal session for EIS setup; no pixels are read from it.
-        let connected_now = state
+        let stream = state
             .active()
             .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
-            .input
-            .is_none();
-        if connected_now {
-            let session = Arc::clone(
-                &state
-                    .active()
-                    .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
-                    .session,
-            );
-            let stream = state
-                .active()
-                .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
-                .stream
-                .clone();
-            match ReisInputBackend::connect(session, &stream).await {
-                Ok(input) => {
-                    state
-                        .active_mut()
-                        .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
-                        .input = Some(input)
-                }
-                Err(error) => {
-                    exhaust_capture(&mut state, "EIS setup failed").await;
-                    return Err(format!("{SESSION_UNAVAILABLE}: EIS setup failed: {error}"));
-                }
-            }
-        }
-        let input = state
-            .active()
-            .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
-            .input
-            .as_ref()
-            .ok_or_else(|| "EIS backend disappeared after setup".to_owned())?;
-        let input = Arc::clone(input);
+            .stream
+            .clone();
+        let (input, _) = ensure_eis_input(&mut state, &stream).await?;
         // Focused-element typing needs only the unique keyboard: resolving a
         // pointer region here would let ambiguous multi-monitor EIS
         // advertisements block typing into a verified focused element.
@@ -1200,19 +1169,19 @@ where
                 focus: KeyboardFocus::Semantic { .. },
                 events,
             } => {
-                keyboard_input::preflight_transaction_focused(&input, events)?;
+                keyboard_input::preflight_transaction(None, events)?;
             }
             GeneratedInputAction::Paste {
                 focus: KeyboardFocus::Semantic { .. },
                 text,
             } => {
                 if clipboard_available {
-                    keyboard_input::preflight_transaction_focused(
-                        &input,
+                    keyboard_input::preflight_transaction(
+                        None,
                         &[KeyboardEvent::Press("CTRL+V".into())],
                     )?;
                 } else {
-                    keyboard_input::preflight_paste_focused(&input, text).map(drop)?;
+                    keyboard_input::preflight_paste(None, text).map(drop)?;
                 }
             }
             _ => {
@@ -1232,31 +1201,16 @@ where
             .lock()
             .expect("paste delivery mutex poisoned") = None;
         let mut state = self.state.lock().await;
-        if state
-            .active()
-            .is_none_or(|active| active.session.is_closed())
-        {
-            exhaust_capture(&mut state, "portal session closed before focused input").await;
-            return Err(InputError::SessionUnavailable(SESSION_UNAVAILABLE.into()));
-        }
+        require_active_session(&mut state, "portal session closed before focused input")
+            .await
+            .map_err(InputError::from)?;
         if let Some(failure) = state.active().and_then(terminal_failure) {
             exhaust_capture(&mut state, "desktop session failed before focused input").await;
             return Err(InputError::SessionUnavailable(format!(
                 "{SESSION_UNAVAILABLE}: {failure}"
             )));
         }
-        let input = state
-            .active()
-            .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
-            .input
-            .as_ref()
-            .ok_or_else(|| "EIS input was not prepared for this action".to_owned())?
-            .clone();
-        let clipboard = state
-            .active()
-            .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
-            .session
-            .clipboard();
+        let (input, clipboard) = prepared_input(&state)?;
         require_focused_capabilities(input.as_ref(), &action)?;
 
         let result: Result<(), String> = async {
@@ -1265,12 +1219,8 @@ where
                     focus: KeyboardFocus::Semantic { .. },
                     events,
                 } => {
-                    keyboard_input::perform_transaction_focused(
-                        input,
-                        events,
-                        Arc::clone(&progress),
-                    )
-                    .await?;
+                    keyboard_input::perform_transaction(input, None, events, Arc::clone(&progress))
+                        .await?;
                 }
                 GeneratedInputAction::Paste {
                     focus: KeyboardFocus::Semantic { .. },
@@ -1366,35 +1316,18 @@ async fn perform_clipboard_paste(
     progress: Arc<ActionProgress>,
 ) -> Result<&'static str, String> {
     let Some(clipboard) = clipboard else {
-        return match focus {
-            Some(focus) => keyboard_input::perform_paste(input, focus, text, progress)
-                .await
-                .map(|_| "eis_typed_insertion"),
-            None => keyboard_input::perform_paste_focused(input, text, progress)
-                .await
-                .map(|_| "eis_typed_insertion"),
-        };
+        return keyboard_input::perform_paste(input, focus, text, progress)
+            .await
+            .map(|_| "eis_typed_insertion");
     };
     let selection = clipboard.begin(&text, &progress).await?;
-    let dispatch = match focus {
-        Some(focus) => {
-            keyboard_input::perform_transaction(
-                input,
-                focus,
-                vec![KeyboardEvent::Press("CTRL+V".into())],
-                progress,
-            )
-            .await
-        }
-        None => {
-            keyboard_input::perform_transaction_focused(
-                input,
-                vec![KeyboardEvent::Press("CTRL+V".into())],
-                progress,
-            )
-            .await
-        }
-    };
+    let dispatch = keyboard_input::perform_transaction(
+        input,
+        focus,
+        vec![KeyboardEvent::Press("CTRL+V".into())],
+        progress,
+    )
+    .await;
     // Completed progress refers to the Ctrl+V dispatch. A later transfer or
     // revocation failure remains an error, never a successful paste result.
     selection.finish(dispatch).await?;

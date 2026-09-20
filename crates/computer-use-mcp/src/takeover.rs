@@ -368,6 +368,17 @@ struct WatchedDevice {
     absolute: std::collections::HashMap<u16, i32>,
 }
 
+impl WatchedDevice {
+    fn open(path: &Path) -> Option<Self> {
+        open_input_device(path).ok().map(|file| Self {
+            path: path.to_owned(),
+            file,
+            carry: Vec::new(),
+            absolute: Default::default(),
+        })
+    }
+}
+
 /// Dropping an operation stops and joins its watcher, including empty-device
 /// retry loops. No thread or device descriptor survives the operation.
 pub(crate) struct HardwareWatch {
@@ -410,14 +421,7 @@ pub(crate) fn spawn_hardware_watcher(
     let devices = paths
         .iter()
         .take(MAX_WATCHED_DEVICES)
-        .filter_map(|path| {
-            open_input_device(path).ok().map(|file| WatchedDevice {
-                path: path.clone(),
-                file,
-                carry: Vec::new(),
-                absolute: Default::default(),
-            })
-        })
+        .filter_map(|path| WatchedDevice::open(path))
         .collect();
     let result = std::thread::Builder::new()
         .name("takeover-input-watch".to_owned())
@@ -465,13 +469,8 @@ fn watch_loop(
             if devices.iter().any(|device| device.path == *path) {
                 continue;
             }
-            if let Ok(file) = open_input_device(path) {
-                devices.push(WatchedDevice {
-                    path: path.clone(),
-                    file,
-                    carry: Vec::new(),
-                    absolute: Default::default(),
-                });
+            if let Some(device) = WatchedDevice::open(path) {
+                devices.push(device);
             }
         }
         if devices.is_empty() {

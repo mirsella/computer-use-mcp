@@ -22,6 +22,18 @@ use crate::{
     validation::MAX_TEXT_LIMIT,
 };
 
+macro_rules! proxy_builder {
+    ($proxy:ident, $connection:expr, $destination:expr, $path:expr) => {{
+        $proxy::builder($connection)
+            .destination($destination)
+            .map_err(atspi_call_error)?
+            .path($path)
+            .map_err(atspi_call_error)?
+            .cache_properties(CacheProperties::No)
+            .build()
+    }};
+}
+
 #[derive(Debug, Default)]
 pub struct AtspiAdapter {
     connection: OnceCell<Connection>,
@@ -80,26 +92,24 @@ impl AtspiAdapter {
         connection: &'a Connection,
         object: &'a ObjectId,
     ) -> Result<AccessibleProxy<'a>, RuntimeError> {
-        AccessibleProxy::builder(connection)
-            .destination(object.bus_name.as_str())
-            .map_err(atspi_call_error)?
-            .path(object.path.as_str())
-            .map_err(atspi_call_error)?
-            .cache_properties(CacheProperties::No)
-            .build()
-            .await
-            .map_err(atspi_call_error)
+        proxy_builder!(
+            AccessibleProxy,
+            connection,
+            object.bus_name.as_str(),
+            object.path.as_str()
+        )
+        .await
+        .map_err(atspi_call_error)
     }
 
     async fn discover_inner(&self) -> Result<Vec<AppInfo>, RuntimeError> {
         let connection = self.connection().await?;
-        let root = AccessibleProxy::builder(connection)
-            .destination("org.a11y.atspi.Registry")
-            .map_err(atspi_call_error)?
-            .path("/org/a11y/atspi/accessible/root")
-            .map_err(atspi_call_error)?
-            .cache_properties(CacheProperties::No)
-            .build()
+        let root = proxy_builder!(
+            AccessibleProxy,
+            connection,
+            "org.a11y.atspi.Registry",
+            "/org/a11y/atspi/accessible/root"
+        )
             .await
             .map_err(|error| {
                 runtime_error(format!(
@@ -462,75 +472,70 @@ async fn action_proxy<'a>(
     connection: &'a Connection,
     object: &'a ObjectId,
 ) -> Result<ActionProxy<'a>, RuntimeError> {
-    ActionProxy::builder(connection)
-        .destination(object.bus_name.as_str())
-        .map_err(atspi_call_error)?
-        .path(object.path.as_str())
-        .map_err(atspi_call_error)?
-        .cache_properties(CacheProperties::No)
-        .build()
-        .await
-        .map_err(atspi_call_error)
+    proxy_builder!(
+        ActionProxy,
+        connection,
+        object.bus_name.as_str(),
+        object.path.as_str()
+    )
+    .await
+    .map_err(atspi_call_error)
 }
 
 async fn component_proxy<'a>(
     connection: &'a Connection,
     object: &'a ObjectId,
 ) -> Result<ComponentProxy<'a>, RuntimeError> {
-    ComponentProxy::builder(connection)
-        .destination(object.bus_name.as_str())
-        .map_err(atspi_call_error)?
-        .path(object.path.as_str())
-        .map_err(atspi_call_error)?
-        .cache_properties(CacheProperties::No)
-        .build()
-        .await
-        .map_err(atspi_call_error)
+    proxy_builder!(
+        ComponentProxy,
+        connection,
+        object.bus_name.as_str(),
+        object.path.as_str()
+    )
+    .await
+    .map_err(atspi_call_error)
 }
 
 async fn text_proxy<'a>(
     connection: &'a Connection,
     object: &'a ObjectId,
 ) -> Result<TextProxy<'a>, RuntimeError> {
-    TextProxy::builder(connection)
-        .destination(object.bus_name.as_str())
-        .map_err(atspi_call_error)?
-        .path(object.path.as_str())
-        .map_err(atspi_call_error)?
-        .cache_properties(CacheProperties::No)
-        .build()
-        .await
-        .map_err(atspi_call_error)
+    proxy_builder!(
+        TextProxy,
+        connection,
+        object.bus_name.as_str(),
+        object.path.as_str()
+    )
+    .await
+    .map_err(atspi_call_error)
 }
 
 async fn editable_text_proxy<'a>(
     connection: &'a Connection,
     object: &'a ObjectId,
 ) -> Result<EditableTextProxy<'a>, RuntimeError> {
-    EditableTextProxy::builder(connection)
-        .destination(object.bus_name.as_str())
-        .map_err(atspi_call_error)?
-        .path(object.path.as_str())
-        .map_err(atspi_call_error)?
-        .cache_properties(CacheProperties::No)
-        .build()
-        .await
-        .map_err(atspi_call_error)
+    proxy_builder!(
+        EditableTextProxy,
+        connection,
+        object.bus_name.as_str(),
+        object.path.as_str()
+    )
+    .await
+    .map_err(atspi_call_error)
 }
 
 async fn value_proxy<'a>(
     connection: &'a Connection,
     object: &'a ObjectId,
 ) -> Result<ValueProxy<'a>, RuntimeError> {
-    ValueProxy::builder(connection)
-        .destination(object.bus_name.as_str())
-        .map_err(atspi_call_error)?
-        .path(object.path.as_str())
-        .map_err(atspi_call_error)?
-        .cache_properties(CacheProperties::No)
-        .build()
-        .await
-        .map_err(atspi_call_error)
+    proxy_builder!(
+        ValueProxy,
+        connection,
+        object.bus_name.as_str(),
+        object.path.as_str()
+    )
+    .await
+    .map_err(atspi_call_error)
 }
 
 async fn read_text_metadata(

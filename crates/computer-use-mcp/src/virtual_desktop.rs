@@ -372,7 +372,7 @@ pub struct VirtualDesktopProvider {
 
 impl VirtualDesktopProvider {
     pub fn disabled() -> Self {
-        Self { bus: None }
+        Self::default()
     }
 
     pub fn live() -> Self {

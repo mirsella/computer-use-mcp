@@ -184,7 +184,6 @@ chmod 700 "$RUNTIME_DIR"
 umask 077
 ISOLATION_MARKER="$RUNTIME_DIR/isolation.ready"
 
-declare -a SERVICE_LABELS=()
 declare -a SERVICE_PIDS=()
 declare -A SERVICE_PID_BY_LABEL=()
 CLEANED_UP=0
@@ -206,6 +205,20 @@ process_has_isolation_marker() {
     return 1
 }
 
+signal_recorded_services() {
+    local signal="$1"
+    local pid
+    for pid in "${SERVICE_PIDS[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            if process_has_isolation_marker "$pid"; then
+                kill "-$signal" -- "-$pid" 2>/dev/null || true
+            else
+                printf 'computer-use-mcp: refusing to signal unverified service leader %s\n' "$pid" >&2
+            fi
+        fi
+    done
+}
+
 kill_marked_processes() {
     local signal="$1"
     local process_path
@@ -221,31 +234,19 @@ kill_marked_processes() {
 }
 
 cleanup() {
-    local index
     local pid
     [ "$CLEANED_UP" -eq 1 ] && return
     CLEANED_UP=1
 
-    # Every service was started by setsid, so each recorded PID is the leader
-    # of a process group owned by this launcher.  Never use a broad process
-    # name match: unrelated user processes must survive cleanup.
-    for ((index=${#SERVICE_PIDS[@]} - 1; index >= 0; index--)); do
-        pid="${SERVICE_PIDS[index]}"
-        if kill -0 "$pid" 2>/dev/null; then
-            kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-        fi
-    done
+    # Every service was started by setsid. Verify the per-run marker before
+    # signaling a recorded process group because a PID/PGID may have been reused.
+    signal_recorded_services TERM
     # Applications may be launched through private D-Bus and detach from the
     # command process group.  The per-run marker path is the ownership key for
     # those descendants; never match by executable name or a reused PID.
     kill_marked_processes TERM
     sleep 0.1
-    for ((index=${#SERVICE_PIDS[@]} - 1; index >= 0; index--)); do
-        pid="${SERVICE_PIDS[index]}"
-        if kill -0 "$pid" 2>/dev/null; then
-            kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
-        fi
-    done
+    signal_recorded_services KILL
     kill_marked_processes KILL
     for pid in "${SERVICE_PIDS[@]}"; do
         wait "$pid" 2>/dev/null || true
@@ -299,7 +300,6 @@ start_owned() {
     local pid
     "$SETSID_BIN" --wait -- "$@" >"$RUNTIME_DIR/$label.log" 2>&1 &
     pid="$!"
-    SERVICE_LABELS+=("$label")
     SERVICE_PIDS+=("$pid")
     SERVICE_PID_BY_LABEL["$label"]="$pid"
 }

@@ -36,10 +36,14 @@ pub fn is_protected_surface(
     resource_name: Option<&str>,
 ) -> bool {
     fn matches(value: &str) -> bool {
-        let lowered = value.to_ascii_lowercase();
-        PROTECTED_SURFACE_PATTERNS
-            .iter()
-            .any(|pattern| lowered.contains(pattern))
+        PROTECTED_SURFACE_PATTERNS.iter().any(|pattern| {
+            value.as_bytes().windows(pattern.len()).any(|candidate| {
+                candidate
+                    .iter()
+                    .zip(pattern.as_bytes())
+                    .all(|(byte, expected)| byte.to_ascii_lowercase() == *expected)
+            })
+        })
     }
     app_id.is_some_and(matches) || matches(title) || resource_name.is_some_and(matches)
 }

@@ -80,23 +80,24 @@ pub async fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), CliE
             require_no_extra_arguments(&arguments)?;
             server::serve_stdio().await
         }
-        "__desktop_worker" => {
-            require_no_extra_arguments(&arguments)?;
-            server::serve_worker_stdio().await
-        }
-        "__background_worker" => {
-            require_no_extra_arguments(&arguments)?;
-            let session = crate::session::describe_session_from_env();
-            if !session.isolated {
-                return Err(CliError::Mcp(format!(
-                    "background worker isolation verification failed: {}",
-                    session.isolation_reason
-                )));
-            }
-            server::serve_worker_stdio().await
-        }
+        "__desktop_worker" => run_worker(&arguments, false).await,
+        "__background_worker" => run_worker(&arguments, true).await,
         unknown => Err(CliError::InvalidCommand(unknown.to_owned())),
     }
+}
+
+async fn run_worker(arguments: &[String], require_isolation: bool) -> Result<(), CliError> {
+    require_no_extra_arguments(arguments)?;
+    if require_isolation {
+        let session = crate::session::describe_session_from_env();
+        if !session.isolated {
+            return Err(CliError::Mcp(format!(
+                "background worker isolation verification failed: {}",
+                session.isolation_reason
+            )));
+        }
+    }
+    server::serve_worker_stdio().await
 }
 
 async fn run_calls(source: &str) -> Result<(), CliError> {

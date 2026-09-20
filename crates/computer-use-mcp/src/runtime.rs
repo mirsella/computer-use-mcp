@@ -302,8 +302,9 @@ impl ToolOutput {
             .lines()
             .any(|line| line.starts_with("Action progress: "))
         {
-            let suffix = format!("{}\n{}", self.text, compact_action_progress(snapshot));
-            self.text = bound_text_with_suffix("", &suffix, MAX_MODEL_TEXT_BYTES);
+            self.text.push('\n');
+            self.text.push_str(&compact_action_progress(snapshot));
+            self.text = bound_text_with_suffix("", &self.text, MAX_MODEL_TEXT_BYTES);
         }
         let evidence = action_progress_json(snapshot);
         self.structured_content = match self.structured_content.take() {
@@ -410,7 +411,11 @@ pub(crate) fn annotate_mcp_result(
             }
         }
     }
-    let overhead = json_size(&serde_json::Value::Object(metadata.clone())) - 1;
+    let overhead = serde_json::to_vec(&metadata)
+        .expect("structured output metadata must be serializable")
+        .len()
+        .checked_sub(1)
+        .expect("structured output metadata must serialize as an object");
     let budget = MAX_MODEL_STRUCTURED_BYTES
         .checked_sub(overhead)
         .expect("routing metadata exceeds structured budget");
@@ -498,11 +503,7 @@ fn bound_structured(value: serde_json::Value, maximum: usize) -> serde_json::Val
         "replacement_element_id",
     ];
     if let serde_json::Value::Object(object) = &value {
-        for key in keys
-            .into_iter()
-            .chain(object.keys().map(String::as_str))
-            .collect::<Vec<_>>()
-        {
+        for key in keys.into_iter().chain(object.keys().map(String::as_str)) {
             if bounded.contains_key(key) {
                 continue;
             }

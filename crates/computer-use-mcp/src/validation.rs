@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-
 use serde_json::{Map as JsonObject, Value};
 
 use crate::errors::RuntimeError;
@@ -557,13 +555,7 @@ fn required_target(
     arguments: &mut JsonObject<String, Value>,
     key: &str,
 ) -> Result<TargetRef, RuntimeError> {
-    let mut object = required_object(arguments, key)?;
-    let target = TargetRef {
-        app_instance_id: required_opaque_id(&mut object, "app_instance_id", "app")?,
-        window_instance_id: required_opaque_id(&mut object, "window_instance_id", "win")?,
-    };
-    reject_unknown(object)?;
-    Ok(target)
+    target_from_object(required_object(arguments, key)?)
 }
 
 fn optional_target(
@@ -572,18 +564,20 @@ fn optional_target(
 ) -> Result<Option<TargetRef>, RuntimeError> {
     match arguments.remove(key) {
         None => Ok(None),
-        Some(value) => {
-            let mut object = value.as_object().cloned().ok_or_else(|| {
-                RuntimeError::invalid_arguments(format!("argument {key:?} must be an object"))
-            })?;
-            let target = TargetRef {
-                app_instance_id: required_opaque_id(&mut object, "app_instance_id", "app")?,
-                window_instance_id: required_opaque_id(&mut object, "window_instance_id", "win")?,
-            };
-            reject_unknown(object)?;
-            Ok(Some(target))
-        }
+        Some(Value::Object(object)) => Ok(Some(target_from_object(object)?)),
+        Some(_) => Err(RuntimeError::invalid_arguments(format!(
+            "argument {key:?} must be an object"
+        ))),
     }
+}
+
+fn target_from_object(mut object: JsonObject<String, Value>) -> Result<TargetRef, RuntimeError> {
+    let target = TargetRef {
+        app_instance_id: required_opaque_id(&mut object, "app_instance_id", "app")?,
+        window_instance_id: required_opaque_id(&mut object, "window_instance_id", "win")?,
+    };
+    reject_unknown(object)?;
+    Ok(target)
 }
 
 fn validate_wait_target(
@@ -840,12 +834,10 @@ fn act_pointer_action(
             }
         }
         "drag" => {
-            let values = required(&mut object, "path")?
-                .as_array()
-                .cloned()
-                .ok_or_else(|| {
-                    RuntimeError::invalid_arguments("pointer drag path must be an array")
-                })?;
+            let values = match required(&mut object, "path")? {
+                Value::Array(values) => values,
+                _ => return invalid("pointer drag path must be an array"),
+            };
             if !(2..=MAX_DRAG_POINTS).contains(&values.len()) {
                 return invalid(format!(
                     "pointer drag path must contain 2 through {MAX_DRAG_POINTS} points"
@@ -854,9 +846,12 @@ fn act_pointer_action(
             let path = values
                 .into_iter()
                 .map(|value| {
-                    let mut point = value.as_object().cloned().ok_or_else(|| {
-                        RuntimeError::invalid_arguments("pointer drag path points must be objects")
-                    })?;
+                    let mut point = match value {
+                        Value::Object(point) => point,
+                        _ => {
+                            return invalid("pointer drag path points must be objects");
+                        }
+                    };
                     let result = coordinate_pair(&mut point, "x", "y")?;
                     reject_unknown(point)?;
                     Ok(result)
@@ -913,26 +908,28 @@ fn keyboard_focus_target(
 fn keyboard_events(
     arguments: &mut JsonObject<String, Value>,
 ) -> Result<Vec<KeyboardEvent>, RuntimeError> {
-    let values = required(arguments, "events")?
-        .as_array()
-        .cloned()
-        .ok_or_else(|| RuntimeError::invalid_arguments("keyboard events must be an array"))?;
+    let values = match required(arguments, "events")? {
+        Value::Array(values) => values,
+        _ => return invalid("keyboard events must be an array"),
+    };
     if values.is_empty() || values.len() > MAX_KEYBOARD_EVENTS {
         return invalid(format!(
             "keyboard events must contain 1 through {MAX_KEYBOARD_EVENTS} events"
         ));
     }
-    let kinds = values
-        .iter()
-        .map(|value| {
-            value
-                .as_object()
-                .and_then(|object| object.get("type"))
-                .and_then(Value::as_str)
-        })
-        .collect::<Vec<_>>();
-    let type_count = kinds.iter().filter(|kind| **kind == Some("type")).count();
-    let press_count = kinds.iter().filter(|kind| **kind == Some("press")).count();
+    let (mut type_count, mut press_count) = (0, 0);
+    for kind in values.iter().filter_map(|value| {
+        value
+            .as_object()
+            .and_then(|object| object.get("type"))
+            .and_then(Value::as_str)
+    }) {
+        match kind {
+            "type" => type_count += 1,
+            "press" => press_count += 1,
+            _ => {}
+        }
+    }
     if type_count > 0 && (type_count != 1 || press_count != 0 || values.len() != 1) {
         return invalid(
             "keyboard events must be either press-only or exactly one non-empty type event; mixed press/type transactions are rejected",
@@ -944,9 +941,10 @@ fn keyboard_events(
     values
         .into_iter()
         .map(|value| {
-            let mut event = value.as_object().cloned().ok_or_else(|| {
-                RuntimeError::invalid_arguments("keyboard events must contain objects")
-            })?;
+            let mut event = match value {
+                Value::Object(event) => event,
+                _ => return invalid("keyboard events must contain objects"),
+            };
             let result = match required_string(&mut event, "type")?.as_str() {
                 "press" => {
                     let key = bounded_nonblank(
@@ -1080,24 +1078,24 @@ fn required_object(
     arguments: &mut JsonObject<String, Value>,
     key: &str,
 ) -> Result<JsonObject<String, Value>, RuntimeError> {
-    required(arguments, key)?
-        .as_object()
-        .cloned()
-        .ok_or_else(|| {
-            RuntimeError::invalid_arguments(format!("argument {key:?} must be an object"))
-        })
+    match required(arguments, key)? {
+        Value::Object(object) => Ok(object),
+        _ => Err(RuntimeError::invalid_arguments(format!(
+            "argument {key:?} must be an object"
+        ))),
+    }
 }
 
 fn required_string(
     arguments: &mut JsonObject<String, Value>,
     key: &str,
 ) -> Result<String, RuntimeError> {
-    required(arguments, key)?
-        .as_str()
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            RuntimeError::invalid_arguments(format!("argument {key:?} must be a string"))
-        })
+    match required(arguments, key)? {
+        Value::String(value) => Ok(value),
+        _ => Err(RuntimeError::invalid_arguments(format!(
+            "argument {key:?} must be a string"
+        ))),
+    }
 }
 
 fn bounded_text(value: String, key: &str, maximum: usize) -> Result<String, RuntimeError> {
@@ -1231,11 +1229,12 @@ fn reject_unknown(arguments: JsonObject<String, Value>) -> Result<(), RuntimeErr
     if arguments.is_empty() {
         return Ok(());
     }
-    let keys = arguments.keys().cloned().collect::<BTreeSet<_>>();
-    invalid(format!(
-        "unknown argument(s): {}",
-        keys.into_iter().collect::<Vec<_>>().join(", ")
-    ))
+    let mut keys = arguments
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    invalid(format!("unknown argument(s): {}", keys.join(", ")))
 }
 
 fn invalid<T>(message: impl Into<String>) -> Result<T, RuntimeError> {

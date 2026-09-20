@@ -310,6 +310,16 @@ struct StreamUserData {
     failure: Arc<Mutex<Option<String>>>,
 }
 
+impl StreamUserData {
+    fn invalidate_frame_state(&mut self) {
+        self.format = None;
+        self.last_source_sequence = None;
+        self.last_content_hash = None;
+        self.prev_tiles = None;
+        self.sender.send_replace(None);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RawFormat {
     format: VideoFormat,
@@ -474,22 +484,14 @@ fn begin_format(data: &mut StreamUserData) -> Result<(), String> {
             data.stream_index
         )
     })?;
-    data.format = None;
-    data.last_source_sequence = None;
-    data.last_content_hash = None;
-    data.prev_tiles = None;
     // Keep change_epoch monotonic across format generations. Stability waits
     // bind both epochs, so renegotiation is independently observable.
-    data.sender.send_replace(None);
+    data.invalidate_frame_state();
     Ok(())
 }
 
 fn invalidate_format(data: &mut StreamUserData) {
-    data.format = None;
-    data.last_source_sequence = None;
-    data.last_content_hash = None;
-    data.prev_tiles = None;
-    data.sender.send_replace(None);
+    data.invalidate_frame_state();
 }
 
 fn report_failure(failure: &Mutex<Option<String>>, error: String) {
@@ -906,8 +908,8 @@ fn publish_frame(
         (Some(previous), Some(current)) => changed_rect_between(previous, current),
         _ => None,
     };
-    if grid.is_some() {
-        user_data.prev_tiles = grid;
+    if let Some(grid) = grid {
+        user_data.prev_tiles = Some(grid);
     }
     let stream_health = if discontinuity {
         StreamHealth::Degraded
@@ -1054,6 +1056,7 @@ fn changed_rect_between(previous: &TileGrid, current: &TileGrid) -> Option<Chang
     let mut max_tx: u32 = 0;
     let mut min_ty: Option<u32> = None;
     let mut max_ty: u32 = 0;
+    let tiles_x = usize::try_from(current.tiles_x).ok()?;
     for (index, (before, after)) in previous
         .hashes
         .iter()
@@ -1063,8 +1066,8 @@ fn changed_rect_between(previous: &TileGrid, current: &TileGrid) -> Option<Chang
         if before == after {
             continue;
         }
-        let tile_x = u32::try_from(index % usize::try_from(current.tiles_x).ok()?).ok()?;
-        let tile_y = u32::try_from(index / usize::try_from(current.tiles_x).ok()?).ok()?;
+        let tile_x = u32::try_from(index % tiles_x).ok()?;
+        let tile_y = u32::try_from(index / tiles_x).ok()?;
         min_tx = Some(min_tx.map_or(tile_x, |value| value.min(tile_x)));
         max_tx = max_tx.max(tile_x);
         min_ty = Some(min_ty.map_or(tile_y, |value| value.min(tile_y)));

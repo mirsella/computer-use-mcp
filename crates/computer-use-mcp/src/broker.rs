@@ -6,6 +6,7 @@ use std::{
     collections::BTreeMap,
     future::Future,
     io::{self, Read},
+    pin::Pin,
     process::Stdio,
     sync::{Arc, Mutex},
     time::Duration,
@@ -132,9 +133,13 @@ impl Identities {
             desktop.as_str()
         );
         let structured = result.structured_content.get_or_insert_with(|| json!({}));
+        if !structured.is_object() {
+            let value = std::mem::take(structured);
+            *structured = json!({"value": value});
+        }
         let object = structured
             .as_object_mut()
-            .expect("desktop results have object structured content");
+            .expect("structured content was normalized to an object");
         let retired = object.remove("session_replacement_required") == Some(json!(true));
         let mut metadata =
             json!({"desktop":desktop.as_str(),"session_id":format!("session-{generation:016x}")})
@@ -403,10 +408,7 @@ impl DesktopBroker {
             .expect("identity lock poisoned")
             .decode(&mut arguments, selected)?;
         tokio::pin!(cancelled);
-        let slot = match desktop {
-            Desktop::Foreground => &self.foreground,
-            Desktop::Background => &self.background,
-        };
+        let slot = self.worker_slot(desktop);
         let mut slot = tokio::select! {
             biased;
             () = &mut cancelled => return Err(cancelled_before_dispatch()),
@@ -439,16 +441,7 @@ impl DesktopBroker {
                     worker: slot.as_mut().expect("worker just installed"),
                     completed: false,
                 };
-                let result = tokio::select! {
-                    biased;
-                    () = &mut cancelled => Err(cancelled_before_dispatch()),
-                    result = tokio::time::timeout(STARTUP_TIMEOUT, pending.worker.output.read()) => match result {
-                        Ok(Ok(value)) if value == json!({"ready":1}) => Ok(()),
-                        Ok(Ok(_)) => Err(worker_failure("invalid worker handshake", false)),
-                        Ok(Err(error)) => Err(worker_failure(error, false)),
-                        Err(_) => Err(worker_failure("desktop startup timed out", false)),
-                    },
-                };
+                let result = start_worker(pending.worker, &mut cancelled).await;
                 pending.completed = result.is_ok();
                 result
             };
@@ -465,27 +458,7 @@ impl DesktopBroker {
                 worker: slot.as_mut().expect("initialized worker"),
                 completed: false,
             };
-            let worker = &mut *pending.worker;
-            let result = async {
-            tokio::select! {
-                biased;
-                () = &mut cancelled => return Ok(tool_error_result(&cancelled_before_dispatch())),
-                () = std::future::ready(()) => {},
-            }
-            tokio::time::timeout(CLEANUP_TIMEOUT, worker.send(&json!({"name":name,"arguments":arguments}))).await
-                .map_err(|_| io::Error::other("worker request write timed out"))??;
-            let response = tokio::select! {
-                biased;
-                result = worker.output.read() => result?,
-                () = &mut cancelled => {
-                    worker.send(&json!({"cancel":true})).await?;
-                    tokio::time::timeout(CLEANUP_TIMEOUT, worker.output.read()).await
-                        .map_err(|_| io::Error::other("worker cancellation cleanup timed out"))??
-                }
-            };
-            serde_json::from_value::<CallToolResult>(response)
-                .map_err(|_| io::Error::other("invalid desktop worker response"))
-        }.await;
+            let result = request_worker(pending.worker, name, arguments, &mut cancelled).await;
             pending.completed = result.is_ok();
             result
         };
@@ -517,6 +490,13 @@ impl DesktopBroker {
             tokio::join!(self.foreground.lock(), self.background.lock());
         tokio::join!(stop_slot(&mut foreground), stop_slot(&mut background));
     }
+
+    fn worker_slot(&self, desktop: Desktop) -> &tokio::sync::Mutex<Option<Worker>> {
+        match desktop {
+            Desktop::Foreground => &self.foreground,
+            Desktop::Background => &self.background,
+        }
+    }
 }
 
 async fn stop_slot(slot: &mut Option<Worker>) {
@@ -525,6 +505,64 @@ async fn stop_slot(slot: &mut Option<Worker>) {
     {
         eprintln!("computer-use-mcp: {error}");
     }
+}
+
+async fn start_worker<C>(
+    worker: &mut Worker,
+    cancelled: &mut Pin<&mut C>,
+) -> Result<(), RuntimeError>
+where
+    C: Future<Output = ()>,
+{
+    tokio::select! {
+        biased;
+        () = &mut *cancelled => Err(cancelled_before_dispatch()),
+        result = tokio::time::timeout(STARTUP_TIMEOUT, worker.output.read()) => match result {
+            Ok(Ok(value)) if value == json!({"ready": 1}) => Ok(()),
+            Ok(Ok(_)) => Err(worker_failure("invalid worker handshake", false)),
+            Ok(Err(error)) => Err(worker_failure(error, false)),
+            Err(_) => Err(worker_failure("desktop startup timed out", false)),
+        },
+    }
+}
+
+async fn request_worker<C>(
+    worker: &mut Worker,
+    name: &str,
+    arguments: Value,
+    cancelled: &mut Pin<&mut C>,
+) -> Result<CallToolResult, io::Error>
+where
+    C: Future<Output = ()>,
+{
+    tokio::select! {
+        biased;
+        () = &mut *cancelled => return Ok(tool_error_result(&cancelled_before_dispatch())),
+        () = std::future::ready(()) => {},
+    }
+    tokio::time::timeout(
+        CLEANUP_TIMEOUT,
+        worker.send(&json!({"name": name, "arguments": arguments})),
+    )
+    .await
+    .map_err(|_| io::Error::other("worker request write timed out"))??;
+    let response = tokio::select! {
+        biased;
+        result = worker.output.read() => result?,
+        () = &mut *cancelled => {
+            tokio::time::timeout(
+                CLEANUP_TIMEOUT,
+                worker.send(&json!({"cancel": true})),
+            )
+            .await
+            .map_err(|_| io::Error::other("worker cancellation write timed out"))??;
+            tokio::time::timeout(CLEANUP_TIMEOUT, worker.output.read())
+                .await
+                .map_err(|_| io::Error::other("worker cancellation cleanup timed out"))??
+        }
+    };
+    serde_json::from_value::<CallToolResult>(response)
+        .map_err(|_| io::Error::other("invalid desktop worker response"))
 }
 
 fn cancelled_before_dispatch() -> RuntimeError {
@@ -1204,6 +1242,24 @@ for line in sys.stdin:
         assert_eq!(structured["session_id"], "session-0000000000000001");
         assert_eq!(structured["value"], "app-0000000000000001");
         assert_ne!(structured["target"]["app_instance_id"], structured["value"]);
+    }
+
+    #[test]
+    fn routing_metadata_preserves_non_object_structured_content() {
+        let broker = broker();
+        let mut result = CallToolResult::success(vec![ContentBlock::text("value")]);
+        result.structured_content = Some(json!("raw value"));
+
+        broker
+            .identities
+            .lock()
+            .unwrap()
+            .encode(&mut result, Desktop::Background, 1);
+
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["value"], "raw value");
+        assert_eq!(structured["desktop"], "background");
+        assert_eq!(structured["session_id"], "session-0000000000000001");
     }
 
     #[test]

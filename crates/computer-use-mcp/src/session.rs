@@ -322,18 +322,10 @@ pub fn describe_session_from_env() -> SessionDescription {
     let (isolated, reason) = isolated_session_from_env();
     let xdg_runtime_dir = std::env::var(XDG_RUNTIME_DIR_ENV).ok();
     let display = resolved.wayland_display;
-    let (socket, socket_present) = display
+    let socket = display
         .as_deref()
-        .and_then(|display| {
-            wayland_socket_path(display, xdg_runtime_dir.as_deref())
-                .ok()
-                .map(|path| {
-                    let present = real_wayland_socket_exists(&path);
-                    (path, present)
-                })
-        })
-        .map(|(path, present)| (Some(path), present))
-        .unwrap_or((None, false));
+        .and_then(|display| wayland_socket_path(display, xdg_runtime_dir.as_deref()).ok());
+    let socket_present = socket.as_deref().is_some_and(real_wayland_socket_exists);
     SessionDescription {
         display,
         socket,

@@ -186,10 +186,7 @@ fn act_input_schema() -> Value {
 }
 
 fn accessibility_request_schema() -> Value {
-    let scopes = AccessibilityScope::ALL
-        .into_iter()
-        .map(AccessibilityScope::as_str)
-        .collect::<Vec<_>>();
+    let scopes = AccessibilityScope::ALL.map(|scope| scope.as_str());
     object(
         json!({
             "scope": {"type": "string", "enum": scopes, "default": AccessibilityScope::default().as_str()},
@@ -323,11 +320,8 @@ fn wait_condition_schema() -> Value {
     ]})
 }
 
-fn window_action_names() -> Vec<&'static str> {
-    WindowAction::ALL
-        .into_iter()
-        .map(WindowAction::as_str)
-        .collect()
+fn window_action_names() -> [&'static str; 5] {
+    WindowAction::ALL.map(|action| action.as_str())
 }
 
 fn coordinate_schema() -> Value {

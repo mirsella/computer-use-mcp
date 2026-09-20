@@ -267,23 +267,31 @@ impl XdgPortalBackend {
             None
         };
 
-        select_devices(
-            &connection,
-            &remote,
-            &session_path,
-            self.token_store.is_some(),
-            restore_token.as_deref(),
-            &closed,
-        )
-        .await?;
-        select_sources(
-            &connection,
-            &screencast,
-            &session_path,
-            capabilities.available_cursor_modes,
-            &closed,
-        )
-        .await?;
+        session_guard
+            .close_on_expiry(
+                select_devices(
+                    &connection,
+                    &remote,
+                    &session_path,
+                    self.token_store.is_some(),
+                    restore_token.as_deref(),
+                    &closed,
+                )
+                .await,
+            )
+            .await?;
+        session_guard
+            .close_on_expiry(
+                select_sources(
+                    &connection,
+                    &screencast,
+                    &session_path,
+                    capabilities.available_cursor_modes,
+                    &closed,
+                )
+                .await,
+            )
+            .await?;
         let clipboard_requested = match request_clipboard(&connection, &session_path).await {
             Ok(()) => true,
             Err(error) => {
@@ -671,9 +679,7 @@ impl ClipboardController {
     }
 
     fn clear_active(&self) {
-        if let Ok(mut active) = self.state.active.lock() {
-            *active = None;
-        }
+        clear_active_selection(&self.state);
     }
 
     pub(crate) async fn clear_selection(&self) -> Result<(), String> {
@@ -700,6 +706,15 @@ impl ClipboardController {
             .expect("clipboard sequence mutex poisoned") = reply.recv_position();
         self.needs_clear.store(false, Ordering::Release);
         Ok(())
+    }
+}
+
+fn clear_active_selection(state: &ClipboardState) {
+    if let Ok(mut active) = state.active.lock() {
+        if let Some(selection) = active.as_ref() {
+            let _ = selection.cancel.send(true);
+        }
+        *active = None;
     }
 }
 
@@ -1163,21 +1178,19 @@ async fn read_capabilities(
     remote: &RemoteDesktop,
     screencast: &Screencast,
 ) -> Result<PortalCapabilities, String> {
+    let (available_device_types, available_source_types, available_cursor_modes) =
+        tokio::try_join!(
+            remote.get_property("AvailableDeviceTypes"),
+            screencast.get_property("AvailableSourceTypes"),
+            screencast.get_property("AvailableCursorModes"),
+        )
+        .map_err(portal_error)?;
     Ok(PortalCapabilities {
         remote_desktop_version: remote.version(),
         screencast_version: screencast.version(),
-        available_device_types: remote
-            .get_property("AvailableDeviceTypes")
-            .await
-            .map_err(portal_error)?,
-        available_source_types: screencast
-            .get_property("AvailableSourceTypes")
-            .await
-            .map_err(portal_error)?,
-        available_cursor_modes: screencast
-            .get_property("AvailableCursorModes")
-            .await
-            .map_err(portal_error)?,
+        available_device_types,
+        available_source_types,
+        available_cursor_modes,
     })
 }
 
@@ -1223,7 +1236,7 @@ async fn select_devices(
     persist: bool,
     restore_token: Option<&str>,
     closed: &watch::Receiver<bool>,
-) -> Result<(), String> {
+) -> Result<(), ApprovalError> {
     let token = random_token("devices")?;
     let mut request = RawRequest::new(connection, &token).await?;
     let mut options = HashMap::new();
@@ -1236,12 +1249,19 @@ async fn select_devices(
         }
     }
     let path = ObjectPath::try_from(session_path).map_err(portal_error)?;
-    let returned: OwnedObjectPath = remote
-        .call("SelectDevices", &(path, options))
+    request
+        .response_with_deadline(
+            async {
+                remote
+                    .call("SelectDevices", &(path, options))
+                    .await
+                    .map_err(portal_error)
+            },
+            "SelectDevices",
+            closed,
+        )
         .await
-        .map_err(portal_error)?;
-    request.response(returned, "SelectDevices", closed).await?;
-    Ok(())
+        .map(|_| ())
 }
 
 async fn select_sources(
@@ -1250,7 +1270,7 @@ async fn select_sources(
     session_path: &str,
     available_cursor_modes: u32,
     closed: &watch::Receiver<bool>,
-) -> Result<(), String> {
+) -> Result<(), ApprovalError> {
     let token = random_token("sources")?;
     let mut request = RawRequest::new(connection, &token).await?;
     let mut options = HashMap::new();
@@ -1267,12 +1287,19 @@ async fn select_sources(
         Value::from(cursor_mode(available_cursor_modes)?),
     );
     let path = ObjectPath::try_from(session_path).map_err(portal_error)?;
-    let returned: OwnedObjectPath = screencast
-        .call("SelectSources", &(path, options))
+    request
+        .response_with_deadline(
+            async {
+                screencast
+                    .call("SelectSources", &(path, options))
+                    .await
+                    .map_err(portal_error)
+            },
+            "SelectSources",
+            closed,
+        )
         .await
-        .map_err(portal_error)?;
-    request.response(returned, "SelectSources", closed).await?;
-    Ok(())
+        .map(|_| ())
 }
 
 async fn request_clipboard(connection: &Connection, session_path: &str) -> Result<(), String> {
@@ -1300,21 +1327,18 @@ async fn start_remote_desktop(
     let mut options = HashMap::new();
     options.insert("handle_token", Value::from(token));
     let path = ObjectPath::try_from(session_path).map_err(portal_error)?;
-    let result = consent_deadline(async {
-        let returned: OwnedObjectPath = remote
-            .call("Start", &(path, "", options))
-            .await
-            .map_err(portal_error)?;
-        request.response(returned, "Start", closed).await
-    })
-    .await;
-    match result {
-        Err(ApprovalError::Expired) => {
-            request.guard.close().await?;
-            Err(ApprovalError::Expired)
-        }
-        result => result,
-    }
+    request
+        .response_with_deadline(
+            async {
+                remote
+                    .call("Start", &(path, "", options))
+                    .await
+                    .map_err(portal_error)
+            },
+            "Start",
+            closed,
+        )
+        .await
 }
 
 struct RawRequest {
@@ -1392,6 +1416,23 @@ impl RawRequest {
         classify_response(code, operation)?;
         Ok(results)
     }
+
+    async fn response_with_deadline(
+        &mut self,
+        response: impl Future<Output = Result<OwnedObjectPath, String>>,
+        operation: &str,
+        closed: &watch::Receiver<bool>,
+    ) -> Result<HashMap<String, OwnedValue>, ApprovalError> {
+        let result = consent_deadline(async {
+            let returned = response.await?;
+            self.response(returned, operation, closed).await
+        })
+        .await;
+        if matches!(result, Err(ApprovalError::Expired)) {
+            self.guard.close().await?;
+        }
+        result
+    }
 }
 
 async fn wait_for_request_response<S>(
@@ -1461,6 +1502,16 @@ struct CloseGuard {
 }
 
 impl CloseGuard {
+    async fn close_on_expiry<T>(
+        &mut self,
+        result: Result<T, ApprovalError>,
+    ) -> Result<T, ApprovalError> {
+        if matches!(result, Err(ApprovalError::Expired)) {
+            self.close().await?;
+        }
+        result
+    }
+
     async fn close(&mut self) -> Result<(), String> {
         match &self.target {
             Some(CloseTarget::Proxy(proxy)) => {
@@ -1943,6 +1994,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_consent_closes_the_session_before_retrying() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut guard = CloseGuard {
+            target: Some(CloseTarget::Probe(Arc::clone(&count))),
+            label: "expired consent test",
+        };
+        let result = guard
+            .close_on_expiry(Err::<(), _>(ApprovalError::Expired))
+            .await;
+        assert!(matches!(result, Err(ApprovalError::Expired)));
+        assert_eq!(count.load(AtomicOrdering::Acquire), 1);
+        drop(guard);
+        assert_eq!(count.load(AtomicOrdering::Acquire), 1);
+    }
+
+    #[tokio::test]
     async fn consent_explicit_cancel_and_unspecified_termination_do_not_reprompt() {
         for code in [1, 2] {
             let attempts = AtomicUsize::new(0);
@@ -2227,6 +2294,26 @@ mod tests {
         complete_active(&state, Ok(()));
         assert_eq!(receiver.await.unwrap(), Ok(()));
         complete_active(&state, Err("late transfer".into()));
+    }
+
+    #[tokio::test]
+    async fn clearing_active_clipboard_selection_signals_in_flight_transfer() {
+        let state = ClipboardState {
+            active: Mutex::new(None),
+            cleared_through: Mutex::new(Default::default()),
+        };
+        let (cancel, mut cancelled) = watch::channel(false);
+        *state.active.lock().unwrap() = Some(ActiveClipboardSelection {
+            payload: Arc::from(b"payload".as_slice()),
+            completion: None,
+            cancel,
+        });
+
+        clear_active_selection(&state);
+
+        cancelled.changed().await.unwrap();
+        assert!(*cancelled.borrow());
+        assert!(state.active.lock().unwrap().is_none());
     }
 
     #[tokio::test]

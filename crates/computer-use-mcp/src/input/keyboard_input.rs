@@ -36,48 +36,30 @@ impl ResolvedPaste {
 }
 
 pub fn preflight_transaction(
-    _backend: &ReisInputBackend,
-    focus: KeyboardPoint,
+    focus: Option<KeyboardPoint>,
     events: &[KeyboardEvent],
 ) -> Result<(), String> {
     validate_transaction_shape(events)?;
-    validate_focus(focus)?;
-    Ok(())
-}
-
-/// Preflight a keyboard transaction for the already-focused element without
-/// resolving keys. Execution resolves the complete transaction before its
-/// first event, so preparation does not duplicate that work.
-pub fn preflight_transaction_focused(
-    _backend: &ReisInputBackend,
-    events: &[KeyboardEvent],
-) -> Result<(), String> {
-    validate_transaction_shape(events)?;
+    if let Some(focus) = focus {
+        validate_focus(focus)?;
+    }
     Ok(())
 }
 
 pub async fn perform_transaction(
     backend: Arc<ReisInputBackend>,
-    focus: KeyboardPoint,
+    focus: Option<KeyboardPoint>,
     events: Vec<KeyboardEvent>,
     progress: Arc<ActionProgress>,
 ) -> Result<(), String> {
-    validate_focus(focus)?;
+    if let Some(focus) = focus {
+        validate_focus(focus)?;
+    }
     let resolved = resolve_transaction(&backend, &events)?;
-    tap_sequence(backend, focus, resolved, progress).await
-}
-
-/// Type into the already-focused element without moving the pointer or
-/// clicking: the caller must have verified AT-SPI focus (element focused, its
-/// window active) before dispatch. Held keys are released through the same
-/// cleanup guard as the point-click path.
-pub async fn perform_transaction_focused(
-    backend: Arc<ReisInputBackend>,
-    events: Vec<KeyboardEvent>,
-    progress: Arc<ActionProgress>,
-) -> Result<(), String> {
-    let resolved = resolve_transaction(&backend, &events)?;
-    type_into_focus(backend, resolved, progress).await
+    match focus {
+        Some(focus) => tap_sequence(backend, focus, resolved, progress).await,
+        None => type_into_focus(backend, resolved, progress).await,
+    }
 }
 
 /// Split paste text into bounded typing chunks. The split is on Unicode scalar
@@ -133,51 +115,30 @@ fn validate_paste_shape(text: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn preflight_paste(
-    _backend: &ReisInputBackend,
-    focus: KeyboardPoint,
-    text: &str,
-) -> Result<usize, String> {
+pub fn preflight_paste(focus: Option<KeyboardPoint>, text: &str) -> Result<usize, String> {
     validate_paste_shape(text)?;
-    validate_focus(focus)?;
+    if let Some(focus) = focus {
+        validate_focus(focus)?;
+    }
     Ok(paste_chunk_slices(text).count())
 }
 
-/// Preflight a paste for the already-focused element without resolving keys.
-/// Execution resolves every bounded chunk before its first event.
-pub fn preflight_paste_focused(_backend: &ReisInputBackend, text: &str) -> Result<usize, String> {
-    validate_paste_shape(text)?;
-    Ok(paste_chunk_slices(text).count())
-}
-
-/// Paste long text without touching any clipboard: focus-click the point, then
-/// type the text in bounded chunks. Each chunk runs through the same
-/// cleanup-guarded transaction path as a single `type` event, so held keys are
-/// released even when a later chunk fails. Never logs the text itself.
+/// Paste long text without touching any clipboard, optionally focus-clicking a
+/// point first. Each chunk runs through the same cleanup-guarded transaction
+/// path as a single `type` event, so held keys are released even when a later
+/// chunk fails. Never logs the text itself.
 pub async fn perform_paste(
     backend: Arc<ReisInputBackend>,
-    focus: KeyboardPoint,
+    focus: Option<KeyboardPoint>,
     text: String,
     progress: Arc<ActionProgress>,
 ) -> Result<usize, String> {
     validate_paste_shape(&text)?;
-    validate_focus(focus)?;
+    if let Some(focus) = focus {
+        validate_focus(focus)?;
+    }
     let resolved = resolve_paste(&backend, &text)?;
-    stream_paste(backend, Some(focus), resolved, progress).await
-}
-
-/// Paste into the already-focused element without moving the pointer or
-/// clicking. Same chunking and cleanup guarantees as [`perform_paste`]; the
-/// caller must have verified AT-SPI focus before dispatch. Never logs the
-/// text itself.
-pub async fn perform_paste_focused(
-    backend: Arc<ReisInputBackend>,
-    text: String,
-    progress: Arc<ActionProgress>,
-) -> Result<usize, String> {
-    validate_paste_shape(&text)?;
-    let resolved = resolve_paste(&backend, &text)?;
-    stream_paste(backend, None, resolved, progress).await
+    stream_paste(backend, focus, resolved, progress).await
 }
 
 fn validate_focus(focus: KeyboardPoint) -> Result<(), String> {
@@ -330,7 +291,6 @@ async fn tap_sequence<B>(
 where
     B: InputBackend,
 {
-    validate_focus(focus)?;
     let backend: Arc<dyn InputBackend> = backend;
     let mut guard = HeldInputGuard::new(Arc::clone(&backend));
     guard.begin().await?;
@@ -366,9 +326,6 @@ async fn stream_paste<B>(
 where
     B: InputBackend,
 {
-    if let Some(focus) = focus {
-        validate_focus(focus)?;
-    }
     let backend: Arc<dyn InputBackend> = backend;
     let mut guard = HeldInputGuard::new(Arc::clone(&backend));
     guard.begin().await?;

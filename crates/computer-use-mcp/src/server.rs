@@ -166,36 +166,36 @@ impl<R: DesktopRuntime> ComputerUseMcpServer<R> {
 
     async fn cancel_active(&self, progress: Option<&Arc<ActionProgress>>) -> CallToolResult {
         eprintln!("computer-use-mcp: tool call cancelled");
-        match tokio::time::timeout(
+        self.cleanup_active_or_disable(progress).await;
+        let error = cancelled_error(progress, "tool call cancelled while execution was active");
+        tool_error_result(&error)
+    }
+
+    async fn cleanup_active_or_disable(&self, progress: Option<&Arc<ActionProgress>>) {
+        let reason = match tokio::time::timeout(
             Duration::from_secs(8),
             self.runtime.cleanup(progress.cloned()),
         )
         .await
         {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                if let Some(progress) = &progress {
-                    progress.mark_cleanup_failed();
-                }
-                eprintln!(
-                    "computer-use-mcp: cancellation cleanup failed: {error}; shutting down the desktop session"
-                );
-                self.unavailable.store(true, Ordering::Release);
-                shutdown_after_cleanup_failure(self.runtime.as_ref()).await;
-            }
-            Err(_) => {
-                if let Some(progress) = &progress {
-                    progress.mark_cleanup_failed();
-                }
-                eprintln!(
-                    "computer-use-mcp: cancellation cleanup timed out; shutting down the desktop session"
-                );
-                self.unavailable.store(true, Ordering::Release);
-                shutdown_after_cleanup_failure(self.runtime.as_ref()).await;
-            }
+            Ok(Ok(())) => return,
+            Ok(Err(error)) => format!("cancellation cleanup failed: {error}"),
+            Err(_) => "cancellation cleanup timed out".to_owned(),
+        };
+        self.disable_after_cleanup_failure(progress, reason).await;
+    }
+
+    async fn disable_after_cleanup_failure(
+        &self,
+        progress: Option<&Arc<ActionProgress>>,
+        reason: impl std::fmt::Display,
+    ) {
+        if let Some(progress) = progress {
+            progress.mark_cleanup_failed();
         }
-        let error = cancelled_error(progress, "tool call cancelled while execution was active");
-        tool_error_result(&error)
+        eprintln!("computer-use-mcp: {reason}; shutting down the desktop session");
+        self.unavailable.store(true, Ordering::Release);
+        shutdown_after_cleanup_failure(self.runtime.as_ref()).await;
     }
 }
 

@@ -1280,7 +1280,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             .map_err(catalog_error)
     }
 
-    async fn refresh_window_catalog(&self) -> Result<(), RuntimeError> {
+    async fn refresh_window_catalog(&self) -> Result<Vec<AppInfo>, RuntimeError> {
         let apps = self.discover().await.map_err(|error| {
             eprintln!(
                 "computer-use-mcp: AT-SPI discovery unavailable while refreshing target catalog: {error}"
@@ -1296,7 +1296,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         self.lock_catalog()?
             .reconcile_sources(&apps, compositor.records)
             .map_err(catalog_error)?;
-        Ok(())
+        Ok(apps)
     }
 
     async fn requested_target_snapshot(
@@ -1309,7 +1309,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         // Target IDs are process-lifetime handles, but the backend record must
         // still be present in the current catalog before visual capture or
         // accessibility collection begins.
-        self.refresh_window_catalog().await?;
+        let apps = self.refresh_window_catalog().await?;
         let entry = self.target_entry(target)?;
         let accessibility = accessibility.unwrap_or_else(|| AccessibilityRequest {
             scope: AccessibilityScope::default(),
@@ -1331,39 +1331,12 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             depth: accessibility.limits.depth,
         };
 
-        if !wants_accessibility {
-            return self.commit_snapshot(self.visual_snapshot(
-                &entry,
-                target,
-                VisualSnapshotOptions {
-                    view,
-                    accessibility_scope: accessibility.scope,
-                    element_query: accessibility.query.clone(),
-                    limits: snapshot_limits,
-                    accessibility_ready: false,
-                    accessibility_reason: Some("accessibility was not requested".into()),
-                    crop,
-                },
-            ));
-        }
-
-        let Some(binding) = entry.atspi.clone() else {
-            let reason = "this window has no AT-SPI authority";
-            if wants_screenshot {
-                return self.commit_snapshot(self.visual_snapshot(
-                    &entry,
-                    target,
-                    VisualSnapshotOptions {
-                        view,
-                        accessibility_scope: accessibility.scope,
-                        element_query: accessibility.query.clone(),
-                        limits: snapshot_limits,
-                        accessibility_ready: false,
-                        accessibility_reason: Some(reason.into()),
-                        crop,
-                    },
-                ));
-            }
+        if !wants_accessibility || entry.atspi.is_none() {
+            let reason = if wants_accessibility {
+                "this window has no AT-SPI authority"
+            } else {
+                "accessibility was not requested"
+            };
             return self.commit_snapshot(self.visual_snapshot(
                 &entry,
                 target,
@@ -1377,10 +1350,16 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                     crop,
                 },
             ));
-        };
+        }
+
+        let binding = entry
+            .atspi
+            .as_ref()
+            .expect("AT-SPI binding was checked before snapshot collection");
         let mut snapshot = self
-            .collect_snapshot(
-                &binding,
+            .collect_snapshot_from_apps(
+                &apps,
+                binding,
                 accessibility.scope,
                 accessibility.query,
                 snapshot_limits,
@@ -1914,14 +1893,15 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         }
         self.clear_click_grace();
         let cleanup = timeout(Duration::from_secs(2), self.screenshots.cleanup_input()).await;
-        if !matches!(cleanup, Ok(Ok(()))) {
-            progress.mark_cleanup_failed();
-        } else {
+        let cleanup_succeeded = matches!(&cleanup, Ok(Ok(())));
+        if cleanup_succeeded {
             progress.mark_cleanup_completed();
+        } else {
+            progress.mark_cleanup_failed();
         }
         let mut error = RuntimeError::user_takeover();
         error.outcome = progress.snapshot().outcome();
-        if !matches!(cleanup, Ok(Ok(()))) {
+        if !cleanup_succeeded {
             error
                 .message
                 .push_str("; held input release could not be verified");
@@ -1932,6 +1912,14 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
     fn check_takeover(&self) -> Result<(), RuntimeError> {
         if self.takeover.is_active() {
             Err(RuntimeError::user_takeover())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn ensure_no_launch_in_progress(&self) -> Result<(), RuntimeError> {
+        if self.launch_in_progress.load(Ordering::Acquire) {
+            Err(launch_in_progress_error())
         } else {
             Ok(())
         }
@@ -2250,7 +2238,6 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
     ) -> Result<ToolOutput, RuntimeError> {
         let requested_app_id = desktop_id.strip_suffix(".desktop").unwrap_or(desktop_id);
         loop {
-            self.check_takeover()?;
             if !self.refresh_window_catalog_for_wait(deadline).await? {
                 return Ok(wait_output_optional(
                     None,
@@ -2305,7 +2292,6 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
     ) -> Result<ToolOutput, RuntimeError> {
         let mut matched_target = None;
         loop {
-            self.check_takeover()?;
             if !self.refresh_window_catalog_for_wait(deadline).await? {
                 if let Some(matched_target) = matched_target.as_ref() {
                     return Ok(wait_output_optional(
@@ -2377,12 +2363,13 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<bool, RuntimeError> {
+        self.check_takeover()?;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return Ok(false);
         }
         match timeout(remaining, self.refresh_window_catalog()).await {
-            Ok(result) => result.map(|()| true),
+            Ok(result) => result.map(|_| true),
             Err(_) => Ok(false),
         }
     }
@@ -2700,26 +2687,18 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         progress: Option<Arc<ActionProgress>>,
         visual_session: Result<(), RuntimeError>,
     ) -> Result<ToolOutput, RuntimeError> {
+        let _mutation = self.mutation.lock().await;
         match call {
             ToolCall::ListDesktop {
                 scope,
                 limit,
                 cursor,
-            } => {
-                let _mutation = self.mutation.lock().await;
-                self.list_desktop(scope, limit, cursor.as_deref()).await
-            }
+            } => self.list_desktop(scope, limit, cursor.as_deref()).await,
             ToolCall::LaunchApplication { desktop_id } => {
-                let _mutation = self.mutation.lock().await;
                 self.check_takeover()?;
                 self.clear_click_grace();
                 self.invalidate_for_launch()?;
-                let Some(progress) = progress else {
-                    eprintln!(
-                        "computer-use-mcp: launch call reached runtime without an attempt record"
-                    );
-                    return Err(operational_error("launch attempt record is missing"));
-                };
+                let progress = required_action_progress(progress, "launch")?;
                 let launched = crate::desktop_launcher::launch(
                     &desktop_id,
                     Arc::clone(&self.launch_in_progress),
@@ -2740,18 +2719,10 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 .map(|output| output.with_action_progress(progress.as_ref()))
             }
             ToolCall::ActivateWindow { target, action } => {
-                let _mutation = self.mutation.lock().await;
                 self.check_takeover()?;
                 self.clear_click_grace();
-                if self.launch_in_progress.load(Ordering::Acquire) {
-                    return Err(launch_in_progress_error());
-                }
-                let Some(progress) = progress else {
-                    eprintln!(
-                        "computer-use-mcp: activation call reached runtime without an attempt record"
-                    );
-                    return Err(operational_error("activation attempt record is missing"));
-                };
+                self.ensure_no_launch_in_progress()?;
+                let progress = required_action_progress(progress, "activation")?;
                 if action == WindowAction::Activate {
                     self.activate_window(&target, progress.as_ref()).await
                 } else {
@@ -2764,10 +2735,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 accessibility,
                 crop,
             } => {
-                let _mutation = self.mutation.lock().await;
-                if self.launch_in_progress.load(Ordering::Acquire) {
-                    return Err(launch_in_progress_error());
-                }
+                self.ensure_no_launch_in_progress()?;
                 let snapshot = self
                     .requested_target_snapshot(&target, view, accessibility, crop)
                     .await?;
@@ -2778,7 +2746,6 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 source,
                 operation,
             } => {
-                let _mutation = self.mutation.lock().await;
                 if !matches!(
                     &operation,
                     ActOperation::Keyboard {
@@ -2791,16 +2758,8 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 ) {
                     self.clear_click_grace();
                 }
-                if self.launch_in_progress.load(Ordering::Acquire) {
-                    return Err(launch_in_progress_error());
-                }
-                let Some(progress) = progress else {
-                    eprintln!(
-                        "computer-use-mcp: act call reached runtime without an attempt record"
-                    );
-                    return Err(operational_error("act attempt record is missing"));
-                };
-                self.refuse_takeover_with_cleanup(progress.as_ref()).await?;
+                self.ensure_no_launch_in_progress()?;
+                let progress = required_action_progress(progress, "act")?;
                 self.act_new(&target, &source, operation, progress).await
             }
             ToolCall::WaitFor {
@@ -2808,10 +2767,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 condition,
                 timeout_ms,
             } => {
-                let _mutation = self.mutation.lock().await;
-                if self.launch_in_progress.load(Ordering::Acquire) {
-                    return Err(launch_in_progress_error());
-                }
+                self.ensure_no_launch_in_progress()?;
                 self.check_takeover()?;
                 self.wait_for_new(target, condition, timeout_ms).await
             }
@@ -2851,16 +2807,16 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         Ok(())
     }
 
-    async fn collect_snapshot(
+    async fn collect_snapshot_from_apps(
         &self,
+        apps: &[AppInfo],
         binding: &AtspiBinding,
         view: AccessibilityScope,
         element_query: Option<String>,
         limits: SnapshotLimits,
     ) -> Result<Snapshot, RuntimeError> {
-        let apps = self.discover().await?;
         let matching_apps = apps
-            .into_iter()
+            .iter()
             .filter(|app| app.pid == binding.app.pid && app.object == binding.app.object)
             .collect::<Vec<_>>();
         let [app] = matching_apps.as_slice() else {
@@ -2899,7 +2855,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         Ok(Snapshot {
             view,
             element_query,
-            app: app.clone(),
+            app: (*app).clone(),
             window: window.clone(),
             generation: 0,
             node_limit_reached: elements.node_limit_reached,
@@ -3114,8 +3070,10 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         cached: &Snapshot,
         limits: SnapshotLimits,
     ) -> Result<Snapshot, RuntimeError> {
+        let apps = self.discover().await?;
         let mut snapshot = self
-            .collect_snapshot(
+            .collect_snapshot_from_apps(
+                &apps,
                 &AtspiBinding {
                     app: cached.app.clone(),
                     window: cached.window.clone(),
@@ -3162,6 +3120,47 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         Ok(())
     }
 
+    async fn prepare_input_with_cleanup<F>(
+        &self,
+        preparation: F,
+        timeout_message: &str,
+        cleanup_failure_log: &str,
+        cleanup_failure_message: &str,
+        cleanup_error_message: &str,
+        progress: &ActionProgress,
+    ) -> Result<(), RuntimeError>
+    where
+        F: Future<Output = Result<(), String>> + Send,
+    {
+        let preparation = timeout(self.config.snapshot_timeout, preparation).await;
+        let cleanup = self.screenshots.cleanup_input().await;
+        let cleanup_succeeded = cleanup.is_ok();
+        if cleanup_succeeded {
+            progress.mark_cleanup_completed();
+        } else {
+            progress.mark_cleanup_failed();
+        }
+        let preparation = preparation
+            .map_err(|_| operational_error(timeout_message))
+            .map_err(|error| with_action_progress(error, progress))?
+            .map_err(generated_input_error);
+        if let Err(mut error) = preparation {
+            if let Err(cleanup) = cleanup {
+                eprintln!("computer-use-mcp: {cleanup_failure_log}: {cleanup}");
+                error
+                    .message
+                    .push_str(&format!("; {cleanup_failure_message}: {cleanup}"));
+            }
+            return Err(with_action_progress(error, progress));
+        }
+        cleanup.map_err(|error| {
+            with_action_progress(
+                operational_error(format!("{cleanup_error_message}: {error}")),
+                progress,
+            )
+        })
+    }
+
     async fn perform_generated_with_progress(
         &self,
         observation_id: &str,
@@ -3192,40 +3191,15 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         self.lock_cache()?
             .position(&cached)
             .map_err(|error| with_action_progress(error, progress.as_ref()))?;
-        let preparation = timeout(
-            self.config.snapshot_timeout,
+        self.prepare_input_with_cleanup(
             self.screenshots.prepare_input(&cached, &mapping, &action),
+            "generated input preparation timed out",
+            "cleanup also failed after input preparation error",
+            "generated input cleanup also failed",
+            "generated input preparation cleanup failed",
+            progress.as_ref(),
         )
-        .await;
-        let cleanup = self.screenshots.cleanup_input().await;
-        if cleanup.is_err() {
-            progress.mark_cleanup_failed();
-        } else {
-            progress.mark_cleanup_completed();
-        }
-        let preparation = preparation
-            .map_err(|_| operational_error("generated input preparation timed out"))
-            .map_err(|error| with_action_progress(error, progress.as_ref()))?
-            .map_err(generated_input_error);
-        if let Err(mut error) = preparation {
-            if let Err(cleanup) = cleanup {
-                eprintln!(
-                    "computer-use-mcp: cleanup also failed after input preparation error: {cleanup}"
-                );
-                error
-                    .message
-                    .push_str(&format!("; generated input cleanup also failed: {cleanup}"));
-                return Err(with_action_progress(error, progress.as_ref()));
-            }
-            return Err(with_action_progress(error, progress.as_ref()));
-        }
-        cleanup
-            .map_err(|error| {
-                operational_error(format!(
-                    "generated input preparation cleanup failed: {error}"
-                ))
-            })
-            .map_err(|error| with_action_progress(error, progress.as_ref()))?;
+        .await?;
         self.fresh_for_action(&cached)
             .await
             .map_err(|error| with_action_progress(error, progress.as_ref()))?;
@@ -3334,38 +3308,15 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         }
         // Prepare the EIS transaction before changing focus. Preparation may
         // await a portal dialog, so earlier focus evidence is insufficient.
-        let preparation = timeout(
-            self.config.snapshot_timeout,
+        self.prepare_input_with_cleanup(
             self.screenshots.prepare_focused_input(&action),
+            "focused input preparation timed out",
+            "focused input preparation failed and cleanup also failed",
+            "focused input cleanup also failed",
+            "focused input preparation cleanup failed",
+            progress.as_ref(),
         )
-        .await;
-        let cleanup = self.screenshots.cleanup_input().await;
-        if cleanup.is_err() {
-            progress.mark_cleanup_failed();
-        } else {
-            progress.mark_cleanup_completed();
-        }
-        let preparation = preparation
-            .map_err(|_| operational_error("focused input preparation timed out"))
-            .map_err(|error| with_action_progress(error, progress.as_ref()))?
-            .map_err(generated_input_error);
-        if let Err(mut error) = preparation {
-            if let Err(cleanup) = cleanup {
-                eprintln!(
-                    "computer-use-mcp: focused input preparation failed and cleanup also failed: {cleanup}"
-                );
-                error
-                    .message
-                    .push_str(&format!("; focused input cleanup also failed: {cleanup}"));
-                return Err(with_action_progress(error, progress.as_ref()));
-            }
-            return Err(with_action_progress(error, progress.as_ref()));
-        }
-        cleanup
-            .map_err(|error| {
-                operational_error(format!("focused input preparation cleanup failed: {error}"))
-            })
-            .map_err(|error| with_action_progress(error, progress.as_ref()))?;
+        .await?;
         self.refuse_takeover_with_cleanup(progress.as_ref()).await?;
         // Preparation can await portal/EIS setup. Grab and verify focus only
         // after it completes, using fresh window evidence after GrabFocus.
@@ -3606,12 +3557,12 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
 
     async fn settle_and_refresh(&self, old: Arc<Snapshot>) -> Result<Arc<Snapshot>, RuntimeError> {
         sleep(self.config.settle_interval).await;
-        self.refresh_window_catalog().await?;
+        let apps = self.refresh_window_catalog().await?;
         let refreshed = if let Some(target) = old.target_ref.as_ref() {
             let entry = self
                 .target_entry(target)
                 .map_err(completed_without_observation)?;
-            let future = self.replacement_snapshot(&old, target, &entry);
+            let future = self.replacement_snapshot(&old, target, &entry, &apps);
             timeout(self.config.snapshot_timeout, future)
                 .await
                 .map_err(|_| operational_error("snapshot timed out after action"))??
@@ -3634,6 +3585,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         old: &Snapshot,
         target: &TargetRef,
         entry: &WindowEntry,
+        apps: &[AppInfo],
     ) -> Result<Snapshot, RuntimeError> {
         if !old.requires_atspi_revalidation {
             let view = if old.screenshot_requested {
@@ -3679,7 +3631,13 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             ));
         };
         let mut snapshot = self
-            .collect_snapshot(binding, old.view, old.element_query.clone(), old.limits)
+            .collect_snapshot_from_apps(
+                apps,
+                binding,
+                old.view,
+                old.element_query.clone(),
+                old.limits,
+            )
             .await?;
         snapshot.target_ref = Some(target.clone());
         snapshot.screenshot_requested = old.screenshot_requested;
@@ -4004,14 +3962,20 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
     }
 
     async fn revalidate_screenshot_target(&self, snapshot: &Snapshot) -> Result<(), RuntimeError> {
-        if let Some(target) = snapshot.target_ref.as_ref() {
-            self.refresh_window_catalog().await?;
+        let catalog_apps = if let Some(target) = snapshot.target_ref.as_ref() {
+            let apps = self.refresh_window_catalog().await?;
             let _ = self.target_entry(target)?;
-        }
+            Some(apps)
+        } else {
+            None
+        };
         if !snapshot.requires_atspi_revalidation {
             return Ok(());
         }
-        let apps = self.discover().await?;
+        let apps = match catalog_apps {
+            Some(apps) => apps,
+            None => self.discover().await?,
+        };
         let matching_apps = apps
             .iter()
             .filter(|app| app.pid == snapshot.app.pid && app.object == snapshot.app.object)
@@ -4100,7 +4064,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             ObserveView::Accessibility => AccessibilityScope::Full,
             ObserveView::Both => AccessibilityScope::Full,
         };
-        let apps = self.discover().await?;
+        let apps = self.refresh_window_catalog().await?;
         let [app] = apps.as_slice() else {
             return Err(operational_error(
                 "test fixture must expose exactly one AT-SPI application",
@@ -4116,7 +4080,8 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             window: window.clone(),
         };
         let snapshot = self
-            .collect_snapshot(
+            .collect_snapshot_from_apps(
+                &apps,
                 &binding,
                 scope,
                 None,
@@ -4127,7 +4092,6 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 },
             )
             .await?;
-        self.refresh_window_catalog().await?;
         let mut snapshot = snapshot;
         snapshot.screenshot_requested = false;
         snapshot.target_ref = Some(TargetRef {
@@ -5571,6 +5535,16 @@ fn binding_active_in(apps: &[AppInfo], binding: &AtspiBinding) -> bool {
 
 fn operational_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::not_started("target_unavailable", message)
+}
+
+fn required_action_progress(
+    progress: Option<Arc<ActionProgress>>,
+    action: &str,
+) -> Result<Arc<ActionProgress>, RuntimeError> {
+    progress.ok_or_else(|| {
+        eprintln!("computer-use-mcp: {action} call reached runtime without an attempt record");
+        operational_error(format!("{action} attempt record is missing"))
+    })
 }
 
 fn catalog_error(error: CatalogError) -> RuntimeError {
@@ -12025,8 +11999,7 @@ mod tests {
             (ObserveView::Accessibility, false) => AccessibilityScope::Visible,
             (ObserveView::Screenshot, _) => AccessibilityScope::Interactive,
         };
-        runtime.refresh_window_catalog().await.unwrap();
-        let apps = runtime.discover().await.unwrap();
+        let apps = runtime.refresh_window_catalog().await.unwrap();
         let [app] = apps.as_slice() else {
             panic!("test fixture must expose exactly one application");
         };
@@ -12038,7 +12011,8 @@ mod tests {
             window: window.clone(),
         };
         let snapshot = runtime
-            .collect_snapshot(
+            .collect_snapshot_from_apps(
+                &apps,
                 &binding,
                 scope,
                 query,
