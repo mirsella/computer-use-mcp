@@ -1,41 +1,54 @@
 ---
 name: computer-use-mcp
-description: Operate the local Wayland desktop with exact MCP targets, fresh evidence, and explicit input boundaries.
+description: Use the computer-use MCP to operate a Wayland desktop through screenshots, accessibility, and exact window targets.
 license: MIT
 ---
 
 # Computer-use MCP
 
-Use only `list_desktop`, `launch_application`, `activate_window`, `observe`,
-`act`, and `wait_for`. Read initialize instructions; there is no help call or
-resource catalogue.
+## Route and discover
 
-## Evidence-first workflow
+1. `list_desktop` with `scope: "windows"`; copy the complete target. To launch,
+   list installed applications first. Launch only acknowledges a request; list
+   windows again or wait for `window_opened`.
+2. `observe` the target. Start with accessibility for semantic controls; request
+   screenshots for visual grounding. Expand scope or text limits only when needed.
+3. `act` from that observation. Prefer advertised `invoke` and `set_value`.
+   Continue from the replacement observation and copy opaque IDs unchanged.
 
-Start with `list_desktop` using `{"scope":"windows"}` and copy one complete
-opaque target. Use `applications` only for an installed `.desktop` ID. Titles,
-names, PIDs, selectors, and guessed geometry are not IDs. Launch is only an
-acknowledgement: list and observe the new target before acting. Use only exact
-advertised capabilities and copy observation, frame, element, and cursor IDs
-unchanged.
+`desktop` is accepted only by `list_desktop`, `launch_application`, and a
+targetless `window_opened`, with `foreground` or `background`. Omit it for the
+foreground default. Returned targets and cursors route later calls; do not send
+`session_id`. Background starts a private worker lazily. Retired-worker IDs are
+stale; explicitly discover or launch again to create a replacement.
 
-Activation evidence does not prove seat focus. `act` needs an exact
-`source_observation`; pointer/keyboard also require its frame. Continue from a
-returned replacement observation. Waits use exact prior IDs. On stale target or
-cursor, list again; on stale observation or element, observe again.
+Use `activate_window` for switching, never Alt+Tab. Its other actions need KDE
+window-management capability. Activation does not prove seat focus.
 
-## Input boundaries
+## Input
 
-Pointer and keyboard points are half-open pixels in the complete selected-monitor
-PNG. Never convert AT-SPI bounds. Keyboard requires a visibly intended point and
-either press-only events or one type-only event. Do not use Alt+Tab. Separate
-routing, text, and submit with replacement observations; prefer advertised
-`set_value`. AT-SPI focus is not keyboard authority.
+Pointer and point-focus keyboard/paste require `source_observation.frame_id`.
+Use pixels in the returned PNG, `0 <= x < width` and `0 <= y < height`.
+Check the crop and never convert AT-SPI bounds into image coordinates.
 
-## Uncertainty and privacy
+Keyboard/paste may use semantic focus without a frame. Semantic focus requires
+fresh exact focused-element and active-window evidence; a false `GrabFocus` is
+not enough. Click grace is one-shot best-effort evidence, not verified focus.
+Use press-only keyboard transactions for shortcuts or one type event for text.
+Reobserve between routing, text, and submit. A point-focused call clicks again.
 
-Follow recovery for `not_started`. For `unknown` or `completed`, the action may
-have happened: inspect current state and never repeat blindly. Protocol progress
-does not prove focus, delivery, or effect. Restart only when recovery reports an
-exhausted portal/session. Whole-monitor images and accessibility text are
-sensitive; use only through a trusted local host.
+`paste` uses bounded portal `text/plain` transfer and `Ctrl+V` when
+`clipboard_enabled` is returned, then waits and clears the selection. It never
+reads or restores the prior clipboard. Otherwise it uses bounded simulated EIS
+typing. Check delivery evidence and the resulting field.
+
+## Wait and recover
+
+Window waits may omit target. `window_opened` checks presence by exact compositor
+app ID, including an existing window; it never matches titles. `window_closed`
+requires a previously observed exact window ID. Other waits require target. A
+frame wait returns metadata, not a new image; observe before new coordinates.
+
+Follow recovery instructions. On takeover, stop and ask the user; resume needs
+authorization, cleared signal, MCP restart, and fresh evidence. Finish when fresh
+evidence confirms the task result.

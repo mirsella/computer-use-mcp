@@ -1,45 +1,60 @@
-# MCP guide
+# MCP Guide
 
-This document is the user-facing contract for `computer-use-mcp mcp`. See
-[ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and
-[SECURITY.md](SECURITY.md) for the threat model.
+This is the caller-facing guide for `computer-use-mcp mcp`. The server exposes
+exactly six tools over stdio: `list_desktop`, `launch_application`,
+`activate_window`, `observe`, `act`, and `wait_for`. The initialize response and
+`tools/list` entries are the authoritative schemas and descriptions.
 
-## Trust boundary
+See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation boundaries and
+[SECURITY.md](SECURITY.md) for the trust boundary.
 
-Run this server only for a trusted local MCP host and user. AT-SPI may expose
-private text and semantic side effects without a portal prompt. A screenshot is
-the complete selected monitor, including unrelated windows and notifications.
-Portal approval is session-level access, not approval for each later call.
+## Trust and Startup
 
-Use an MCP host that lets the user inspect and deny sensitive calls. Review the
-exact target and arguments before observations, launches, activation, and
-mutations.
+Run the server only for a trusted local MCP host and user. AT-SPI reads and
+semantic actions do not require portal approval. Portal approval grants a
+session rather than each individual call. By default, a screenshot contains the complete
+selected monitor, including unrelated applications and notifications.
 
-## Transport and startup
-
-The transport is stdio only:
+The transport is stdio. The broker starts idle and creates a worker only when a
+call needs a desktop:
 
 ```text
 computer-use-mcp mcp
 ```
 
-The host owns stdin and stdout. Do not run `mcp` interactively or wrap it with
-anything that writes to stdout. JSON-RPC messages use stdout; diagnostics use
-stderr.
+The host owns stdin and stdout. Do not wrap the command with a program that
+writes to stdout. JSON-RPC uses stdout and diagnostics use stderr.
 
-The protocol starts immediately while KDE portal approval and PipeWire setup
-run in the background. `list_desktop`, `launch_application`, and
-accessibility-only observations do not wait for capture. Denial, timeout,
-revocation, or stream loss exhausts portal-backed functionality for that
-process. Restart the MCP to try again.
+Startup requires `XDG_SESSION_TYPE=wayland`, a live Wayland display, and a
+present display socket. The server binds the actual `WAYLAND_DISPLAY`.
+`COMPUTER_USE_MCP_DISPLAY` is diagnostic validation only; it cannot redirect
+client libraries. If it differs from `WAYLAND_DISPLAY`, startup fails.
 
-### OpenCode configuration
+The foreground worker requests portal approval on demand. Known local approval
+failures retry for up to 45 seconds with 1, 2, 4, and 8 second backoff; call
+cancellation, broker shutdown, and worker termination stop the attempt. A
+background request starts a private worker inside the embedded runner and does
+not require wrapping normal MCP in `scripts/run-isolated-session.sh`. Revocation
+or exhausted approval retires only that worker. Its IDs become stale, and the
+next explicit discovery or launch starts a replacement worker. A successful
+`doctor` check establishes startup support, not unattended capture or input
+support.
+
+The direct normal-MCP smoke passed screenshot, click, focused typing, portal
+Clipboard paste, and fresh AT-SPI readback. It kept the foreground worker count
+at zero, reused the persistent background worker, and verified clean exit with
+the target gone and no owned descendants. Its window-close case was unavailable
+because the AT-SPI target had no KDE authority; this does not change the exact
+authority rules described below.
+
+### OpenCode Configuration
 
 ```sh
 opencode mcp add computer_use -- "$(command -v computer-use-mcp)" mcp
 ```
 
-Require review for every tool:
+Keep the absolute binary path and use a `90000` millisecond host timeout.
+Choose permissions for your host; this example asks before each call:
 
 ```jsonc
 {
@@ -56,49 +71,78 @@ Require review for every tool:
 }
 ```
 
-OpenCode applies the last matching permission rule. Put
-`"computer_use_*": "ask"` after any broader wildcard rule.
+OpenCode applies the last matching permission rule. Check registration with
+`opencode mcp list`.
 
-### Portal restore token
+### Private Sessions
 
-`computer-use-mcp init` opens and closes a temporary approval session and
-requires KDE to return a reusable token. The private one-shot token is stored at
-`$XDG_STATE_HOME/computer-use-mcp/portal-restore-token`, or
-`~/.local/state/computer-use-mcp/portal-restore-token` when `XDG_STATE_HOME` is
-unset. Startup claims and removes it before use, then stores only the replacement
-returned by a successful portal start.
+Run the server in the supported private session when routing separation is
+needed:
 
-Set `COMPUTER_USE_MCP_PERSIST_PORTAL=0` before MCP startup to skip token loading
-and storage for that run; it neither deletes an existing token nor affects
-`computer-use-mcp init`, which always requests persistence.
+```sh
+scripts/run-isolated-session.sh [--width 1920] [--height 1080] [--scale 1] [--] [command...]
+```
 
-## Initialize context and request rules
+The runner starts and verifies private instances of D-Bus, `kwin_wayland`,
+PipeWire, WirePlumber, the AT-SPI bus and registry, and the KDE and generic
+portals. It requires `kwin_wayland`; there is no cage or gamescope fallback.
+It uses private runtime, configuration, data, and state directories and writes
+the readiness marker only after endpoint and ownership checks pass. The default
+command is `computer-use-mcp mcp`.
 
-The server exposes exactly six tools: `list_desktop`, `launch_application`,
-`activate_window`, `observe`, `act`, and `wait_for`. Every input object and
-nested variant is closed; unknown fields are rejected. The initialize response
-contains a compact operational contract and each `tools/list` entry contains
-call-local guidance, so no progressive help call is needed. The server does not
-advertise prompts, MCP resources, or resource templates. An optional native
-skill is available at `.agents/skills/computer-use-mcp/SKILL.md` and is kept
-byte-identical to the packaged `guidance/skill.md` artifact. Tools do not
-advertise `outputSchema`; structured content is returned only when the
-negotiated protocol supports it.
+This is routing and process separation for cooperative same-user processes, not
+a malicious same-user sandbox. A same-user process with host access may still
+inspect or interfere with the session. Normal MCP calls that select
+`desktop: "background"` start the embedded private worker automatically; no
+host wrapper or private-session configuration is required for that route.
+
+Check the session without requesting portal consent:
+
+```sh
+scripts/run-isolated-session.sh -- computer-use-mcp doctor
+```
+
+Expect a private `wayland-virtual-*` display, a present socket, and a verified
+isolated-session verdict.
+
+### Portal Restore Token
+
+`computer-use-mcp init` opens and closes a temporary KDE approval session and
+requests a reusable foreground token. The token is stored under
+`$XDG_STATE_HOME/computer-use-mcp/portal-restore-token`, or the equivalent
+default XDG state directory. The foreground worker claims and removes it before
+use and only stores a replacement returned by a successful portal start.
+
+Set `COMPUTER_USE_MCP_PERSIST_PORTAL=0` before startup to skip token loading and
+storage for that run. This does not erase an existing token or revoke a portal
+grant. `init` always requests persistence.
+
+## Call Rules
+
+All input objects and nested variants are closed. Unknown fields are rejected.
+The server does not advertise prompts, resources, resource templates, or an
+`outputSchema`.
 
 - Call `list_desktop` first and copy one complete opaque target exactly.
-- Never substitute a title, app name, PID, traversal index, geometry, or fuzzy
-  selector for an opaque ID.
-- `observation_id`, `frame_id`, and `element_id` are scoped to the returned
-  observation or process lifetime. Copy them unchanged. `act.source_observation.frame_id`
-  may be omitted only for semantic operations; pointer and keyboard operations
-  require the exact source frame. Keyboard focus is always a point in that same
-  ready screenshot PNG; an AT-SPI focused element never authorizes EIS keyboard.
-- Use only capabilities advertised in the same observation.
-- Treat stale, unknown, completed, unavailable, and timeout results as stop
-  signals. Observe again instead of retrying blindly.
-- For keyboard, click the visibly intended input field or address bar from the
-  exact source PNG; never click an arbitrary page and route focus with a
-  shortcut. Prefer semantic `set_value` when advertised.
+- Never replace an opaque ID with a title, app name, PID, geometry, traversal
+  index, or selector.
+- `desktop` is accepted only by `list_desktop`, `launch_application`, and a
+  targetless `window_opened` wait. Its values are `foreground` and `background`.
+  Omit it to use foreground when no returned identity selects a route.
+- Returned targets and cursors route later calls automatically. Do not send a
+  `session_id`; it is not part of the caller API. Mixed desktop identities are
+  rejected.
+- Copy `observation_id`, `frame_id`, and `element_id` unchanged. They are bound
+  to a process, observation, or source frame.
+- Use only capabilities advertised for the exact target and observation.
+- Treat `unknown`, `completed`, stale, unavailable, and timeout results as
+  evidence to inspect, not as permission to retry blindly.
+
+Semantic operations may omit a frame. Pointer operations and point-focused
+keyboard or paste operations require the exact ready PNG frame named by
+`act.source_observation.frame_id`. A semantic focus operation uses an
+`element_id`, grabs AT-SPI focus, and verifies focus and active-window state
+without moving the pointer.
 
 ## Tools
 
@@ -108,33 +152,34 @@ negotiated protocol supports it.
 {"scope":"windows"}
 ```
 
-Results are paged. `limit` defaults to 50 and is bounded at 100; pass the
-returned opaque `next_cursor` as `cursor` for the next page. Do not reuse a
-cursor after the desktop catalog changes. Human-readable page text and
-`structuredContent` are each capped at 16,000 UTF-8/serialized-JSON bytes;
-bounded projections identify omitted entries and must be treated as incomplete.
+Use `{"scope":"windows","desktop":"background"}` to discover the
+private background desktop. `desktop` is optional and defaults to foreground;
+the applications scope accepts the same explicit selector.
 
-Returns process-lifetime `app_instance_id` and `window_instance_id` values,
-descriptive metadata, backend authority, and per-target capability states. The
-`windows` result also includes a `backends` object with explicit
-`supported`/`unsupported`/`unavailable`/`busy` status for the standard and KDE
-compositor authorities. Compact text includes those backend statuses and each
-window's source plus screenshot/accessibility/activation capability status;
-`structuredContent.windows` remains canonical for geometry and full reasons.
-The other scope lists exact installed `.desktop` IDs:
+Results are paged. `limit` defaults to 50 and is bounded at 100. Pass the
+returned opaque `next_cursor` unchanged. Do not reuse a cursor after catalog
+membership changes.
+
+The windows result includes process-lifetime `app_instance_id` and
+`window_instance_id` values, descriptive metadata, backend authority, and
+capability states. Standard foreign-toplevel inventory supplies title and app
+ID but not PID, geometry, accessibility, or activation. The optional KDE-rich
+authority requires `COMPUTER_USE_MCP_KDE_WINDOW_MANAGEMENT=1` and a Plasma
+window-management global version 17 or newer. It can be unavailable or busy
+because it is a single-client protocol; that does not weaken other authorities.
+
+The result reports backend status as `supported`, `unsupported`, `unavailable`,
+or `busy`. KDE geometry and desktop fields are logical diagnostics. AT-SPI
+extents are not input or crop authority.
+
+Use the other scope for installed applications:
 
 ```json
 {"scope":"applications"}
 ```
 
-The standard foreign-toplevel authority supplies identifier/title/app ID only;
-PID, geometry, outputs, accessibility, and activation remain unavailable. The
-optional KDE-rich authority requires `COMPUTER_USE_MCP_KDE_WINDOW_MANAGEMENT=1`
-and a Plasma window-management global version 17 or newer. It is a compositor
-single-client protocol and reports Busy/Unavailable rather than weakening the
-AT-SPI or capture path when binding is not possible. KDE geometry and virtual
-desktop fields are logical diagnostics only and are never used to crop PNGs or
-map input coordinates.
+It returns exact case-sensitive GIO desktop IDs. Launch accepts only one of
+those IDs.
 
 ### `launch_application`
 
@@ -142,9 +187,13 @@ map input coordinates.
 {"desktop_id":"org.kde.kwrite.desktop"}
 ```
 
-The ID must be copied exactly from `list_desktop(applications)`. No command,
-path, or arguments are accepted. The result is a launch request, not proof that
-the application has mapped a window; list the desktop again before targeting it.
+Add `"desktop":"background"` to launch in the lazy private worker. The
+default is foreground.
+
+The ID must come from `list_desktop` with `scope: "applications"`. No command,
+path, arguments, or fuzzy name is accepted. The result acknowledges a launch
+request; it does not prove that a window has mapped. List windows again or use
+`wait_for(window_opened)` to obtain an exact target.
 
 ### `activate_window`
 
@@ -157,13 +206,24 @@ the application has mapped a window; list the desktop again before targeting it.
 }
 ```
 
-Activation reports request acceptance/flushing separately from authority-specific
-evidence. AT-SPI uses `status: "atspi_active_observed"` after a fresh active
-state read and never claims compositor verification or seat focus. KDE rich
-activation may use `status: "protocol_state_verified"` only for a matching
-post-request active transition; an already-active KDE target reports no
-transition proof. `dispatch.synchronized` is always `false`: server
-synchronization, seat focus, and client delivery are not observable.
+The optional `action` is `activate`, `minimize`, `maximize`, `restore`, or
+`close`; the default is `activate`. Activation evidence is authority-specific:
+AT-SPI can report a fresh active-state observation, and KDE can report a
+matching protocol state transition. Neither proves seat focus or application
+delivery. `dispatch.synchronized` reports server synchronization only.
+
+KDE activation may switch one verified KWin desktop before dispatch. An
+unknown desktop location does not become proof through a guess. A bounded
+AT-SPI desktop hunt may try each non-current desktop once and restore the
+original desktop when no active state verifies.
+
+Minimize, maximize, restore, and close require the KDE-rich authority. Their
+results distinguish request acceptance, protocol send, and connection flush.
+Restore may contain two state subrequests. No window action claims application
+effect, seat focus, or client delivery.
+
+Protected surfaces are refused before dispatch with
+`ProtectedSurfaceRefused`.
 
 ### `observe`
 
@@ -174,44 +234,33 @@ synchronization, seat focus, and client delivery are not observable.
     "window_instance_id":"win-0000000000000002"
   },
   "view":"both",
-  "accessibility": {
-    "scope":"interactive",
-    "query":"save",
-    "limits":{"text_limit":500,"max_nodes":1200,"max_depth":64}
-  }
+  "accessibility":{"scope":"interactive"}
 }
 ```
 
 `view` is `screenshot`, `accessibility`, or `both`. Accessibility scopes are
-`full`, `visible`, and `interactive`; the latter two prune the returned tree.
-Accessibility-only calls do not wait for portal capture. Screenshot coordinates
-are PNG half-open pixels: `0 <= x < width` and `0 <= y < height`.
+`full`, `visible`, and `interactive`. Accessibility-only observations do not
+wait for portal capture.
 
-The result includes an opaque `observation_id`, target, readiness diagnostics,
-PNG/frame metadata, coordinate-space declarations, and opaque element IDs.
-For a ready screenshot, the human-readable output includes the exact
-`PNG frame_id` that must be copied for pointer or keyboard actions. It also
-reports frame timestamp authority, source-sequence/PTS availability, and stream
-health in compact text. Action results retain compact request,
-flush, synchronization, effect, and seat-focus evidence alongside their
-structured replacement observation.
+The optional crop is `monitor` (default) or `target_window`. Target-window crop
+uses KDE logical geometry, never AT-SPI extents. It is applied to raw source
+pixels before transform, downscale, and PNG encoding. The result retains the
+exact mapping back to the approved EIS region. Missing or untrusted geometry
+falls back to the full monitor with an explicit reason.
 
-Accessibility observation text and structured metadata are each capped at
-16,000 UTF-8/serialized-JSON bytes. If the requested tree cannot fit, complete elements are
-kept where possible (including the root and focused element), text fields are
-Unicode-safe truncated, and `truncated`, `truncation_reason`, and element
-counts identify the response budget. JSON is never cut at a serialized byte
-boundary. Action replacement observations use the same evidence.
-The `e-...` ID on each human-readable element line is the same value as that
-element's structured `element_id`; copy it unchanged for semantic actions and
-element waits.
-Accessibility bounds are diagnostic only and must not be converted into PNG
-coordinates. A ready screenshot is returned as a separate `image/png` content
-block.
+Screenshot coordinates are half-open PNG pixels. A ready result contains the
+exact `frame_id` required for spatial input. Accessibility elements expose
+opaque `element_id` values. Text and structured output are bounded and report
+truncation without cutting serialized JSON at an arbitrary byte.
+
+Ready screenshots may include `changed_rect`, an advisory tile-hash bounding box
+against the previous committed captured frame. It is not a model observation
+delta. The first captured frame has no baseline. A new stream may still return
+that complete baseline if no newer frame arrives during startup capture.
 
 ### `act`
 
-Every `act` call names the exact source observation:
+Every call names the exact source observation:
 
 ```json
 {
@@ -223,98 +272,106 @@ Every `act` call names the exact source observation:
     "observation_id":"obs-0000000000000003",
     "frame_id":"frame-0000000000000004"
   },
-  "operation": {
-    "type":"semantic",
-    "element_id":"e-0000000000000005",
-    "action":{"type":"invoke"}
-  }
+  "operation":{"type":"semantic","action":{"type":"invoke"}}
 }
 ```
 
-Operation types are:
+Semantic operations include `invoke`, `focus`, advertised `named` actions, and
+`set_value`. Pointer operations use exact source-PNG coordinates. Keyboard
+operations are either 1 to 8 press-only events or one non-empty `type` event of
+at most 4,096 Unicode scalar values. Point focus, key events, synchronization,
+and cleanup stay in one EIS transaction. The click is sent and flushed before
+keys are dispatched.
 
-- `semantic`: `invoke`, `focus`, exact advertised `named`, or `set_value`.
-- `pointer`: `move`, `click`, bounded multi-point `drag`, or directional
-  `scroll`; coordinates must use the exact source PNG.
-- `keyboard`: explicit point focus in the exact source PNG and a bounded
-  transaction that is either 1–8 press-only events (at most four modifiers per
-  chord) or exactly one non-empty `type` event of at most 4,096 Unicode scalar
-  values. Mixed `press`/`type` events, NUL text, and empty text are rejected.
-  The point click is requested, sent, flushed, and protocol-synchronized before
-  key events in the same cleanup-safe EIS transaction; phase barriers between
-  high-level presses are protocol synchronization only. Element focus is
-  semantic-only and cannot authorize keys. Alt+Tab is unsupported; use a
-  visibly intended point, separate actions with replacement observations
-  between routing/text/submit, or an advertised semantic `set_value`.
+`paste` focus-clicks an exact source-PNG point. The session requests Clipboard
+before `RemoteDesktop.Start`; when the portal returns `clipboard_enabled`, it
+uses bounded `text/plain` transfer through `SelectionTransfer` and
+`SelectionWrite`, sends `Ctrl+V`, waits for completion, and clears the
+selection. It does not read or restore the user's previous clipboard. If the
+capability is unavailable, it types bounded 4,096-scalar chunks through the
+same cleanup-safe EIS transaction. The direct normal-MCP smoke passed the
+portal Clipboard path and readback.
 
-Semantic actions may work without a frame. Pointer and keyboard actions require
-the exact ready source frame and a current stream mapping. Results expose
-`dispatch.request_accepted`, `dispatch.protocol_request_sent`, and
-`dispatch.request_flushed`, distinguish those facts from replacement-observation
-evidence, and never claim an application effect, seat focus, application
-delivery, or text delivery. Keyboard action evidence explicitly reports
-`focus.click.requested`, `focus.click.sent`, `focus.click.flushed`,
-`seat_focus: "not_observable"`, `application_delivery: "not_observable"`, and
-`text_delivery: "not_observable"`. The exact source frame age, PNG bounds,
-stream mapping, accessibility generation, portal-session identity, and stream
-health are checked. Pre-dispatch validation reuses that exact source mapping and
-does not wait for a strictly newer complete frame; a newer committed frame may
-validate unchanged format/crop/transform invariants but never remaps source
-coordinates. A whole-frame `change_epoch` requirement is intentionally not
-imposed because animated full-monitor content creates an unavoidable visual race.
+A successfully dispatched click may grant one 15-second focus grace for the
+same accessibility app and window when the mapped point lies inside current KDE
+geometry. It is best effort, consumed once, and invalidated by focus or
+geometry changes. Unknown focus state is reported as unavailable or null.
+Semantic typing requires a fresh exact focused-element and active-window
+verification. A false `Component.GrabFocus` result is accepted only when that
+fresh verification succeeds.
 
-When an `act` reaches action-attempt tracking, its result includes
-`action_progress`. Its `dispatch_stage` is `not_started`, `started`, or
-`completed`; `cleanup` is `not_needed`, `completed`, or `failed`; and
-`post_visual` and `post_accessibility` distinguish an observed replacement from
-timeout, stream degradation, session loss, catalog failure, accessibility
-failure, or an unavailable authority. Pre-dispatch validation and
-`not_started` failures before tracking may omit progress. Once tracking begins,
-these fields are attempt evidence only: they never claim application delivery
-or effect.
+Action results separate dispatch, cleanup, and post-visual or
+post-accessibility evidence. They do not prove text delivery, application
+effect, seat focus, or client delivery.
 
 ### `wait_for`
 
+`target` is optional only for window conditions. `condition` and `timeout_ms`
+are required; the timeout is bounded at 5000 milliseconds. Frame,
+accessibility, and element conditions require and resolve an exact target.
+
+Window open:
+
 ```json
 {
-  "target": {
-    "app_instance_id":"app-0000000000000001",
-    "window_instance_id":"win-0000000000000002"
-  },
-  "condition": {
-    "type":"frame_changed",
-    "after_frame_id":"frame-0000000000000004"
-  },
+  "condition":{"type":"window_opened","desktop_id":"org.kde.kwrite"},
   "timeout_ms":3000
 }
 ```
 
-Conditions cover later/changed/stable frames, later accessibility content, and
-specific element state or value. The bounded result says whether the condition
-was satisfied and includes frame or observation evidence. A timeout is not proof
-that nothing changed outside the bounded observation authority.
+The requested desktop ID may include or omit `.desktop`. The wait polls bounded
+catalog refreshes and matches only exact compositor `app_id`, normalizing that
+suffix on both values. It never matches a title or AT-SPI application name. The
+condition has presence semantics: if a matching entry is present during the
+wait, it returns that entry's opaque target. It does not prove that the entry
+arrived after the call. An AT-SPI-only entry cannot satisfy this exact identity
+condition because AT-SPI does not expose a compositor desktop ID.
 
-## Errors and outcomes
+Window close:
 
-An unknown tool or malformed JSON-RPC envelope produces a JSON-RPC error.
-Invalid arguments and runtime failures for a known tool produce a normal tool
-result with `isError: true` and structured fields:
+```json
+{
+  "condition":{"type":"window_closed","window_instance_id":"win-0000000000000002"},
+  "timeout_ms":3000
+}
+```
 
-| Outcome | Meaning | Caller action |
+The wait first refreshes an authoritative catalog and requires the exact opaque
+ID to be present. A supplied `target`, if any, must contain the same window ID.
+Targetless waits return the target observed in the catalog. An ID that was not
+observed, or a catalog that is unavailable, is not treated as closure.
+
+Window waits do not subscribe to an event channel. They refresh and poll until
+the bounded timeout or an explicit catalog error. A timeout is not proof that
+nothing changed outside the catalog authority.
+
+## Outcomes and Takeover
+
+Known-tool argument and runtime failures are normal tool results with
+`isError: true` and structured outcome fields:
+
+| Outcome | Meaning | Next step |
 | --- | --- | --- |
 | `not_started` | Dispatch was blocked before the action. | Follow `recovery`; observe before retrying if needed. |
 | `unknown` | Dispatch may have started or completed. | Observe current state; do not retry blindly. |
-| `completed` | Dispatch completed but later evidence or cleanup failed. | Observe current state; do not repeat automatically. |
+| `completed` | Dispatch completed but later evidence or cleanup is incomplete. | Observe current state before acting again. |
 
-`retryable` is advisory. The recovery text is authoritative for the next safe
-step. Missing stream-to-EIS mapping, stream loss, or portal exhaustion requires
-restarting or re-enabling the MCP.
+`retryable` is advisory. The recovery text is the next-step authority.
+`ProtectedSurfaceRefused` is non-retryable.
 
-Pre-dispatch validation errors and failures before action-attempt tracking may
-omit `action_progress`; if it is absent, no action-attempt stage was entered.
-Once tracking begins, both successful and failed `act` results carry it.
+Takeover monitoring is armed only during an active mutation or wait. It uses
+readable physical `/dev/input/event*` devices, the cooperative
+`COMPUTER_USE_MCP_TAKEOVER=1` flag or handoff file, and EIS refusal caused by
+physical shortcut modifiers. Agent EIS events do not appear as physical device
+events. Monitoring is skipped only for a verified isolated session.
 
-## Direct commands and troubleshooting
+On detection, held input is released and `UserTakeoverInterrupted` is returned.
+The latch remains active for the MCP lifetime. Removing the signal does not
+resume operation. Resumption requires user authorization, clearing the signal,
+restarting MCP, and taking a fresh observation. Detection is best effort when
+no input device is readable and no cooperative signal exists.
+
+## Direct Commands and Troubleshooting
 
 ```sh
 computer-use-mcp doctor
@@ -322,16 +379,17 @@ computer-use-mcp init
 opencode mcp list
 ```
 
-`doctor` reports prerequisites without requesting portal consent. `init` is the
-explicit KDE approval flow. `call FILE` is a diagnostic batch interface and
-uses the same six tool names; it cannot insert an observation ID returned by an
-earlier static array entry.
+`doctor` reports prerequisites, display binding, isolation verdict, watcher
+state, and portal readiness without requesting consent. `init` requests portal
+approval. `call FILE` runs production validation and runtime against a static
+batch; static entries cannot feed returned opaque IDs into later entries.
 
 | Symptom | Recovery |
 | --- | --- |
-| Target unavailable or stale | Call `list_desktop(windows)` again and copy a new target. |
-| Capture denied or timed out | Restart/re-enable the MCP and approve exactly one monitor. |
-| `screenshot.ready` is false | Read its reason; semantic observation/action may still work. |
-| Missing capability | Use only a capability advertised by the exact target. |
-| Invalid coordinates | Use returned PNG dimensions and half-open bounds. |
-| Unknown/completed action | Observe current state before deciding whether another action is needed. |
+| Target is stale or unavailable | Call `list_desktop` with `scope: "windows"` and copy a fresh target. |
+| A worker is retired after capture denial, revocation, or exhausted approval | Approve the intended monitor if requested, then call explicit `list_desktop` or `launch_application` to create a replacement worker. |
+| Screenshot is not ready | Read its reason; an accessibility-only observation may still work. |
+| Capability is unavailable or busy | Use a capability advertised by the exact target, or wait for the authority to recover. |
+| Coordinates are invalid | Use the returned PNG dimensions and half-open bounds from the exact source frame. |
+| Outcome is `unknown` or `completed` | Observe current state before deciding whether another action is needed. |
+| Takeover interruption | Stop. Obtain user authorization, clear the signal, restart MCP, and observe again. |

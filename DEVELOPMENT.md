@@ -1,76 +1,134 @@
 # Development
 
-## Build and checks
+## Toolchain and checks
 
-The workspace uses stable Rust with MSRV 1.97 and exact dependency versions.
-Native packages are listed in [README.md](README.md#requirements). KDE Plasma
-Wayland is the maintained target; a headless CI build does not establish support
-for another desktop.
+The repository uses the ambient Rust toolchain. There is no
+`rust-toolchain.toml`; the current minimum supported Rust version is 1.97.
+Use an installed Rust 1.97.0 toolchain for reproducible verification while the
+host nightly behavior is investigated.
+Native dependencies are listed in [README.md](README.md#requirements). KDE
+Plasma Wayland is the maintained desktop target.
 
-Run from the workspace root:
+Run these commands from the repository root:
 
 ```sh
-cargo fmt --all -- --check
+cargo +1.97.0 fmt --all -- --check
 bash scripts/check-guidance.sh
-cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
-cargo test --locked --workspace --all-features
+cargo +1.97.0 clippy --locked --workspace --all-features --all-targets -- -D warnings
+cargo +1.97.0 test --locked --workspace --all-features
 ```
 
-If host Cargo configuration injects nightly-only flags, set
-`CARGO_HOME=/tmp/opencode/computer-use-mcp-cargo-home`.
+If the host config selects Cranelift or nightly-only flags, override those for
+verification without changing the user's Cargo configuration:
 
-## Contributor invariants
+```sh
+RUSTC_BOOTSTRAP=1 RUSTFLAGS= CARGO_ENCODED_RUSTFLAGS= \
+CARGO_PROFILE_DEV_CODEGEN_BACKEND=llvm CARGO_PROFILE_TEST_CODEGEN_BACKEND=llvm \
+cargo +1.97.0 test --locked --workspace --all-features
+```
 
-- Keep the six ordered tools, closed schemas, descriptions, and typed validation
-  aligned. Preserve opaque IDs, bounded results, error outcomes, and the absence
-  of help tools, prompts, resources, resource templates, and output schemas.
-- Keep [MCP.md](MCP.md) authoritative for public behavior. Architecture and
-  security details belong in their dedicated documents.
-- Launch only exact installed, case-sensitive `.desktop` IDs. Never add command,
-  argument, clipboard, X11, subprocess, `/dev/uinput`, portal `Notify*`, or
-  guessed-geometry escape hatches.
-- AT-SPI selected text must be range-capped before `GetText`; use bounded
-  `CurrentValue` because the Value interface has no ranged text member.
-- Keep Wayland inventory on its blocking event thread. The standard
-  foreign-toplevel backend is conservative; the opt-in KDE backend requires
-  protocol version 17+ and may be unavailable because it is single-client.
-  Isolate that failure from AT-SPI and capture. KDE logical geometry is
-  diagnostic only.
-- Screenshot coordinates cover the complete approved monitor. Never derive them
-  from AT-SPI extents. Spatial actions require the exact source frame and live
-  mapping; semantic actions may omit `frame_id`.
-- Keyboard input requires a visible PNG point and either 1–8 press events or one
-  non-empty type event of at most 4,096 scalars. Keep focus click and keys in one
-  cleanup-safe EIS transaction, with synchronization between press phases. An
-  AT-SPI focused element is not keyboard authority.
-- Revalidate frame, stream, portal session, mapping, target identity, and cache
-  generation around generated-input awaits. Do not add whole-monitor
-  `change_epoch` staleness: animation makes it an invalid authority.
-- Keep the workspace and packaged native skill byte-identical; verify with
+The bootstrap setting permits the host's Cargo codegen-backend configuration;
+the workspace itself requires stable Rust. Use the same environment for Clippy.
+The ambient Cranelift setup aborts intentional panic tests, so verify them with
+LLVM rather than skipping them.
+
+## Invariants
+
+- Keep the six ordered tools, closed schemas, typed validation, opaque IDs,
+  bounded output, and outcome semantics aligned. Public behavior belongs in
+  [MCP.md](MCP.md), not in duplicated instructions.
+- Keep broker routing and worker lifecycle explicit: foreground and background
+  workers are lazy and independently scheduled, returned IDs and cursors route
+  later calls, and retired-worker IDs stay stale until a new explicit discovery
+  or launch creates a replacement. Do not add a caller `session_id`.
+- Launch only an exact installed, case-sensitive `.desktop` ID. Do not add
+  command, argument, X11, direct-device, subprocess, or guessed-geometry escape
+  paths. Keep clipboard operations on the negotiated portal path or the bounded
+  simulated EIS fallback.
+- Keep AT-SPI text reads bounded. Use `CurrentValue` for value metadata and
+  require the interfaces needed for verified replacement. Replacement values
+  must not enter logs.
+- Keep the Wayland catalog on its blocking I/O threads. Treat standard and KDE
+  authorities separately, preserve explicit unavailable and busy states, and
+  never join records by title.
+- Background workers must use the embedded private runner and require private
+  KDE PermissionStore authorization on their own bus/data. This must not change
+  physical-session permissions. Foreground approval retries only within the
+  bounded local deadline and stops on cancellation or shutdown.
+- Spatial actions require the exact ready source frame and live mapping.
+  Semantic actions may omit a frame. Do not turn AT-SPI extents into PNG
+  coordinates or add whole-frame change-epoch staleness.
+- Preserve cleanup around every generated-input await. Revalidate target,
+  source mapping, stream, portal session, format, route, device, and cache
+  generations at the existing barriers.
+- Keep the workspace skill and packaged skill byte-identical; verify with
   `bash scripts/check-guidance.sh`.
 
-## Test policy
+## Tests
 
-Tests must be deterministic and must not require a live desktop. Use adapter,
-portal, capture, input, and runtime fakes to cover identity generations,
-relocation, bounded traversal/formatting, pagination, frame conversion and
-budgets, portal/session lifecycle, EIS routing and cleanup, cancellation, and
-shutdown. Preserve coverage for corrupted/wrapped PipeWire buffers, format
-changes, restore-token replacement, stream exhaustion, post-frame identity
-revalidation, complete input transactions, and post-action observations.
+Unit and integration tests must be deterministic and must not require a live
+desktop. Use the existing adapter, portal, capture, input, session, and runtime
+fakes for identity generations, bounded traversal, frame conversion, portal
+lifecycle, EIS routing, cancellation, cleanup, and shutdown. Preserve coverage
+for wrapped and corrupt PipeWire buffers, format changes, restore-token
+replacement, stream exhaustion, exact source-frame revalidation, portal
+Clipboard transfer and cleanup, simulated typing fallback, complete input
+transactions, window identity, and post-action evidence.
 
-An ignored, non-mutating discovery check is available:
+Session and takeover tests use injected environment, filesystem, device, and
+counter fakes. They must verify actual display resolution, isolation checks,
+handoff latching, operation cleanup, and physical-modifier refusal. No unit test
+starts a compositor. The runner is checked with `bash -n` and fail-closed
+readiness assertions.
+
+Useful focused commands are:
 
 ```sh
-cargo test -p computer-use-mcp live_discovery_is_non_mutating -- --ignored
+cargo +1.97.0 test -p computer-use-mcp --lib window_
+cargo +1.97.0 test -p computer-use-mcp --test validation
+cargo +1.97.0 test -p computer-use-mcp --test contract
+cargo +1.97.0 test -p computer-use-mcp live_discovery_is_non_mutating -- --ignored
 ```
 
-Manual MCP checks may list and observe a non-sensitive app with explicit portal
-consent. Never automate live click, typing, or other generated input.
+The ignored discovery test is non-mutating. Run live input checks in the owned
+private session with a disposable application. Physical-desktop interaction
+requires the user's explicit request. Normal tests never generate desktop input.
 
-## Integration
+The private-session startup smoke check does not request portal consent:
 
-Follow [README.md](README.md#install) for installation and registration. `mcp`
-is the only MCP entry point; `doctor` is non-consenting, `init` requests portal
-approval, and `call FILE` uses production validation/runtime for static
-diagnostics. Static arrays cannot feed returned opaque IDs into later entries.
+```sh
+scripts/run-isolated-session.sh -- computer-use-mcp doctor
+```
+
+It should report a private `wayland-virtual-*` display, a present socket, and a
+verified isolated-session verdict. The live doctor smoke has passed, which
+establishes startup support. Run the direct normal-MCP smoke with:
+
+```sh
+python3 scripts/isolated-mcp-smoke.py --normal-mcp "$PWD/target/debug/computer-use-mcp"
+```
+
+This invokes the binary directly, without an outer isolated-session wrapper or
+injected private environment.
+
+The confirmed run kept the foreground worker count at zero, reused the
+persistent background worker, launched on the background route, and passed
+PNG capture, pointer click, focused typing, portal Clipboard paste, and fresh
+AT-SPI readback. The PNG was 1280x720 and 32,121 bytes; the pointer click
+targeted `NewFile`, and both readback strings matched. It exited successfully
+with the target gone and no owned descendants. The window-close case was
+unavailable because the AT-SPI target had no KDE authority.
+
+The installed Rust 1.97.0 workspace verification passed 346 tests: 312 library,
+3 cancellation, 4 contract, 6 isolated, 3 process, 4 readiness, and 14
+validation tests, with 1 ignored. Clippy passed. This is evidence for the tested
+Linux/KDE environment, not a claim of support for every platform.
+
+## Entry points
+
+`computer-use-mcp mcp` is the only MCP transport. `doctor` reports diagnostics
+without portal consent, `init` requests a reusable KDE portal grant, and
+`call FILE` runs production validation and runtime against a static batch.
+Static batch entries cannot feed opaque IDs returned by earlier entries into
+later entries. See [README.md](README.md#install) for installation and host
+registration.
