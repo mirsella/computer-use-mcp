@@ -1,9 +1,9 @@
 use computer_use_mcp::validation::{
-    AccessibilityScope, ActOperation, DesktopScope, ElementAction, KeyboardEvent, KeyboardPoint,
-    MAX_CLICK_COUNT, MAX_DRAG_POINTS, MAX_KEYBOARD_TRANSACTION_TEXT, MAX_QUERY_LENGTH,
-    MAX_SCROLL_STEPS, MAX_TEXT_LIMIT, MAX_TREE_DEPTH, MAX_TREE_NODES, MAX_WAIT_STABLE_MS,
-    MAX_WAIT_TIMEOUT_MS, ObserveView, PointerAction, TextLimit, ToolCall, WaitCondition,
-    validate_call,
+    AccessibilityScope, ActOperation, DesktopScope, ElementAction, KeyboardEvent, KeyboardFocus,
+    KeyboardPoint, MAX_CLICK_COUNT, MAX_DRAG_POINTS, MAX_KEYBOARD_TRANSACTION_TEXT,
+    MAX_QUERY_LENGTH, MAX_SCROLL_STEPS, MAX_TEXT_LIMIT, MAX_TREE_DEPTH, MAX_TREE_NODES,
+    MAX_WAIT_STABLE_MS, MAX_WAIT_TIMEOUT_MS, ObserveCrop, ObserveView, PointerAction, TextLimit,
+    ToolCall, WaitCondition, WindowAction, validate_call,
 };
 use serde_json::{Map, Value, json};
 
@@ -72,10 +72,10 @@ fn accepts_exactly_the_six_public_tools() {
             })
         ),
         ToolCall::WaitFor {
-            target: computer_use_mcp::validation::TargetRef {
+            target: Some(computer_use_mcp::validation::TargetRef {
                 app_instance_id: "app-0000000000000001".into(),
                 window_instance_id: "win-0000000000000002".into()
-            },
+            }),
             condition: WaitCondition::FrameChanged {
                 after_frame_id: "frame-0000000000000004".into()
             },
@@ -155,6 +155,43 @@ fn accessibility_defaults_and_limits_are_bounded() {
             json!({"target": target(), "view": "accessibility", "accessibility": {"query": "   "}})
         )
         .contains("must not be blank")
+    );
+}
+
+#[test]
+fn observe_crop_defaults_to_monitor_and_rejects_unknown_values() {
+    let call = valid("observe", json!({"target": target(), "view": "screenshot"}));
+    assert!(matches!(
+        call,
+        ToolCall::Observe {
+            crop: ObserveCrop::Monitor,
+            ..
+        }
+    ));
+    let call = valid(
+        "observe",
+        json!({"target": target(), "view": "screenshot", "crop": "target_window"}),
+    );
+    assert!(matches!(
+        call,
+        ToolCall::Observe {
+            crop: ObserveCrop::TargetWindow,
+            ..
+        }
+    ));
+    assert!(
+        invalid(
+            "observe",
+            json!({"target": target(), "view": "screenshot", "crop": "window"})
+        )
+        .contains("crop")
+    );
+    assert!(
+        invalid(
+            "observe",
+            json!({"target": target(), "view": "screenshot", "crop": 1})
+        )
+        .contains("crop")
     );
 }
 
@@ -442,7 +479,7 @@ fn pointer_drag_and_keyboard_transactions_preserve_all_events() {
                 events
             },
             ..
-        } if focus == (KeyboardPoint { x: 1.0, y: 2.0 })
+        } if focus == (KeyboardFocus::Point(KeyboardPoint { x: 1.0, y: 2.0 }))
             && events == [KeyboardEvent::Press("Ctrl+L".into()), KeyboardEvent::Press("Enter".into())]
     ));
     assert!(
@@ -470,6 +507,83 @@ fn pointer_drag_and_keyboard_transactions_preserve_all_events() {
             })
         )
         .contains("Alt+Tab")
+    );
+
+    // Semantic focus needs no screenshot point: keyboard and paste may
+    // target a focused element without a source frame.
+    let semantic_focus = valid(
+        "act",
+        json!({
+            "target": target(),
+            "source_observation": {"observation_id": "obs-0000000000000003"},
+            "operation": {
+                "type": "keyboard",
+                "focus": {"type": "semantic", "element_id": "e-0000000000000005"},
+                "events": [{"type": "press", "key": "Enter"}]
+            }
+        }),
+    );
+    assert!(matches!(
+        semantic_focus,
+        ToolCall::Act {
+            operation: ActOperation::Keyboard {
+                focus: KeyboardFocus::Semantic { element_id },
+                ..
+            },
+            ..
+        } if element_id == "e-0000000000000005"
+    ));
+    let semantic_paste = valid(
+        "act",
+        json!({
+            "target": target(),
+            "source_observation": {"observation_id": "obs-0000000000000003"},
+            "operation": {
+                "type": "paste",
+                "focus": {"type": "semantic", "element_id": "e-0000000000000005"},
+                "text": "hello"
+            }
+        }),
+    );
+    assert!(matches!(
+        semantic_paste,
+        ToolCall::Act {
+            operation: ActOperation::Paste {
+                focus: KeyboardFocus::Semantic { element_id },
+                ..
+            },
+            ..
+        } if element_id == "e-0000000000000005"
+    ));
+    assert!(
+        invalid(
+            "act",
+            json!({
+                "target": target(),
+                "source_observation": {"observation_id": "obs-0000000000000003"},
+                "operation": {
+                    "type": "keyboard",
+                    "focus": {"type": "semantic", "element_id": "not-an-id"},
+                    "events": [{"type": "press", "key": "Enter"}]
+                }
+            })
+        )
+        .contains("element_id")
+    );
+    assert!(
+        invalid(
+            "act",
+            json!({
+                "target": target(),
+                "source_observation": {"observation_id": "obs-0000000000000003"},
+                "operation": {
+                    "type": "keyboard",
+                    "focus": {"type": "point", "x": 1, "y": 2},
+                    "events": [{"type": "press", "key": "Enter"}]
+                }
+            })
+        )
+        .contains("frame_id is required")
     );
 
     assert!(
@@ -701,4 +815,222 @@ fn invalid(name: &str, arguments: Value) -> String {
 
 fn object(value: Value) -> Map<String, Value> {
     value.as_object().cloned().expect("object arguments")
+}
+
+#[test]
+fn activate_window_action_defaults_to_activate_and_parses_all_variants() {
+    assert!(matches!(
+        valid("activate_window", json!({"target": target()})),
+        ToolCall::ActivateWindow {
+            action: WindowAction::Activate,
+            ..
+        }
+    ));
+    for (name, expected) in [
+        ("activate", WindowAction::Activate),
+        ("minimize", WindowAction::Minimize),
+        ("maximize", WindowAction::Maximize),
+        ("restore", WindowAction::Restore),
+        ("close", WindowAction::Close),
+    ] {
+        assert_eq!(
+            valid(
+                "activate_window",
+                json!({"target": target(), "action": name})
+            ),
+            ToolCall::ActivateWindow {
+                target: computer_use_mcp::validation::TargetRef {
+                    app_instance_id: "app-0000000000000001".into(),
+                    window_instance_id: "win-0000000000000002".into()
+                },
+                action: expected,
+            }
+        );
+    }
+    assert!(
+        invalid(
+            "activate_window",
+            json!({"target": target(), "action": "hide"})
+        )
+        .contains("must be activate, minimize, maximize, restore, or close")
+    );
+    assert!(
+        invalid("activate_window", json!({"target": target(), "action": 1}))
+            .contains("must be a string")
+    );
+    assert!(
+        invalid(
+            "activate_window",
+            json!({"target": target(), "action": "activate", "unexpected": true})
+        )
+        .contains("unknown argument")
+    );
+}
+
+#[test]
+fn paste_operation_is_bounded_and_requires_explicit_focus() {
+    assert!(matches!(
+        valid(
+            "act",
+            json!({
+                "target": target(),
+                "source_observation": observation(),
+                "operation": {
+                    "type": "paste",
+                    "focus": {"type": "point", "x": 1, "y": 2},
+                    "text": "hello"
+                }
+            })
+        ),
+        ToolCall::Act {
+            operation: ActOperation::Paste { text, .. },
+            ..
+        } if text == "hello"
+    ));
+    assert!(
+        invalid(
+            "act",
+            json!({
+                "target": target(),
+                "source_observation": observation(),
+                "operation": {
+                    "type": "paste",
+                    "focus": {"type": "point", "x": 1, "y": 2},
+                    "text": ""
+                }
+            })
+        )
+        .contains("must not be empty")
+    );
+    assert!(
+        invalid(
+            "act",
+            json!({
+                "target": target(),
+                "source_observation": observation(),
+                "operation": {
+                    "type": "paste",
+                    "focus": {"type": "point", "x": 1, "y": 2},
+                    "text": "x".repeat(MAX_TEXT_LIMIT + 1)
+                }
+            })
+        )
+        .contains("at most")
+    );
+    assert!(
+        invalid(
+            "act",
+            json!({
+                "target": target(),
+                "source_observation": observation_with_frame(None),
+                "operation": {
+                    "type": "paste",
+                    "focus": {"type": "point", "x": 1, "y": 2},
+                    "text": "hello"
+                }
+            })
+        )
+        .contains("frame_id")
+    );
+}
+
+#[test]
+fn window_open_and_close_conditions_parse_and_reject_unknown() {
+    assert_eq!(
+        valid(
+            "wait_for",
+            json!({
+                "condition": {"type": "window_opened", "desktop_id": "org.example.Editor.desktop"},
+                "timeout_ms": 5000
+            })
+        ),
+        ToolCall::WaitFor {
+            target: None,
+            condition: WaitCondition::WindowOpened {
+                desktop_id: "org.example.Editor.desktop".into()
+            },
+            timeout_ms: 5000
+        }
+    );
+    assert_eq!(
+        valid(
+            "wait_for",
+            json!({
+                "condition": {"type": "window_closed", "window_instance_id": "win-0000000000000009"},
+                "timeout_ms": 5000
+            })
+        ),
+        ToolCall::WaitFor {
+            target: None,
+            condition: WaitCondition::WindowClosed {
+                window_instance_id: "win-0000000000000009".into()
+            },
+            timeout_ms: 5000
+        }
+    );
+    assert!(
+        invalid(
+            "wait_for",
+            json!({
+                "condition": {"type": "window_opened", "desktop_id": "org.example Editor"},
+                "timeout_ms": 1
+            })
+        )
+        .contains("non-whitespace application ID")
+    );
+    assert!(matches!(
+        valid(
+            "wait_for",
+            json!({
+                "condition": {"type": "window_opened", "desktop_id": "org.example.Editor"},
+                "timeout_ms": 1
+            })
+        ),
+        ToolCall::WaitFor {
+            target: None,
+            condition: WaitCondition::WindowOpened { desktop_id },
+            timeout_ms: 1
+        } if desktop_id == "org.example.Editor"
+    ));
+    assert!(
+        invalid(
+            "wait_for",
+            json!({
+                "target": target(),
+                "condition": {"type": "window_closed", "window_instance_id": "window-9"},
+                "timeout_ms": 1
+            })
+        )
+        .contains("opaque")
+    );
+    assert!(invalid(
+        "wait_for",
+        json!({
+            "target": target(),
+            "condition": {"type": "window_closed", "window_instance_id": "win-0000000000000009"},
+            "timeout_ms": 1
+        })
+    )
+    .contains("must match"));
+    assert!(
+        invalid(
+            "wait_for",
+            json!({
+                "target": target(),
+                "condition": {"type": "window_opened", "desktop_id": "org.example.Editor.desktop", "unexpected": true},
+                "timeout_ms": 1
+            })
+        )
+        .contains("unknown argument")
+    );
+}
+
+fn observation_with_frame(frame_id: Option<&str>) -> Value {
+    match frame_id {
+        Some(frame_id) => json!({
+            "observation_id": "obs-0000000000000003",
+            "frame_id": frame_id
+        }),
+        None => json!({"observation_id": "obs-0000000000000003"}),
+    }
 }

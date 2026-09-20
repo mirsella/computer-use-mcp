@@ -25,6 +25,64 @@ pub const DEFAULT_ACCESSIBILITY_TEXT_LIMIT: usize = 256;
 pub const DEFAULT_ACCESSIBILITY_MAX_NODES: usize = 250;
 pub const DEFAULT_ACCESSIBILITY_MAX_DEPTH: usize = 64;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum Desktop {
+    #[default]
+    Foreground,
+    Background,
+}
+
+impl Desktop {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Foreground => "foreground",
+            Self::Background => "background",
+        }
+    }
+}
+
+pub struct RoutedCall {
+    pub desktop: Option<Desktop>,
+    pub arguments: JsonObject<String, Value>,
+    pub call: ToolCall,
+}
+
+/// Routing belongs to the parent. Workers receive only the existing, typed
+/// desktop-local contract; they never choose a desktop from ambient state.
+pub fn validate_routed_call(
+    name: &str,
+    mut arguments: JsonObject<String, Value>,
+) -> Result<RoutedCall, RuntimeError> {
+    let desktop = match arguments.remove("desktop") {
+        None => None,
+        Some(Value::String(value)) if value == "foreground" => Some(Desktop::Foreground),
+        Some(Value::String(value)) if value == "background" => Some(Desktop::Background),
+        Some(_) => return invalid("desktop must be foreground or background"),
+    };
+    let call = validate_call(name, arguments.clone())?;
+    if desktop.is_some()
+        && !matches!(
+            call,
+            ToolCall::ListDesktop { .. }
+                | ToolCall::LaunchApplication { .. }
+                | ToolCall::WaitFor {
+                    target: None,
+                    condition: WaitCondition::WindowOpened { .. },
+                    ..
+                }
+        )
+    {
+        return invalid(
+            "desktop is allowed only for discovery, launch, and targetless window_opened; other calls route by returned IDs",
+        );
+    }
+    Ok(RoutedCall {
+        desktop,
+        arguments,
+        call,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TextLimit {
     Count(usize),
@@ -113,6 +171,28 @@ impl ObserveView {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ObserveCrop {
+    #[default]
+    Monitor,
+    TargetWindow,
+}
+
+impl ObserveCrop {
+    pub const ALL: [Self; 2] = [Self::Monitor, Self::TargetWindow];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Monitor => "monitor",
+            Self::TargetWindow => "target_window",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|crop| crop.as_str() == value)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessibilityScope {
     Full,
@@ -183,9 +263,51 @@ pub struct KeyboardPoint {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum KeyboardFocus {
+    Point(KeyboardPoint),
+    Semantic { element_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum KeyboardEvent {
     Press(String),
     Type(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WindowAction {
+    #[default]
+    Activate,
+    Minimize,
+    Maximize,
+    Restore,
+    Close,
+}
+
+impl WindowAction {
+    pub const ALL: [Self; 5] = [
+        Self::Activate,
+        Self::Minimize,
+        Self::Maximize,
+        Self::Restore,
+        Self::Close,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Activate => "activate",
+            Self::Minimize => "minimize",
+            Self::Maximize => "maximize",
+            Self::Restore => "restore",
+            Self::Close => "close",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|action| action.as_str() == value)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -198,8 +320,12 @@ pub enum ActOperation {
         action: ElementAction,
     },
     Keyboard {
-        focus: KeyboardPoint,
+        focus: KeyboardFocus,
         events: Vec<KeyboardEvent>,
+    },
+    Paste {
+        focus: KeyboardFocus,
+        text: String,
     },
 }
 
@@ -227,6 +353,12 @@ pub enum WaitCondition {
         element_id: String,
         value: String,
     },
+    WindowOpened {
+        desktop_id: String,
+    },
+    WindowClosed {
+        window_instance_id: String,
+    },
 }
 
 impl ToolCall {
@@ -240,7 +372,11 @@ impl ToolCall {
                 ObserveView::Accessibility => false,
             },
             Self::Act { operation, .. } => match operation {
-                ActOperation::Pointer { .. } | ActOperation::Keyboard { .. } => true,
+                // Focused-element typing still needs the live desktop/EIS
+                // session; only the screenshot mapping is skipped.
+                ActOperation::Pointer { .. }
+                | ActOperation::Keyboard { .. }
+                | ActOperation::Paste { .. } => true,
                 ActOperation::Semantic { .. } => false,
             },
             Self::WaitFor { condition, .. } => match condition {
@@ -249,7 +385,9 @@ impl ToolCall {
                 | WaitCondition::FrameStable { .. } => true,
                 WaitCondition::AccessibilityAdvanced { .. }
                 | WaitCondition::ElementState { .. }
-                | WaitCondition::ElementValue { .. } => false,
+                | WaitCondition::ElementValue { .. }
+                | WaitCondition::WindowOpened { .. }
+                | WaitCondition::WindowClosed { .. } => false,
             },
         }
     }
@@ -296,11 +434,13 @@ pub enum ToolCall {
     },
     ActivateWindow {
         target: TargetRef,
+        action: WindowAction,
     },
     Observe {
         target: TargetRef,
         view: ObserveView,
         accessibility: Option<AccessibilityRequest>,
+        crop: ObserveCrop,
     },
     Act {
         target: TargetRef,
@@ -308,7 +448,7 @@ pub enum ToolCall {
         operation: ActOperation,
     },
     WaitFor {
-        target: TargetRef,
+        target: Option<TargetRef>,
         condition: WaitCondition,
         timeout_ms: u64,
     },
@@ -357,22 +497,29 @@ pub fn validate_call(
         },
         "activate_window" => ToolCall::ActivateWindow {
             target: required_target(&mut arguments, "target")?,
+            action: optional_window_action(&mut arguments, "action")?,
         },
         "observe" => ToolCall::Observe {
             target: required_target(&mut arguments, "target")?,
             view: required_observe_view(&mut arguments, "view")?,
             accessibility: optional_accessibility(&mut arguments, "accessibility")?,
+            crop: optional_observe_crop(&mut arguments, "crop")?,
         },
         "act" => ToolCall::Act {
             target: required_target(&mut arguments, "target")?,
             source: required_observation_ref(&mut arguments, "source_observation")?,
             operation: act_operation(required_object(&mut arguments, "operation")?)?,
         },
-        "wait_for" => ToolCall::WaitFor {
-            target: required_target(&mut arguments, "target")?,
-            condition: wait_condition(required_object(&mut arguments, "condition")?)?,
-            timeout_ms: required_timeout(&mut arguments, "timeout_ms", MAX_WAIT_TIMEOUT_MS)?,
-        },
+        "wait_for" => {
+            let condition = wait_condition(required_object(&mut arguments, "condition")?)?;
+            let target = optional_target(&mut arguments, "target")?;
+            validate_wait_target(target.as_ref(), &condition)?;
+            ToolCall::WaitFor {
+                target,
+                condition,
+                timeout_ms: required_timeout(&mut arguments, "timeout_ms", MAX_WAIT_TIMEOUT_MS)?,
+            }
+        }
         _ => return invalid(format!("unknown tool {name:?}")),
     };
     reject_unknown(arguments)?;
@@ -383,16 +530,24 @@ pub fn validate_call(
 
 fn validate_action_source(call: &ToolCall) -> Result<(), RuntimeError> {
     let ToolCall::Act {
-        source,
-        operation: ActOperation::Pointer { .. } | ActOperation::Keyboard { .. },
-        ..
+        source, operation, ..
     } = call
     else {
         return Ok(());
     };
+    let needs_frame = match operation {
+        ActOperation::Pointer { .. } => true,
+        ActOperation::Keyboard { focus, .. } | ActOperation::Paste { focus, .. } => {
+            matches!(focus, KeyboardFocus::Point(_))
+        }
+        ActOperation::Semantic { .. } => false,
+    };
+    if !needs_frame {
+        return Ok(());
+    }
     if source.frame_id.is_none() {
         return invalid(
-            "source_observation.frame_id is required for pointer and keyboard operations",
+            "source_observation.frame_id is required for pointer, keyboard, and paste operations",
         );
     }
     Ok(())
@@ -409,6 +564,49 @@ fn required_target(
     };
     reject_unknown(object)?;
     Ok(target)
+}
+
+fn optional_target(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+) -> Result<Option<TargetRef>, RuntimeError> {
+    match arguments.remove(key) {
+        None => Ok(None),
+        Some(value) => {
+            let mut object = value.as_object().cloned().ok_or_else(|| {
+                RuntimeError::invalid_arguments(format!("argument {key:?} must be an object"))
+            })?;
+            let target = TargetRef {
+                app_instance_id: required_opaque_id(&mut object, "app_instance_id", "app")?,
+                window_instance_id: required_opaque_id(&mut object, "window_instance_id", "win")?,
+            };
+            reject_unknown(object)?;
+            Ok(Some(target))
+        }
+    }
+}
+
+fn validate_wait_target(
+    target: Option<&TargetRef>,
+    condition: &WaitCondition,
+) -> Result<(), RuntimeError> {
+    match condition {
+        WaitCondition::WindowOpened { .. } => Ok(()),
+        WaitCondition::WindowClosed { window_instance_id } => {
+            if let Some(target) = target
+                && target.window_instance_id != *window_instance_id
+            {
+                return invalid(
+                    "target.window_instance_id must match condition.window_instance_id",
+                );
+            }
+            Ok(())
+        }
+        _ if target.is_none() => {
+            invalid("missing required argument \"target\" for this wait condition")
+        }
+        _ => Ok(()),
+    }
 }
 
 fn required_opaque_id(
@@ -433,6 +631,23 @@ fn required_observe_view(
     ObserveView::parse(&value).ok_or_else(|| {
         RuntimeError::invalid_arguments(format!(
             "argument {key:?} must be screenshot, accessibility, or both"
+        ))
+    })
+}
+
+fn optional_observe_crop(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+) -> Result<ObserveCrop, RuntimeError> {
+    let Some(value) = arguments.remove(key) else {
+        return Ok(ObserveCrop::default());
+    };
+    let Value::String(value) = value else {
+        return invalid(format!("argument {key:?} must be a string"));
+    };
+    ObserveCrop::parse(&value).ok_or_else(|| {
+        RuntimeError::invalid_arguments(format!(
+            "argument {key:?} must be \"monitor\" or \"target_window\""
         ))
     })
 }
@@ -565,10 +780,46 @@ fn act_operation(mut object: JsonObject<String, Value>) -> Result<ActOperation, 
             focus: keyboard_focus_target(required_object(&mut object, "focus")?)?,
             events: keyboard_events(&mut object)?,
         },
-        _ => return invalid("operation.type must be pointer, semantic, or keyboard"),
+        "paste" => ActOperation::Paste {
+            focus: keyboard_focus_target(required_object(&mut object, "focus")?)?,
+            text: paste_text(required_string(&mut object, "text")?)?,
+        },
+        _ => return invalid("operation.type must be pointer, semantic, keyboard, or paste"),
     };
     reject_unknown(object)?;
     Ok(operation)
+}
+
+fn optional_window_action(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+) -> Result<WindowAction, RuntimeError> {
+    let Some(value) = arguments.remove(key) else {
+        return Ok(WindowAction::default());
+    };
+    let Value::String(value) = value else {
+        return invalid(format!("argument {key:?} must be a string"));
+    };
+    WindowAction::parse(&value).ok_or_else(|| {
+        RuntimeError::invalid_arguments(
+            "argument \"action\" must be activate, minimize, maximize, restore, or close",
+        )
+    })
+}
+
+fn paste_text(text: String) -> Result<String, RuntimeError> {
+    if text.is_empty() {
+        return invalid("paste text must not be empty");
+    }
+    if text.chars().count() > MAX_TEXT_LIMIT {
+        return invalid(format!(
+            "paste text must contain at most {MAX_TEXT_LIMIT} Unicode scalar values"
+        ));
+    }
+    if text.contains('\0') {
+        return invalid("paste text must not contain NUL");
+    }
+    Ok(text)
 }
 
 fn act_pointer_action(
@@ -643,14 +894,17 @@ fn act_pointer_action(
 
 fn keyboard_focus_target(
     mut object: JsonObject<String, Value>,
-) -> Result<KeyboardPoint, RuntimeError> {
+) -> Result<KeyboardFocus, RuntimeError> {
     let focus = match required_string(&mut object, "type")?.as_str() {
         "point" => {
             let (x, y) = coordinate_pair(&mut object, "x", "y")?;
-            KeyboardPoint { x, y }
+            KeyboardFocus::Point(KeyboardPoint { x, y })
         }
+        "semantic" => KeyboardFocus::Semantic {
+            element_id: required_opaque_id(&mut object, "element_id", "e")?,
+        },
         "element" => return invalid("keyboard focus must be a point in the source screenshot PNG"),
-        _ => return invalid("keyboard focus.type must be point"),
+        _ => return invalid("keyboard focus.type must be point or semantic"),
     };
     reject_unknown(object)?;
     Ok(focus)
@@ -761,6 +1015,12 @@ fn wait_condition(mut object: JsonObject<String, Value>) -> Result<WaitCondition
                 "value",
                 MAX_TEXT_LIMIT,
             )?,
+        },
+        "window_opened" => WaitCondition::WindowOpened {
+            desktop_id: required_window_app_id(&mut object, "desktop_id")?,
+        },
+        "window_closed" => WaitCondition::WindowClosed {
+            window_instance_id: required_opaque_id(&mut object, "window_instance_id", "win")?,
         },
         _ => return invalid("condition.type is not a supported wait condition"),
     };
@@ -874,6 +1134,19 @@ fn required_desktop_id(
     Ok(value)
 }
 
+fn required_window_app_id(
+    arguments: &mut JsonObject<String, Value>,
+    key: &str,
+) -> Result<String, RuntimeError> {
+    let value = required_string(arguments, key)?;
+    if value.is_empty() || value.chars().any(char::is_whitespace) {
+        return invalid(format!(
+            "argument {key:?} must be an exact non-whitespace application ID"
+        ));
+    }
+    Ok(value)
+}
+
 fn required_finite(
     arguments: &mut JsonObject<String, Value>,
     key: &str,
@@ -967,4 +1240,65 @@ fn reject_unknown(arguments: JsonObject<String, Value>) -> Result<(), RuntimeErr
 
 fn invalid<T>(message: impl Into<String>) -> Result<T, RuntimeError> {
     Err(RuntimeError::invalid_arguments(message))
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn desktop_selection_is_only_valid_without_a_target_identity() {
+        for (name, arguments) in [
+            (
+                "list_desktop",
+                json!({"scope":"windows","desktop":"background"}),
+            ),
+            (
+                "launch_application",
+                json!({"desktop_id":"app.desktop","desktop":"background"}),
+            ),
+            (
+                "wait_for",
+                json!({"condition":{"type":"window_opened","desktop_id":"app.desktop"},"timeout_ms":100,"desktop":"background"}),
+            ),
+        ] {
+            let RoutedCall {
+                desktop,
+                arguments: local,
+                ..
+            } = validate_routed_call(name, arguments.as_object().unwrap().clone()).unwrap();
+            assert_eq!(desktop, Some(Desktop::Background));
+            assert!(!local.contains_key("desktop"));
+            assert!(validate_call(name, local).is_ok());
+        }
+        for arguments in [
+            json!({"scope":"windows","desktop":"Background"}),
+            json!({"scope":"windows","desktop":null}),
+            json!({"scope":"windows","desktop":0}),
+            json!({"scope":"windows","desktop":"background","extra":true}),
+        ] {
+            assert!(
+                validate_routed_call("list_desktop", arguments.as_object().unwrap().clone())
+                    .is_err()
+            );
+        }
+        let target = json!({"app_instance_id":"app-0000000000000001","window_instance_id":"win-0000000000000001"});
+        for (name, arguments) in [
+            (
+                "observe",
+                json!({"target":target,"view":"both","desktop":"background"}),
+            ),
+            (
+                "wait_for",
+                json!({"condition":{"type":"window_closed","window_instance_id":"win-0000000000000001"},"timeout_ms":0,"desktop":"background"}),
+            ),
+            (
+                "wait_for",
+                json!({"target":target,"condition":{"type":"window_opened","desktop_id":"app.desktop"},"timeout_ms":0,"desktop":"background"}),
+            ),
+        ] {
+            assert!(validate_routed_call(name, arguments.as_object().unwrap().clone()).is_err());
+        }
+    }
 }

@@ -1,5 +1,6 @@
 pub mod accessibility;
 pub mod atspi_adapter;
+pub mod broker;
 pub mod capture;
 pub mod cli;
 pub mod contract;
@@ -12,7 +13,10 @@ pub mod portal;
 pub mod runtime;
 pub mod screenshot;
 pub mod server;
+pub mod session;
+pub mod takeover;
 pub mod validation;
+pub mod virtual_desktop;
 pub mod wayland_catalog;
 pub mod window_backend;
 

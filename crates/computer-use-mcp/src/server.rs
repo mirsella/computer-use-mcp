@@ -7,13 +7,13 @@ use std::{
 };
 
 use rmcp::{
-    ErrorData as McpError, ServerHandler, ServiceExt,
+    ErrorData as McpError, ServerHandler,
     model::{
         CallToolRequestParams, CallToolResult, Implementation, ListToolsResult,
         PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
         ToolsCapability,
     },
-    service::{RequestContext, RoleServer, ServerInitializeError},
+    service::{RequestContext, RoleServer},
 };
 
 use crate::{
@@ -22,9 +22,12 @@ use crate::{
     atspi_adapter::AtspiAdapter,
     contract::{SERVER_INSTRUCTIONS, TOOL_NAMES, tool_definitions},
     errors::{CliError, RuntimeError, ToolOutcome},
-    runtime::{ActionProgress, DesktopRuntime, tool_error_result, with_action_progress},
+    runtime::{
+        ActionProgress, CleanupStatus, DesktopRuntime, tool_error_result, with_action_progress,
+    },
     screenshot::ProductionScreenshotCoordinator,
-    validation::validate_call,
+    validation::{ToolCall, validate_call},
+    virtual_desktop::VirtualDesktopProvider,
 };
 
 #[derive(Debug)]
@@ -48,16 +51,7 @@ impl<R: DesktopRuntime> ComputerUseMcpServer<R> {
 
 impl<R: DesktopRuntime> ServerHandler for ComputerUseMcpServer<R> {
     fn get_info(&self) -> ServerInfo {
-        let mut tools = ToolsCapability::default();
-        tools.list_changed = Some(false);
-        ServerInfo::new(
-            ServerCapabilities::builder()
-                .enable_tools_with(tools)
-                .build(),
-        )
-        .with_server_info(Implementation::new("computer-use-mcp", VERSION))
-        .with_protocol_version(ProtocolVersion::V_2025_11_25)
-        .with_instructions(SERVER_INSTRUCTIONS)
+        server_info()
     }
 
     async fn list_tools(
@@ -93,35 +87,59 @@ impl<R: DesktopRuntime> ServerHandler for ComputerUseMcpServer<R> {
                 return Ok(for_protocol(tool_error_result(&error), structured));
             }
         };
+        Ok(for_protocol(
+            self.execute(call, context.ct.cancelled()).await,
+            structured,
+        ))
+    }
+}
+
+impl<R: DesktopRuntime> ComputerUseMcpServer<R> {
+    pub(crate) async fn execute(
+        &self,
+        call: ToolCall,
+        cancelled: impl std::future::Future<Output = ()> + Send,
+    ) -> CallToolResult {
+        tokio::pin!(cancelled);
         let progress = call
             .tracks_action()
             .then(|| Arc::new(ActionProgress::default()));
+        // Initialization owns no action input. Wait before serializing calls
+        // so list/launch can proceed while portal consent is pending.
         if call.requires_visual_session() {
             tokio::select! {
-                () = self.runtime.wait_for_desktop_session() => {}
-                () = context.ct.cancelled() => {
-                    eprintln!("computer-use-mcp: tool call cancelled while waiting for desktop session initialization");
-                    return Ok(for_protocol(
-                        tool_error_result(&cancelled_error(progress.as_ref(), "tool call cancelled before execution")),
-                        structured,
+                biased;
+                () = &mut cancelled => {
+                    let mut result = tool_error_result(&cancelled_error(
+                            progress.as_ref(),
+                            "tool call cancelled while waiting for desktop initialization",
                     ));
+                    result.structured_content.as_mut().expect("error has structured content")["session_replacement_required"] = serde_json::json!(true);
+                    return result;
                 }
+                () = self.runtime.wait_for_desktop_session() => {}
             }
         }
         let _execution = tokio::select! {
-            guard = self.execution_barrier.lock() => guard,
-            () = context.ct.cancelled() => {
+            biased;
+            () = &mut cancelled => {
                 eprintln!("computer-use-mcp: queued tool call cancelled before execution");
-                return Ok(for_protocol(
-                    tool_error_result(&cancelled_error(
+                return tool_error_result(&cancelled_error(
                         progress.as_ref(),
                         "tool call cancelled before execution",
-                    )),
-                    structured,
-                ));
+                    ));
             }
+            guard = self.execution_barrier.lock() => guard,
         };
-        let result = if self.unavailable.load(Ordering::Acquire) {
+        // Some DesktopRuntime implementations enqueue work when execute() is
+        // called, before polling its future. Check cancellation before even
+        // constructing that future, not only as another select branch.
+        tokio::select! {
+            biased;
+            () = &mut cancelled => return tool_error_result(&cancelled_error(progress.as_ref(), "tool call cancelled before execution")),
+            () = std::future::ready(()) => {},
+        }
+        if self.unavailable.load(Ordering::Acquire) {
             tool_error_result(&RuntimeError::new(
                 "backend_failed",
                 "the desktop session was shut down after cancellation cleanup failed",
@@ -129,14 +147,12 @@ impl<R: DesktopRuntime> ServerHandler for ComputerUseMcpServer<R> {
                 false,
                 "Disable and re-enable the MCP before issuing more computer-use calls.",
             ))
-        } else if context.ct.is_cancelled() {
-            eprintln!("computer-use-mcp: queued tool call cancelled before execution");
-            tool_error_result(&cancelled_error(
-                progress.as_ref(),
-                "tool call cancelled before execution",
-            ))
         } else {
             tokio::select! {
+                biased;
+                () = &mut cancelled => {
+                    self.cancel_active(progress.as_ref()).await
+                }
                 result = self.runtime.execute(call, progress.clone()) => match result {
                     Ok(output) => output.into_mcp_result(),
                     Err(error) => {
@@ -144,30 +160,42 @@ impl<R: DesktopRuntime> ServerHandler for ComputerUseMcpServer<R> {
                         tool_error_result(&error)
                     }
                 },
-                () = context.ct.cancelled() => {
-                    eprintln!("computer-use-mcp: tool call cancelled");
-                         match tokio::time::timeout(Duration::from_secs(2), self.runtime.cleanup(progress.clone())).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => {
-                            eprintln!("computer-use-mcp: cancellation cleanup failed: {error}; shutting down the desktop session");
-                            self.unavailable.store(true, Ordering::Release);
-                            shutdown_after_cleanup_failure(self.runtime.as_ref()).await;
-                        }
-                        Err(_) => {
-                            eprintln!("computer-use-mcp: cancellation cleanup timed out; shutting down the desktop session");
-                            self.unavailable.store(true, Ordering::Release);
-                            shutdown_after_cleanup_failure(self.runtime.as_ref()).await;
-                        }
-                    }
-                    let error = cancelled_error(
-                        progress.as_ref(),
-                        "tool call cancelled while execution was active",
-                    );
-                    tool_error_result(&error)
-                }
             }
-        };
-        Ok(for_protocol(result, structured))
+        }
+    }
+
+    async fn cancel_active(&self, progress: Option<&Arc<ActionProgress>>) -> CallToolResult {
+        eprintln!("computer-use-mcp: tool call cancelled");
+        match tokio::time::timeout(
+            Duration::from_secs(8),
+            self.runtime.cleanup(progress.cloned()),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                if let Some(progress) = &progress {
+                    progress.mark_cleanup_failed();
+                }
+                eprintln!(
+                    "computer-use-mcp: cancellation cleanup failed: {error}; shutting down the desktop session"
+                );
+                self.unavailable.store(true, Ordering::Release);
+                shutdown_after_cleanup_failure(self.runtime.as_ref()).await;
+            }
+            Err(_) => {
+                if let Some(progress) = &progress {
+                    progress.mark_cleanup_failed();
+                }
+                eprintln!(
+                    "computer-use-mcp: cancellation cleanup timed out; shutting down the desktop session"
+                );
+                self.unavailable.store(true, Ordering::Release);
+                shutdown_after_cleanup_failure(self.runtime.as_ref()).await;
+            }
+        }
+        let error = cancelled_error(progress, "tool call cancelled while execution was active");
+        tool_error_result(&error)
     }
 }
 
@@ -189,17 +217,25 @@ fn cancelled_error(progress: Option<&Arc<ActionProgress>>, message: &str) -> Run
             "Retry the call if it is still needed.",
         );
     };
-    let outcome = progress.snapshot().outcome();
-    let (retryable, recovery) = match outcome {
-        ToolOutcome::NotStarted => (true, "Retry the call if it is still needed."),
-        ToolOutcome::Unknown => (
+    let snapshot = progress.snapshot();
+    let outcome = snapshot.outcome();
+    let (retryable, recovery) = if snapshot.cleanup == CleanupStatus::Failed {
+        (
             false,
-            "Input dispatch may have happened. Call observe and do not retry blindly.",
-        ),
-        ToolOutcome::Completed => (
-            false,
-            "Input dispatch completed. Call observe before deciding whether another action is needed.",
-        ),
+            "Cleanup failed or timed out; held input release and desktop restoration are not confirmed. Ask the user to restore the desktop and authorize an MCP restart, then observe before further actions.",
+        )
+    } else {
+        match outcome {
+            ToolOutcome::NotStarted => (true, "Retry the call if it is still needed."),
+            ToolOutcome::Unknown => (
+                false,
+                "Input dispatch may have happened. Call observe and do not retry blindly.",
+            ),
+            ToolOutcome::Completed => (
+                false,
+                "Input dispatch completed. Call observe before deciding whether another action is needed.",
+            ),
+        }
     };
     with_action_progress(
         RuntimeError::new("cancelled", message, outcome, retryable, recovery),
@@ -208,28 +244,16 @@ fn cancelled_error(progress: Option<&Arc<ActionProgress>>, message: &str) -> Run
 }
 
 pub async fn serve_stdio() -> Result<(), CliError> {
+    crate::broker::serve_stdio().await
+}
+
+pub async fn serve_worker_stdio() -> Result<(), CliError> {
+    // Log the configured display for diagnostics. Environment settings alone
+    // do not prove that portal, capture, input, and catalog share a compositor.
+    crate::session::log_session_description();
     let runtime = production_runtime();
     eprintln!("computer-use-mcp: starting KDE desktop session initialization in the background");
-    let result = async {
-        let service = match ComputerUseMcpServer::new(Arc::clone(&runtime))
-            .serve(rmcp::transport::stdio())
-            .await
-        {
-            Ok(service) => service,
-            // An MCP host may close stdin while starting or stopping the child.
-            // No request was accepted, so this is a clean shutdown rather than a server failure.
-            Err(ServerInitializeError::ConnectionClosed(_)) => return Ok(()),
-            Err(error) => {
-                return Err(CliError::Mcp(format!(
-                    "failed to start MCP stdio server: {error}"
-                )));
-            }
-        };
-        service.waiting().await.map(|_| ()).map_err(|error| {
-            CliError::Mcp(format!("MCP stdio server stopped with an error: {error}"))
-        })
-    }
-    .await;
+    let result = crate::broker::worker_stdio(Arc::clone(&runtime)).await;
     let shutdown = runtime
         .shutdown()
         .await
@@ -245,24 +269,79 @@ pub async fn serve_stdio() -> Result<(), CliError> {
 }
 
 pub fn production_runtime() -> Arc<SemanticRuntime<AtspiAdapter, ProductionScreenshotCoordinator>> {
-    Arc::new(SemanticRuntime::with_screenshot_provider(
+    // Live KWin awareness is production-only: tests construct
+    // `SemanticRuntime` directly and keep the disabled provider, so no
+    // session-bus traffic exists under test. Fail-closed downstream.
+    let runtime = SemanticRuntime::with_screenshot_provider(
         AtspiAdapter::default(),
         ProductionScreenshotCoordinator::default(),
         RuntimeConfig::default(),
-    ))
+    )
+    .with_virtual_desktop_provider(VirtualDesktopProvider::live());
+    let runtime = Arc::new(runtime);
+    // Enable action-scoped monitoring in shared physical sessions. This
+    // does not spawn a watcher until a mutation or wait owns execution.
+    runtime.arm_hardware_watcher();
+    runtime
 }
 
-fn for_protocol(mut result: CallToolResult, structured: bool) -> CallToolResult {
+pub(crate) fn server_info() -> ServerInfo {
+    let mut tools = ToolsCapability::default();
+    tools.list_changed = Some(false);
+    ServerInfo::new(
+        ServerCapabilities::builder()
+            .enable_tools_with(tools)
+            .build(),
+    )
+    .with_server_info(Implementation::new("computer-use-mcp", VERSION))
+    .with_protocol_version(ProtocolVersion::V_2025_11_25)
+    .with_instructions(SERVER_INSTRUCTIONS)
+}
+
+pub(crate) fn for_protocol(mut result: CallToolResult, structured: bool) -> CallToolResult {
     if !structured {
         result.structured_content = None;
     }
     result
 }
 
-fn supports_structured_content(context: &RequestContext<RoleServer>) -> bool {
+pub(crate) fn supports_structured_content(context: &RequestContext<RoleServer>) -> bool {
     context.protocol_version().is_some_and(|version| {
         version == ProtocolVersion::V_2025_06_18
             || version == ProtocolVersion::V_2025_11_25
             || version == ProtocolVersion::V_2026_07_28
     })
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_preserves_dispatch_outcome_even_when_cleanup_fails() {
+        for expected in [
+            ToolOutcome::NotStarted,
+            ToolOutcome::Unknown,
+            ToolOutcome::Completed,
+        ] {
+            let progress = Arc::new(ActionProgress::default());
+            if expected != ToolOutcome::NotStarted {
+                progress.mark_started();
+            }
+            if expected == ToolOutcome::Completed {
+                progress.mark_completed();
+            }
+            let error = cancelled_error(Some(&progress), "interrupted");
+            assert_eq!(error.outcome, expected);
+            assert_eq!(error.retryable, expected == ToolOutcome::NotStarted);
+
+            progress.mark_cleanup_failed();
+            let error = cancelled_error(Some(&progress), "interrupted");
+            assert_eq!(error.outcome, expected);
+            assert!(!error.retryable);
+            assert!(error.recovery.contains("not confirmed"));
+            assert!(error.recovery.contains("restart"));
+            assert_eq!(error.action_progress.unwrap()["cleanup"], "failed");
+        }
+    }
 }

@@ -21,8 +21,11 @@ use xkbcommon::xkb;
 use crate::portal::PortalSessionLease;
 
 use super::{
+    InputMode,
     backend::{HeldInput, InputBackend, InputEvent, InputFuture, KeyboardKey},
-    coordinates::{EisRegion, EisRoute},
+    coordinates::{
+        EisRegion, EisRoute, StreamExtent, describe_region, resolve_union_tiling_with_extent,
+    },
 };
 
 const READY_TIMEOUT: Duration = Duration::from_secs(3);
@@ -51,6 +54,16 @@ impl DeviceState {
     fn is_usable_keyboard(&self) -> bool {
         self.keymap.is_some() && self.device.interface::<ei::Keyboard>().is_some()
     }
+
+    /// Ready to type: resumed, modifier-synchronized with a known state,
+    /// and usable. This is the shared keyboard predicate for the
+    /// pointer-seat and focused-element paths.
+    fn is_ready_keyboard(&self) -> bool {
+        self.resumed
+            && self.modifiers_synced
+            && self.modifiers.is_some()
+            && self.is_usable_keyboard()
+    }
 }
 
 struct EisState {
@@ -58,6 +71,19 @@ struct EisState {
     devices: HashMap<u64, DeviceState>,
     terminal: Option<String>,
     binding: Option<EisBinding>,
+    /// Keyboard bound by [`ReisInputBackend::wait_for_keyboard`] for
+    /// focused-element typing. Unlike [`EisBinding`] it is anchored on the
+    /// unique usable keyboard instead of the pointer seat, so typing works
+    /// even when no single pointer region matches (e.g. ambiguous multi-
+    /// monitor EIS advertisements). Exactly-one-keyboard keeps it fail-closed.
+    focused_keyboard: Option<FocusedKeyboardBinding>,
+    mode: Option<InputMode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FocusedKeyboardBinding {
+    device_id: u64,
+    resume_generation: u64,
 }
 
 impl EisState {
@@ -67,11 +93,88 @@ impl EisState {
             devices: HashMap::new(),
             terminal: None,
             binding: None,
+            focused_keyboard: None,
+            mode: None,
         }
     }
 
-    fn pointer_device(&self, route: &EisRoute) -> Result<Option<EisBinding>, String> {
-        let mut matched = None;
+    fn bind_pointer_mode(&mut self, binding: EisBinding) {
+        self.binding = Some(binding);
+        self.focused_keyboard = None;
+        self.mode = Some(InputMode::Pointer);
+    }
+
+    fn bind_focused_keyboard_mode(&mut self, binding: FocusedKeyboardBinding) {
+        self.focused_keyboard = Some(binding);
+        self.binding = None;
+        self.mode = Some(InputMode::FocusedKeyboard);
+    }
+
+    /// Exactly-one device selection shared by the keyboard and scroll
+    /// lookups. `Ok(None)` means nothing usable is resumed yet (callers keep
+    /// waiting); more than one match fails closed as ambiguous input.
+    fn unique_device(
+        &self,
+        ambiguous_noun: &str,
+        mut matches: impl FnMut(&DeviceState) -> bool,
+    ) -> Result<Option<u64>, String> {
+        let mut matched = Vec::new();
+        for (&id, state) in &self.devices {
+            if matches(state) {
+                matched.push(id);
+            }
+        }
+        match matched.as_slice() {
+            [] => Ok(None),
+            [id] => Ok(Some(*id)),
+            many => Err(format!(
+                "{} {ambiguous_noun}; refusing ambiguous input",
+                many.len()
+            )),
+        }
+    }
+
+    /// The unique resumed, synchronized, usable keyboard across all EIS
+    /// devices, without any pointer-seat anchoring. `Ok(None)` means no
+    /// keyboard is ready yet (keep waiting); `Err` means two or more match
+    /// and typing would be ambiguous (fail closed immediately).
+    fn unique_keyboard(&self) -> Result<Option<u64>, String> {
+        self.unique_device(
+            "resumed and synchronized EIS keyboards are available",
+            DeviceState::is_ready_keyboard,
+        )
+    }
+
+    /// Validate the keyboard bound for focused-element typing: it must still
+    /// exist with the same resume generation, still be resumed/synchronized/
+    /// usable, and still be the unique keyboard. Any drift fails closed.
+    fn focused_keyboard_device(&self) -> Result<u64, String> {
+        let binding = self.focused_keyboard.as_ref().ok_or_else(|| {
+            "focused-element input was not prepared: no EIS keyboard is bound".to_owned()
+        })?;
+        let device = self
+            .devices
+            .get(&binding.device_id)
+            .ok_or_else(|| "bound EIS keyboard disappeared".to_owned())?;
+        if device.resume_generation != binding.resume_generation {
+            return Err("bound EIS keyboard changed during focused input".into());
+        }
+        if !device.is_ready_keyboard() {
+            return Err("bound EIS keyboard is no longer resumed and synchronized".into());
+        }
+        match self.unique_keyboard()? {
+            Some(id) if id == binding.device_id => Ok(id),
+            _ => Err("available EIS keyboards changed during focused input".into()),
+        }
+    }
+
+    /// Every resumed absolute-pointer region matching the stream route.
+    /// Empty means no usable device is resumed yet (callers keep waiting);
+    /// more than one means the compositor advertised an ambiguous
+    /// multi-monitor layout (callers refuse, or resolve via
+    /// [`ReisInputBackend::resolve_pointer_binding`] with action geometry).
+    fn matched_pointer_regions(&self, route: &EisRoute) -> Vec<MatchedPointerRegion> {
+        let mut matched = Vec::new();
         for (&id, state) in &self.devices {
             if !state.resumed || state.device.interface::<ei::PointerAbsolute>().is_none() {
                 continue;
@@ -83,18 +186,15 @@ impl EisState {
                     mapping_id: region.mapping_id.clone(),
                 };
                 if route.matches(&region) {
-                    let candidate = EisBinding {
-                        pointer_id: id,
+                    matched.push(MatchedPointerRegion {
+                        device_id: id,
                         resume_generation: state.resume_generation,
                         region,
-                    };
-                    if matched.replace(candidate).is_some() {
-                        return Err("multiple resumed EIS regions match the selected monitor stream; refusing ambiguous input".into());
-                    }
+                    });
                 }
             }
         }
-        Ok(matched)
+        matched
     }
 
     fn scroll_device(&self, pointer_device: u64) -> Result<Option<u64>, String> {
@@ -105,24 +205,15 @@ impl EisState {
         if pointer.device.interface::<ei::Scroll>().is_some() {
             return Ok(Some(pointer_device));
         }
-        let matches = self
-            .devices
-            .iter()
-            .filter(|(_, state)| {
+        let pointer_seat = pointer.device.seat();
+        self.unique_device(
+            "resumed EIS scroll devices share the selected pointer seat",
+            |state| {
                 state.resumed
-                    && state.device.seat() == pointer.device.seat()
+                    && state.device.seat() == pointer_seat
                     && state.device.interface::<ei::Scroll>().is_some()
-            })
-            .map(|(&id, _)| id)
-            .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [id] => Ok(Some(*id)),
-            [] => Ok(None),
-            many => Err(format!(
-                "{} resumed EIS scroll devices share the selected pointer seat; refusing ambiguous input",
-                many.len()
-            )),
-        }
+            },
+        )
     }
 
     fn keyboard_device(&self, pointer_device: u64) -> Result<Option<u64>, String> {
@@ -132,57 +223,56 @@ impl EisState {
             .ok_or("selected EIS pointer disappeared")?
             .device
             .seat();
-        let devices = self
-            .devices
-            .iter()
-            .filter(|(_, state)| {
-                state.resumed
-                    && state.modifiers_synced
-                    && state.modifiers.is_some()
-                    && state.is_usable_keyboard()
-                    && state.device.seat() == pointer_seat
-            })
-            .map(|(&id, _)| id)
-            .collect::<Vec<_>>();
-        match devices.as_slice() {
-            [id] => Ok(Some(*id)),
-            [] => Ok(None),
-            many => Err(format!(
-                "{} resumed and synchronized EIS keyboards are available; refusing ambiguous input",
-                many.len()
-            )),
-        }
+        self.unique_device(
+            "resumed and synchronized EIS keyboards are available",
+            |state| state.is_ready_keyboard() && state.device.seat() == pointer_seat,
+        )
     }
 
     fn keyboard_diagnostics(&self, route: &EisRoute) -> Result<String, String> {
         let pointer_id = self
-            .pointer_device(route)?
+            .matched_pointer_regions(route)
+            .first()
             .ok_or("exact EIS pointer region is not resumed")?
-            .pointer_id;
-        let pointer = self
+            .device_id;
+        let seat = self
             .devices
             .get(&pointer_id)
-            .ok_or("selected EIS pointer disappeared")?;
-        let details = self
-            .devices
-            .iter()
-            .filter(|(_, state)| state.device.interface::<ei::Keyboard>().is_some())
-            .map(|(id, state)| {
-                format!(
-                    "device {id}: same_seat={}, resumed={}, keymap={}, modifiers={}, synchronized={}",
-                    state.device.seat() == pointer.device.seat(),
-                    state.resumed,
-                    state.keymap.is_some(),
-                    state.modifiers.is_some(),
-                    state.modifiers_synced
-                )
-            })
-            .collect::<Vec<_>>();
-        Ok(if details.is_empty() {
-            "no EIS keyboard device was advertised".into()
-        } else {
-            details.join("; ")
-        })
+            .ok_or("selected EIS pointer disappeared")?
+            .device
+            .seat();
+        Ok(describe_keyboards(Some(seat), &self.devices))
+    }
+}
+
+/// One-line-per-keyboard status shared by the pointer-anchored and
+/// focused-element timeout errors. With `seat`, each line gains a
+/// same-seat column for the pointer-anchored path.
+fn describe_keyboards(
+    seat: Option<&reis::event::Seat>,
+    devices: &HashMap<u64, DeviceState>,
+) -> String {
+    let mut details = Vec::new();
+    for (id, state) in devices {
+        if state.device.interface::<ei::Keyboard>().is_none() {
+            continue;
+        }
+        let mut line = format!(
+            "device {id}: resumed={} keymap={} modifiers={} synchronized={}",
+            state.resumed,
+            state.keymap.is_some(),
+            state.modifiers.is_some(),
+            state.modifiers_synced
+        );
+        if let Some(seat) = seat {
+            line.push_str(&format!(" same_seat={}", state.device.seat() == seat));
+        }
+        details.push(line);
+    }
+    if details.is_empty() {
+        "no EIS keyboard device was advertised".to_owned()
+    } else {
+        details.join("; ")
     }
 }
 
@@ -200,6 +290,7 @@ struct SyncRequest {
 struct CleanupState {
     held: Vec<HeldInput>,
     sequence_pending: bool,
+    mode: Option<InputMode>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -207,6 +298,58 @@ struct EisBinding {
     pointer_id: u64,
     resume_generation: u64,
     region: EisRegion,
+    /// Source regions backing a union binding, sorted for deterministic
+    /// comparison. Empty for the legacy single-region path.
+    union_sources: Vec<EisRegion>,
+}
+
+struct MatchedPointerRegion {
+    device_id: u64,
+    resume_generation: u64,
+    region: EisRegion,
+}
+
+/// Region bound for one pointer action: the EIS region absolute motion is
+/// mapped into, plus optional union-disambiguation evidence for the action
+/// output when several resumed regions were resolved.
+#[derive(Debug, Clone)]
+pub struct ResolvedPointerBinding {
+    pub region: EisRegion,
+    pub evidence: Option<String>,
+}
+
+fn sort_regions(regions: &mut [EisRegion]) {
+    regions.sort_by(|first, second| {
+        (first.position, first.size, first.mapping_id.clone()).cmp(&(
+            second.position,
+            second.size,
+            second.mapping_id.clone(),
+        ))
+    });
+}
+
+/// List every matching region so the ambiguity can be diagnosed from the
+/// error alone (multi-monitor KWin setups may advertise duplicate regions).
+fn ambiguous_regions_error(route: &EisRoute, matched: &[MatchedPointerRegion]) -> String {
+    let details = matched
+        .iter()
+        .map(|candidate| {
+            format!(
+                "device {} gen={} region=({},{}) {}x{} mapping_id={:?}",
+                candidate.device_id,
+                candidate.resume_generation,
+                candidate.region.position.0,
+                candidate.region.position.1,
+                candidate.region.size.0,
+                candidate.region.size.1,
+                candidate.region.mapping_id,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "multiple resumed EIS regions match the selected monitor stream (route={route:?}); refusing ambiguous input: {details}"
+    )
 }
 
 struct EisThread {
@@ -311,14 +454,79 @@ impl ReisInputBackend {
             }),
             sync_requests,
         });
-        tokio::time::timeout(READY_TIMEOUT, backend.wait_ready(false))
-            .await
-            .map_err(|_| "timed out waiting for the exact EIS monitor device".to_owned())??;
         attempt.complete()?;
         Ok(backend)
     }
 
-    async fn wait_ready(&self, keyboard_required: bool) -> Result<EisRegion, String> {
+    /// Bind one pointer region unambiguously; several resumed regions from
+    /// the same device are resolved through the action's PNG geometry (see
+    /// [`resolve_union_tiling_with_extent`]). `None` means nothing usable is
+    /// resumed yet (callers keep waiting).
+    fn resolve_pointer_binding(
+        route: &EisRoute,
+        matched: &[MatchedPointerRegion],
+        output_size: (u32, u32),
+        stream_extent: Option<StreamExtent>,
+        window_cropped: bool,
+        png_points: &[(f64, f64)],
+    ) -> Result<Option<(EisBinding, Option<String>)>, String> {
+        let [only] = matched else {
+            if matched.is_empty() {
+                return Ok(None);
+            }
+            let first = &matched[0];
+            if matched.iter().any(|candidate| {
+                candidate.device_id != first.device_id
+                    || candidate.resume_generation != first.resume_generation
+            }) {
+                return Err(ambiguous_regions_error(route, matched));
+            }
+            let regions: Vec<EisRegion> = matched
+                .iter()
+                .map(|candidate| candidate.region.clone())
+                .collect();
+            let stream_extent = stream_extent.ok_or_else(|| {
+                "ambiguous EIS regions have no authoritative portal stream extent; refusing union resolution"
+                    .to_owned()
+            })?;
+            let (union, containing) = resolve_union_tiling_with_extent(
+                &regions,
+                output_size,
+                stream_extent,
+                window_cropped,
+                png_points,
+            )?;
+            let mut union_sources = regions;
+            sort_regions(&mut union_sources);
+            return Ok(Some((
+                EisBinding {
+                    pointer_id: first.device_id,
+                    resume_generation: first.resume_generation,
+                    region: union,
+                    union_sources,
+                },
+                Some(describe_region(&containing)),
+            )));
+        };
+        Ok(Some((
+            EisBinding {
+                pointer_id: only.device_id,
+                resume_generation: only.resume_generation,
+                region: only.region.clone(),
+                union_sources: Vec::new(),
+            },
+            None,
+        )))
+    }
+
+    async fn wait_resolved_ready(
+        &self,
+        keyboard_required: bool,
+        output_size: (u32, u32),
+        stream_extent: Option<StreamExtent>,
+        window_cropped: bool,
+        png_points: &[(f64, f64)],
+    ) -> Result<ResolvedPointerBinding, String> {
         loop {
             {
                 let mut state = self
@@ -328,7 +536,15 @@ impl ReisInputBackend {
                 if let Some(error) = &state.terminal {
                     return Err(error.clone());
                 }
-                if let Some(binding) = state.pointer_device(&self.route)? {
+                let matched = state.matched_pointer_regions(&self.route);
+                if let Some((binding, evidence)) = Self::resolve_pointer_binding(
+                    &self.route,
+                    &matched,
+                    output_size,
+                    stream_extent,
+                    window_cropped,
+                    png_points,
+                )? {
                     let keyboard_ready =
                         !keyboard_required || state.keyboard_device(binding.pointer_id)?.is_some();
                     if keyboard_ready {
@@ -342,8 +558,8 @@ impl ReisInputBackend {
                             );
                         }
                         let region = binding.region.clone();
-                        state.binding = Some(binding);
-                        return Ok(region);
+                        state.bind_pointer_mode(binding);
+                        return Ok(ResolvedPointerBinding { region, evidence });
                     }
                 }
             }
@@ -351,27 +567,51 @@ impl ReisInputBackend {
         }
     }
 
-    pub async fn wait_for_action(&self, keyboard_required: bool) -> Result<EisRegion, String> {
-        tokio::time::timeout(READY_TIMEOUT, self.wait_ready(keyboard_required))
-            .await
-            .map_err(|_| {
-                if keyboard_required {
-                    let detail = self
-                        .state
-                        .lock()
-                        .map_err(|_| "EIS state mutex poisoned".to_owned())
-                        .and_then(|state| state.keyboard_diagnostics(&self.route))
-                        .unwrap_or_else(|error| error);
-                    format!(
-                        "timed out waiting for a synchronized EIS keyboard on the monitor seat ({detail})"
-                    )
-                } else {
-                    "timed out waiting for the exact EIS monitor device".to_owned()
-                }
-            })?
+    pub async fn wait_for_resolved_action(
+        &self,
+        keyboard_required: bool,
+        output_size: (u32, u32),
+        stream_extent: Option<StreamExtent>,
+        window_cropped: bool,
+        png_points: &[(f64, f64)],
+    ) -> Result<ResolvedPointerBinding, String> {
+        let _serial = self.serial.lock().await;
+        self.ensure_mode_switch_allowed()?;
+        tokio::time::timeout(
+            READY_TIMEOUT,
+            self.wait_resolved_ready(
+                keyboard_required,
+                output_size,
+                stream_extent,
+                window_cropped,
+                png_points,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            if keyboard_required {
+                let detail = self
+                    .state
+                    .lock()
+                    .map_err(|_| "EIS state mutex poisoned".to_owned())
+                    .and_then(|state| state.keyboard_diagnostics(&self.route))
+                    .unwrap_or_else(|error| error);
+                format!(
+                    "timed out waiting for a synchronized EIS keyboard on the monitor seat ({detail})"
+                )
+            } else {
+                "timed out waiting for the exact EIS monitor device".to_owned()
+            }
+        })?
     }
 
-    pub fn region(&self) -> Result<EisRegion, String> {
+    pub fn resolved_region(
+        &self,
+        output_size: (u32, u32),
+        stream_extent: Option<StreamExtent>,
+        window_cropped: bool,
+        png_points: &[(f64, f64)],
+    ) -> Result<ResolvedPointerBinding, String> {
         let state = self
             .state
             .lock()
@@ -379,21 +619,143 @@ impl ReisInputBackend {
         if let Some(error) = &state.terminal {
             return Err(error.clone());
         }
-        Ok(self.pointer_device_for_action(&state)?.region)
+        let bound = self.pointer_device_for_action(&state)?;
+        // Re-resolve deterministically and require the same binding, so a
+        // region-set or geometry change between preparation and dispatch
+        // refuses instead of misdelivering.
+        let matched = state.matched_pointer_regions(&self.route);
+        let recomputed = Self::resolve_pointer_binding(
+            &self.route,
+            &matched,
+            output_size,
+            stream_extent,
+            window_cropped,
+            png_points,
+        )?
+        .ok_or_else(|| "exact EIS pointer region is no longer resumed".to_owned())?;
+        if recomputed.0 != bound {
+            return Err("selected EIS region changed before input dispatch".into());
+        }
+        Ok(ResolvedPointerBinding {
+            region: bound.region,
+            evidence: recomputed.1,
+        })
+    }
+
+    /// Wait for the unique usable EIS keyboard and bind it for
+    /// focused-element typing. No pointer region is resolved, so ambiguous
+    /// multi-monitor pointer advertisements do not block typing into an
+    /// AT-SPI-verified focused element.
+    pub async fn wait_for_keyboard(&self) -> Result<u64, String> {
+        let _serial = self.serial.lock().await;
+        self.ensure_mode_switch_allowed()?;
+        tokio::time::timeout(READY_TIMEOUT, self.wait_keyboard_ready())
+            .await
+            .map_err(|_| self.keyboard_wait_detail())?
+    }
+
+    async fn wait_keyboard_ready(&self) -> Result<u64, String> {
+        loop {
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| "EIS state mutex poisoned".to_owned())?;
+                if let Some(error) = &state.terminal {
+                    return Err(error.clone());
+                }
+                if let Some(id) = state.unique_keyboard()? {
+                    let resume_generation = state
+                        .devices
+                        .get(&id)
+                        .ok_or_else(|| "selected EIS keyboard disappeared".to_owned())?
+                        .resume_generation;
+                    state.bind_focused_keyboard_mode(FocusedKeyboardBinding {
+                        device_id: id,
+                        resume_generation,
+                    });
+                    return Ok(id);
+                }
+            }
+            self.ready.notified().await;
+        }
+    }
+
+    fn keyboard_wait_detail(&self) -> String {
+        let detail = self
+            .state
+            .lock()
+            .map_err(|_| "EIS state mutex poisoned".to_owned())
+            .map(|state| describe_keyboards(None, &state.devices))
+            .unwrap_or_else(|error| error);
+        format!("timed out waiting for a unique synchronized EIS keyboard ({detail})")
+    }
+
+    fn ensure_mode_switch_allowed(&self) -> Result<(), String> {
+        let cleanup = self
+            .cleanup
+            .lock()
+            .map_err(|_| "EIS cleanup mutex poisoned".to_owned())?;
+        if cleanup.sequence_pending || !cleanup.held.is_empty() {
+            return Err("cannot switch EIS input modes during an active transaction".into());
+        }
+        Ok(())
+    }
+
+    /// Capability gate for focused-element typing: the bound keyboard must
+    /// still be present, unchanged, resumed, and unique.
+    pub fn require_focused_keyboard(&self) -> Result<(), String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "EIS state mutex poisoned".to_owned())?;
+        if state.mode != Some(InputMode::FocusedKeyboard) {
+            return Err("focused-element input mode was not prepared".into());
+        }
+        state.focused_keyboard_device().map(drop)
     }
 
     fn pointer_device_for_action(&self, state: &EisState) -> Result<EisBinding, String> {
-        let current = state
-            .pointer_device(&self.route)?
-            .ok_or_else(|| "exact EIS pointer region is no longer resumed".to_owned())?;
+        if state.mode != Some(InputMode::Pointer) {
+            return Err("pointer input mode was not prepared".into());
+        }
+        // Structural validation only (no PNG geometry here): the bound
+        // single region must still be the unique match, or the bound union
+        // must still equal the union of the same-device match set.
         let bound = state
             .binding
             .as_ref()
-            .ok_or("EIS monitor region was not bound during input preparation")?;
-        if bound != &current {
+            .ok_or("EIS monitor region was not bound during input preparation")?
+            .clone();
+        let matched = state.matched_pointer_regions(&self.route);
+        if matched.is_empty() {
+            return Err("exact EIS pointer region is no longer resumed".into());
+        }
+        if bound.union_sources.is_empty() {
+            if matched.len() == 1
+                && matched[0].device_id == bound.pointer_id
+                && matched[0].resume_generation == bound.resume_generation
+                && matched[0].region == bound.region
+            {
+                return Ok(bound);
+            }
             return Err("selected EIS region changed before input dispatch".into());
         }
-        Ok(current)
+        if matched.iter().any(|candidate| {
+            candidate.device_id != bound.pointer_id
+                || candidate.resume_generation != bound.resume_generation
+        }) {
+            return Err("selected EIS region changed before input dispatch".into());
+        }
+        let mut regions: Vec<EisRegion> = matched
+            .iter()
+            .map(|candidate| candidate.region.clone())
+            .collect();
+        sort_regions(&mut regions);
+        if regions != bound.union_sources {
+            return Err("selected EIS region changed before input dispatch".into());
+        }
+        Ok(bound)
     }
 
     pub fn require_capabilities(
@@ -406,18 +768,31 @@ impl ReisInputBackend {
             .state
             .lock()
             .map_err(|_| "EIS state mutex poisoned".to_owned())?;
-        let pointer = self.pointer_device_for_action(&state)?.pointer_id;
-        let pointer_state = state
-            .devices
-            .get(&pointer)
-            .ok_or("selected EIS pointer disappeared")?;
-        if button && pointer_state.device.interface::<ei::Button>().is_none()
-            || scroll && state.scroll_device(pointer)?.is_none()
-            || keyboard && state.keyboard_device(pointer)?.is_none()
-        {
-            return Err(
-                "EIS backend lacks the device capabilities required for this action".into(),
-            );
+        match state.mode {
+            Some(InputMode::Pointer) => {
+                let pointer = self.pointer_device_for_action(&state)?.pointer_id;
+                let pointer_state = state
+                    .devices
+                    .get(&pointer)
+                    .ok_or("selected EIS pointer disappeared")?;
+                if button && pointer_state.device.interface::<ei::Button>().is_none()
+                    || scroll && state.scroll_device(pointer)?.is_none()
+                    || keyboard && state.keyboard_device(pointer)?.is_none()
+                {
+                    return Err(
+                        "EIS backend lacks the device capabilities required for this action".into(),
+                    );
+                }
+            }
+            Some(InputMode::FocusedKeyboard) => {
+                if button || scroll {
+                    return Err("focused keyboard mode cannot emit pointer input".into());
+                }
+                if keyboard {
+                    state.focused_keyboard_device().map(drop)?;
+                }
+            }
+            None => return Err("EIS input mode was not prepared".into()),
         }
         Ok(())
     }
@@ -427,10 +802,27 @@ impl ReisInputBackend {
             .state
             .lock()
             .map_err(|_| "EIS state mutex poisoned".to_owned())?;
-        let pointer_id = self.pointer_device_for_action(&state)?.pointer_id;
-        let id = state
-            .keyboard_device(pointer_id)?
-            .ok_or_else(|| "no resumed and synchronized EIS keyboard is available".to_owned())?;
+        let mode = state
+            .mode
+            .ok_or_else(|| "EIS input mode was not prepared".to_owned())?;
+        let id = select_keyboard_for_mode(
+            mode,
+            || {
+                let pointer_id = self.pointer_device_for_action(&state)?.pointer_id;
+                state.keyboard_device(pointer_id)?.ok_or_else(|| {
+                    "no resumed and synchronized EIS keyboard is available".to_owned()
+                })
+            },
+            || state.focused_keyboard_device(),
+        )?;
+        Self::resolve_keysyms_with_device(&state, id, keysyms)
+    }
+
+    fn resolve_keysyms_with_device(
+        state: &EisState,
+        id: u64,
+        keysyms: &[u32],
+    ) -> Result<Vec<ResolvedKey>, String> {
         let device = &state.devices[&id];
         let keymap = parse_keymap(
             device
@@ -514,22 +906,38 @@ impl ReisInputBackend {
             .collect()
     }
 
-    fn selected_device(&self, state: &EisState, event: &InputEvent) -> Result<u64, String> {
-        match event {
-            InputEvent::Absolute { .. } | InputEvent::Button { .. } => self
+    fn selected_device(
+        &self,
+        state: &EisState,
+        mode: InputMode,
+        event: &InputEvent,
+    ) -> Result<u64, String> {
+        match (mode, event) {
+            (InputMode::Pointer, InputEvent::Absolute { .. } | InputEvent::Button { .. }) => self
                 .pointer_device_for_action(state)
                 .map(|binding| binding.pointer_id),
-            InputEvent::ScrollDiscrete { .. } => {
+            (InputMode::Pointer, InputEvent::ScrollDiscrete { .. }) => {
                 let pointer = self.pointer_device_for_action(state)?.pointer_id;
                 state
                     .scroll_device(pointer)?
                     .ok_or_else(|| "EIS scroll device is no longer resumed".into())
             }
-            InputEvent::Keycode { key, .. } => {
-                let pointer = self.pointer_device_for_action(state)?.pointer_id;
-                let current = state
-                    .keyboard_device(pointer)?
-                    .ok_or("synchronized EIS keyboard is no longer resumed")?;
+            (InputMode::FocusedKeyboard, InputEvent::Absolute { .. })
+            | (InputMode::FocusedKeyboard, InputEvent::Button { .. })
+            | (InputMode::FocusedKeyboard, InputEvent::ScrollDiscrete { .. }) => {
+                Err("focused keyboard mode cannot emit pointer input".into())
+            }
+            (_, InputEvent::Keycode { key, .. }) => {
+                let current = select_keyboard_for_mode(
+                    mode,
+                    || {
+                        let pointer = self.pointer_device_for_action(state)?.pointer_id;
+                        state.keyboard_device(pointer)?.ok_or_else(|| {
+                            "synchronized EIS keyboard is no longer resumed".to_owned()
+                        })
+                    },
+                    || state.focused_keyboard_device(),
+                )?;
                 let device = state
                     .devices
                     .get(&key.device_id)
@@ -540,7 +948,7 @@ impl ReisInputBackend {
         }
     }
 
-    fn begin_inner(&self) -> Result<(), String> {
+    fn begin_inner_for_mode(&self, mode: InputMode) -> Result<(), String> {
         if self.session.is_closed() {
             return Err("portal RemoteDesktop Session.Closed".into());
         }
@@ -555,25 +963,32 @@ impl ReisInputBackend {
             .connection
             .clone()
             .ok_or("EIS connection is not ready")?;
-        let pointer_id = self.pointer_device_for_action(&state)?.pointer_id;
-        let device = state
-            .devices
-            .get_mut(&pointer_id)
-            .ok_or("selected EIS pointer disappeared")?;
-        if !device.emulating {
-            device
-                .device
-                .device()
-                .start_emulating(connection.serial(), device.sequence);
-            device.sequence = device.sequence.wrapping_add(1);
-            device.emulating = true;
+        match mode {
+            InputMode::Pointer => {
+                let binding = self.pointer_device_for_action(&state)?;
+                let device = state
+                    .devices
+                    .get_mut(&binding.pointer_id)
+                    .ok_or("selected EIS pointer disappeared")?;
+                if !device.emulating {
+                    device
+                        .device
+                        .device()
+                        .start_emulating(connection.serial(), device.sequence);
+                    device.sequence = device.sequence.wrapping_add(1);
+                    device.emulating = true;
+                }
+            }
+            InputMode::FocusedKeyboard => {
+                state.focused_keyboard_device().map(drop)?;
+            }
         }
         connection
             .flush()
             .map_err(|error| format!("cannot start EIS emulation: {error}"))
     }
 
-    fn emit_inner(&self, event: InputEvent) -> Result<(), String> {
+    fn emit_inner_for_mode(&self, mode: InputMode, event: InputEvent) -> Result<(), String> {
         validate_event(&event)?;
         if self.session.is_closed() {
             return Err("portal RemoteDesktop Session.Closed".into());
@@ -589,7 +1004,7 @@ impl ReisInputBackend {
             .connection
             .clone()
             .ok_or("EIS connection is not ready")?;
-        let device_id = self.selected_device(&state, &event)?;
+        let device_id = self.selected_device(&state, mode, &event)?;
         let device = state
             .devices
             .get_mut(&device_id)
@@ -700,6 +1115,22 @@ impl ReisInputBackend {
         Ok(keyboard)
     }
 
+    fn current_mode(&self) -> Result<InputMode, String> {
+        self.state
+            .lock()
+            .map_err(|_| "EIS state mutex poisoned".to_owned())?
+            .mode
+            .ok_or_else(|| "EIS input mode was not prepared".to_owned())
+    }
+
+    fn transaction_mode(&self) -> Result<InputMode, String> {
+        self.cleanup
+            .lock()
+            .map_err(|_| "EIS cleanup mutex poisoned".to_owned())?
+            .mode
+            .ok_or_else(|| "EIS transaction mode was not started".to_owned())
+    }
+
     async fn synchronize(&self, keyboard_id: Option<u64>) -> Result<(), String> {
         let (response, result) = oneshot::channel();
         self.sync_requests
@@ -719,17 +1150,26 @@ impl InputBackend for ReisInputBackend {
     fn begin_sequence(&self) -> InputFuture<'_> {
         Box::pin(async move {
             let _serial = self.serial.lock().await;
-            let result = self.begin_inner();
+            let mode = self.current_mode();
+            let cleanup_mode = mode.as_ref().ok().copied();
+            let result = match mode {
+                Ok(mode) => self.begin_inner_for_mode(mode),
+                Err(error) => Err(error),
+            };
             let sequence_open = self
                 .state
                 .lock()
                 .map(|state| state.devices.values().any(|device| device.emulating))
                 .unwrap_or(true);
-            if sequence_open {
+            if result.is_ok() || sequence_open {
                 self.cleanup
                     .lock()
                     .map_err(|_| "EIS cleanup mutex poisoned".to_owned())?
                     .sequence_pending = true;
+                self.cleanup
+                    .lock()
+                    .map_err(|_| "EIS cleanup mutex poisoned".to_owned())?
+                    .mode = cleanup_mode;
             }
             result
         })
@@ -738,7 +1178,8 @@ impl InputBackend for ReisInputBackend {
     fn emit(&self, event: InputEvent) -> InputFuture<'_> {
         Box::pin(async move {
             let _serial = self.serial.lock().await;
-            self.emit_inner(event)
+            let mode = self.transaction_mode()?;
+            self.emit_inner_for_mode(mode, event)
         })
     }
 
@@ -762,18 +1203,19 @@ impl InputBackend for ReisInputBackend {
     fn cleanup_barrier(&self) -> InputFuture<'_> {
         Box::pin(async move {
             let _serial = self.serial.lock().await;
-            let (held, sequence_pending) = {
+            let (held, sequence_pending, mode) = {
                 let cleanup = self
                     .cleanup
                     .lock()
                     .map_err(|_| "EIS cleanup mutex poisoned".to_owned())?;
-                (cleanup.held.clone(), cleanup.sequence_pending)
+                (cleanup.held.clone(), cleanup.sequence_pending, cleanup.mode)
             };
             if held.is_empty() && !sequence_pending {
                 return Ok(());
             }
+            let mode = mode.ok_or("EIS cleanup has no transaction mode")?;
             if !sequence_pending {
-                self.begin_inner()?;
+                self.begin_inner_for_mode(mode)?;
                 self.cleanup
                     .lock()
                     .map_err(|_| "EIS cleanup mutex poisoned".to_owned())?
@@ -781,7 +1223,7 @@ impl InputBackend for ReisInputBackend {
             }
             let mut first = None;
             for input in held {
-                match self.emit_inner(input.release_event()) {
+                match self.emit_inner_for_mode(mode, input.release_event()) {
                     Ok(()) => {
                         if let Ok(mut cleanup) = self.cleanup.lock()
                             && let Some(index) = cleanup
@@ -806,6 +1248,16 @@ impl InputBackend for ReisInputBackend {
                         .lock()
                         .map_err(|_| "EIS cleanup mutex poisoned".to_owned())?
                         .sequence_pending = false;
+                    self.cleanup
+                        .lock()
+                        .map_err(|_| "EIS cleanup mutex poisoned".to_owned())?
+                        .mode = None;
+                    if first.is_none() {
+                        self.state
+                            .lock()
+                            .map_err(|_| "EIS state mutex poisoned".to_owned())?
+                            .mode = None;
+                    }
                 }
                 Err(error) => {
                     first.get_or_insert(error);
@@ -1285,6 +1737,17 @@ fn validate_event(event: &InputEvent) -> Result<(), String> {
     Ok(())
 }
 
+fn select_keyboard_for_mode<P, F>(mode: InputMode, pointer: P, focused: F) -> Result<u64, String>
+where
+    P: FnOnce() -> Result<u64, String>,
+    F: FnOnce() -> Result<u64, String>,
+{
+    match mode {
+        InputMode::Pointer => pointer(),
+        InputMode::FocusedKeyboard => focused(),
+    }
+}
+
 fn validate_key_binding(
     current_device_id: u64,
     current_resume_generation: u64,
@@ -1350,5 +1813,52 @@ mod tests {
         assert!(validate_key_binding(4, 7, key).is_ok());
         assert!(validate_key_binding(5, 7, key).is_err());
         assert!(validate_key_binding(4, 8, key).is_err());
+    }
+
+    #[test]
+    fn transaction_mode_does_not_fall_back_between_authorities() {
+        let pointer_stale = || Err("pointer binding is stale".to_owned());
+        let focused_ready = || Ok(22);
+        assert!(
+            select_keyboard_for_mode(InputMode::Pointer, pointer_stale, focused_ready).is_err()
+        );
+
+        let pointer_stale = || panic!("focused mode must not inspect the pointer authority");
+        assert_eq!(
+            select_keyboard_for_mode(InputMode::FocusedKeyboard, pointer_stale, || Ok(22)),
+            Ok(22)
+        );
+    }
+
+    #[test]
+    fn switching_transaction_modes_clears_the_other_authority() {
+        let mut state = EisState::new();
+        state.bind_pointer_mode(EisBinding {
+            pointer_id: 4,
+            resume_generation: 1,
+            region: EisRegion {
+                position: (0, 0),
+                size: (100, 100),
+                mapping_id: None,
+            },
+            union_sources: Vec::new(),
+        });
+        assert_eq!(state.mode, Some(InputMode::Pointer));
+        assert!(state.binding.is_some());
+        assert!(state.focused_keyboard.is_none());
+
+        state.bind_focused_keyboard_mode(FocusedKeyboardBinding {
+            device_id: 8,
+            resume_generation: 3,
+        });
+        assert_eq!(state.mode, Some(InputMode::FocusedKeyboard));
+        assert!(state.binding.is_none());
+        assert_eq!(
+            state.focused_keyboard,
+            Some(FocusedKeyboardBinding {
+                device_id: 8,
+                resume_generation: 3,
+            })
+        );
     }
 }

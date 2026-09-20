@@ -19,8 +19,14 @@ fn tools_list_wire_has_exact_contract_and_stays_within_budget() {
         NumberOrString::Number(1),
     );
     let serialized = serde_json::to_vec(&wire).expect("serialize complete tools/list");
+    println!(
+        "tools/list={} bytes; initialize={} bytes; skill={} bytes",
+        serialized.len(),
+        computer_use_mcp::contract::SERVER_INSTRUCTIONS.len(),
+        PACKAGED_SKILL.len()
+    );
     assert!(
-        serialized.len() <= 16_000,
+        serialized.len() <= 13_000,
         "tools/list is {} bytes",
         serialized.len()
     );
@@ -41,8 +47,9 @@ fn tools_list_wire_has_exact_contract_and_stays_within_budget() {
         );
         assert!(tool.get("outputSchema").is_none());
         let tool_bytes = serde_json::to_vec(tool).expect("serialize wire tool").len();
+        println!("{}={tool_bytes} bytes", tool["name"]);
         assert!(
-            tool_bytes <= 6_000,
+            tool_bytes <= 7_000,
             "{} is {tool_bytes} bytes",
             tool["name"]
         );
@@ -58,7 +65,7 @@ fn tools_list_wire_has_exact_contract_and_stays_within_budget() {
         );
         total_words += words;
     }
-    assert!(computer_use_mcp::contract::SERVER_INSTRUCTIONS.len() <= 2_048);
+    assert!(computer_use_mcp::contract::SERVER_INSTRUCTIONS.len() <= 1_200);
     assert!(
         total_words <= 400,
         "tool descriptions use {total_words} words"
@@ -119,6 +126,15 @@ fn inputs_use_exact_opaque_targets_and_bounded_operations() {
     assert_eq!(list["properties"]["limit"]["default"], 50);
     assert_eq!(list["properties"]["limit"]["maximum"], 100);
     assert_eq!(list["properties"]["cursor"]["minLength"], 1);
+    for name in ["list_desktop", "launch_application", "wait_for"] {
+        assert_eq!(
+            schema(name)["properties"]["desktop"]["enum"],
+            json!(["foreground", "background"])
+        );
+    }
+    for name in ["observe", "act", "activate_window"] {
+        assert!(schema(name)["properties"].get("desktop").is_none());
+    }
     assert_eq!(
         schema("launch_application")["properties"]["desktop_id"]["pattern"],
         "^[^\\s]+\\.desktop$"
@@ -134,6 +150,12 @@ fn inputs_use_exact_opaque_targets_and_bounded_operations() {
         target["properties"]["window_instance_id"]["pattern"],
         "^win-[0-9a-f]{16}$"
     );
+    assert_eq!(activate["required"], json!(["target"]));
+    assert_eq!(
+        activate["properties"]["action"]["enum"],
+        json!(["activate", "minimize", "maximize", "restore", "close"])
+    );
+    assert_eq!(activate["properties"]["action"]["default"], "activate");
 
     let observe = schema("observe");
     assert_eq!(observe["required"], json!(["target", "view"]));
@@ -141,6 +163,11 @@ fn inputs_use_exact_opaque_targets_and_bounded_operations() {
         observe["properties"]["view"]["enum"],
         json!(["screenshot", "accessibility", "both"])
     );
+    assert_eq!(
+        observe["properties"]["crop"]["enum"],
+        json!(["monitor", "target_window"])
+    );
+    assert_eq!(observe["properties"]["crop"]["default"], "monitor");
     assert_eq!(
         observe["properties"]["accessibility"]["properties"]["limits"]["properties"]["max_nodes"]["maximum"],
         5_000
@@ -162,7 +189,7 @@ fn inputs_use_exact_opaque_targets_and_bounded_operations() {
     let act = schema("act");
     assert_eq!(
         discriminants(&act["properties"]["operation"]),
-        ["pointer", "semantic", "keyboard"]
+        ["pointer", "semantic", "keyboard", "paste"]
     );
     assert_eq!(
         discriminants(&act["properties"]["operation"]["oneOf"][0]["properties"]["action"]),
@@ -226,10 +253,37 @@ fn inputs_use_exact_opaque_targets_and_bounded_operations() {
             ["text"]["pattern"],
         "^[^\\u0000]+$"
     );
+    let keyboard_focus = &act["properties"]["operation"]["oneOf"][2]["properties"]["focus"];
     assert_eq!(
-        act["properties"]["operation"]["oneOf"][2]["properties"]["focus"]["properties"]["type"]["const"],
+        keyboard_focus["oneOf"][0]["properties"]["type"]["const"],
         "point"
     );
+    assert_eq!(
+        keyboard_focus["oneOf"][1]["properties"]["type"]["const"],
+        "semantic"
+    );
+    assert_eq!(
+        keyboard_focus["oneOf"][1]["properties"]["element_id"]["pattern"],
+        "^e-[0-9a-f]{16}$"
+    );
+    assert_eq!(
+        keyboard_focus["oneOf"][1]["required"],
+        json!(["type", "element_id"])
+    );
+    let paste = &act["properties"]["operation"]["oneOf"][3];
+    assert_eq!(paste["properties"]["type"]["const"], "paste");
+    assert_eq!(
+        paste["properties"]["focus"]["oneOf"][0]["properties"]["type"]["const"],
+        "point"
+    );
+    assert_eq!(
+        paste["properties"]["focus"]["oneOf"][1]["properties"]["type"]["const"],
+        "semantic"
+    );
+    assert_eq!(paste["properties"]["text"]["minLength"], 1);
+    assert_eq!(paste["properties"]["text"]["maxLength"], 100_000);
+    assert_eq!(paste["properties"]["text"]["pattern"], "^[^\\u0000]+$");
+    assert_eq!(paste["required"], json!(["type", "focus", "text"]));
     let wait = schema("wait_for");
     assert_eq!(
         discriminants(&wait["properties"]["condition"]),
@@ -240,12 +294,11 @@ fn inputs_use_exact_opaque_targets_and_bounded_operations() {
             "accessibility_advanced",
             "element_state",
             "element_value",
+            "window_opened",
+            "window_closed",
         ]
     );
-    assert_eq!(
-        wait["required"],
-        json!(["target", "condition", "timeout_ms"])
-    );
+    assert_eq!(wait["required"], json!(["condition", "timeout_ms"]));
     assert!(wait["properties"]["timeout_ms"].get("default").is_none());
     assert_eq!(wait["properties"]["timeout_ms"]["maximum"], 5_000);
     let frame_stable = &wait["properties"]["condition"]["oneOf"][2];
@@ -259,6 +312,29 @@ fn inputs_use_exact_opaque_targets_and_bounded_operations() {
     assert_eq!(
         wait["properties"]["condition"]["oneOf"][1]["properties"]["type"]["const"],
         "frame_changed"
+    );
+    let window_opened = &wait["properties"]["condition"]["oneOf"][6];
+    assert_eq!(
+        window_opened["properties"]["type"]["const"],
+        "window_opened"
+    );
+    assert_eq!(
+        window_opened["properties"]["desktop_id"]["pattern"],
+        "^[^\\s]+$"
+    );
+    assert_eq!(window_opened["required"], json!(["type", "desktop_id"]));
+    let window_closed = &wait["properties"]["condition"]["oneOf"][7];
+    assert_eq!(
+        window_closed["properties"]["type"]["const"],
+        "window_closed"
+    );
+    assert_eq!(
+        window_closed["properties"]["window_instance_id"]["pattern"],
+        "^win-[0-9a-f]{16}$"
+    );
+    assert_eq!(
+        window_closed["required"],
+        json!(["type", "window_instance_id"])
     );
 
     for (name, bound, expected) in [

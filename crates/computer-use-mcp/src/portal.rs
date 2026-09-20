@@ -10,14 +10,18 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use ashpd::desktop::{remote_desktop::RemoteDesktop, screencast::Screencast};
 use futures_util::StreamExt;
 use rustix::fs::{AtFlags, Mode, OFlags};
-use tokio::sync::watch;
+use tokio::{
+    sync::{oneshot, watch},
+    task::JoinHandle,
+};
 use zbus::{
     Connection, MatchRule, MessageStream, Proxy,
     message::Type as MessageType,
@@ -32,6 +36,12 @@ const REQUEST_INTERFACE: &str = "org.freedesktop.portal.Request";
 const SESSION_INTERFACE: &str = "org.freedesktop.portal.Session";
 pub(crate) const REMOTE_DESKTOP_INTERFACE: &str = "org.freedesktop.portal.RemoteDesktop";
 pub(crate) const PORTAL_OBJECT_PATH: &str = "/org/freedesktop/portal/desktop";
+const CLIPBOARD_INTERFACE: &str = "org.freedesktop.portal.Clipboard";
+const CLIPBOARD_TEXT_MIME: &str = "text/plain";
+const CLIPBOARD_TEXT_UTF8_MIME: &str = "text/plain;charset=utf-8";
+const CLIPBOARD_TRANSFER_TIMEOUT: Duration = Duration::from_secs(5);
+const CLIPBOARD_CALL_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_CLIPBOARD_BYTES: usize = crate::validation::MAX_TEXT_LIMIT * 4;
 const TOKEN_MAX_BYTES: usize = 16 * 1024;
 static SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -162,6 +172,10 @@ impl XdgPortalBackend {
     }
 
     pub(crate) async fn approve(&self) -> Result<PortalApproval, String> {
+        retry_expired_approval(|| self.approve_once()).await
+    }
+
+    async fn approve_once(&self) -> Result<PortalApproval, ApprovalError> {
         require_wayland()?;
         let connection = Connection::session()
             .await
@@ -270,27 +284,68 @@ impl XdgPortalBackend {
             &closed,
         )
         .await?;
+        let clipboard_requested = match request_clipboard(&connection, &session_path).await {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!(
+                    "computer-use-mcp: portal clipboard access unavailable; using bounded EIS typing: {error}"
+                );
+                false
+            }
+        };
         let mut start_results =
-            start_remote_desktop(&connection, &remote, &session_path, &closed).await?;
+            match start_remote_desktop(&connection, &remote, &session_path, &closed).await {
+                Ok(results) => results,
+                Err(error) => {
+                    // A replacement chooser is permitted only after acknowledged
+                    // closure of both the expired request and its session.
+                    session_guard.close().await?;
+                    return Err(error);
+                }
+            };
         let granted_mask = take_owned(&mut start_results, "devices")?
             .try_into()
             .map_err(|error| format!("portal response devices has the wrong type: {error}"))?;
         match validate_start_devices(granted_mask, REQUIRED_DEVICES) {
             Ok(()) => {}
             Err(error) => {
-                match session_proxy.call::<_, _, ()>("Close", &()).await {
-                    Ok(()) => session_guard.disarm(),
-                    Err(close_error) => eprintln!(
+                if let Err(close_error) = session_guard.close().await {
+                    eprintln!(
                         "computer-use-mcp: failed to close rejected portal grant: {close_error}"
-                    ),
+                    );
                 }
-                return Err(error);
+                return Err(error.into());
             }
         };
         let stream = parse_streams(
             take_owned(&mut start_results, "streams")?,
             capabilities.screencast_version,
         )?;
+        let clipboard_enabled = match take_optional::<bool>(&mut start_results, "clipboard_enabled")
+        {
+            Ok(Some(enabled)) => clipboard_requested && enabled,
+            Ok(None) => false,
+            Err(error) => {
+                eprintln!(
+                    "computer-use-mcp: portal clipboard capability had the wrong type; using bounded EIS typing: {error}"
+                );
+                false
+            }
+        };
+        let clipboard = if clipboard_enabled {
+            match ClipboardController::new(connection.clone(), &session_path, closed.clone()).await
+            {
+                Ok(controller) => Some(controller),
+                Err(error) => {
+                    eprintln!(
+                        "computer-use-mcp: portal clipboard responder could not start; using bounded EIS typing: {error}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let mut restore_token_saved = false;
         if let Some(store) = &self.token_store {
             let restore_token = match take_optional::<String>(&mut start_results, "restore_token") {
@@ -326,6 +381,7 @@ impl XdgPortalBackend {
             closed,
             closed_sender,
             connection: Some(connection),
+            clipboard,
             input_state: Mutex::new(EisConnectionState::Available),
             _close_guard: Mutex::new(session_guard),
             _close_monitor: close_monitor,
@@ -376,6 +432,57 @@ impl XdgPortalBackend {
     }
 }
 
+#[derive(Debug)]
+enum ApprovalError {
+    Expired,
+    Terminal(String),
+}
+
+impl From<String> for ApprovalError {
+    fn from(error: String) -> Self {
+        Self::Terminal(error)
+    }
+}
+
+impl From<&str> for ApprovalError {
+    fn from(error: &str) -> Self {
+        Self::Terminal(error.into())
+    }
+}
+
+async fn consent_deadline<T>(
+    response: impl Future<Output = Result<T, String>>,
+) -> Result<T, ApprovalError> {
+    tokio::time::timeout(Duration::from_secs(45), response)
+        .await
+        .map_err(|_| ApprovalError::Expired)?
+        .map_err(ApprovalError::Terminal)
+}
+
+// This future owns retries: dropping it cancels the current attempt/backoff.
+// No task survives to open another dialog after cancellation or shutdown.
+async fn retry_expired_approval<T, F, Fut>(mut attempt: F) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, ApprovalError>>,
+{
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        match attempt().await {
+            Ok(grant) => return Ok(grant),
+            Err(ApprovalError::Terminal(error)) => return Err(error),
+            Err(ApprovalError::Expired) => {
+                eprintln!(
+                    "computer-use-mcp: portal consent deadline expired; closed request and session, reprompting after {} seconds",
+                    backoff.as_secs()
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(8));
+            }
+        }
+    }
+}
+
 impl Default for XdgPortalBackend {
     fn default() -> Self {
         Self::new(PortalConfig::from_env())
@@ -420,6 +527,7 @@ pub struct PortalSessionLease {
     closed: watch::Receiver<bool>,
     closed_sender: watch::Sender<bool>,
     connection: Option<Connection>,
+    clipboard: Option<Arc<ClipboardController>>,
     input_state: Mutex<EisConnectionState>,
     _close_guard: Mutex<CloseGuard>,
     _close_monitor: CloseMonitor,
@@ -433,6 +541,455 @@ enum EisConnectionState {
     Invalid,
 }
 
+struct ActiveClipboardSelection {
+    payload: Arc<[u8]>,
+    completion: Option<oneshot::Sender<Result<(), String>>>,
+    cancel: watch::Sender<bool>,
+}
+
+struct ClipboardState {
+    active: Mutex<Option<ActiveClipboardSelection>>,
+    // Signals already received before revocation must not serve a later paste.
+    cleared_through: Mutex<zbus::message::Sequence>,
+}
+
+pub(crate) struct ClipboardController {
+    proxy: Proxy<'static>,
+    session_path: OwnedObjectPath,
+    state: Arc<ClipboardState>,
+    closed: watch::Receiver<bool>,
+    responder: Mutex<Option<JoinHandle<()>>>,
+    needs_clear: AtomicBool,
+}
+
+pub(crate) struct ClipboardPaste {
+    controller: Arc<ClipboardController>,
+    completion: Option<oneshot::Receiver<Result<(), String>>>,
+}
+
+impl ClipboardController {
+    async fn new(
+        connection: Connection,
+        session_path: &str,
+        closed: watch::Receiver<bool>,
+    ) -> Result<Arc<Self>, String> {
+        let proxy = Proxy::new_owned(
+            connection.clone(),
+            PORTAL_DESTINATION,
+            PORTAL_OBJECT_PATH,
+            CLIPBOARD_INTERFACE,
+        )
+        .await
+        .map_err(portal_error)?;
+        let session_path = OwnedObjectPath::try_from(session_path).map_err(portal_error)?;
+        let rule = MatchRule::builder()
+            .msg_type(MessageType::Signal)
+            .sender(PORTAL_DESTINATION)
+            .map_err(portal_error)?
+            .interface(CLIPBOARD_INTERFACE)
+            .map_err(portal_error)?
+            .member("SelectionTransfer")
+            .map_err(portal_error)?
+            .build();
+        let stream = MessageStream::for_match_rule(rule, &connection, Some(8))
+            .await
+            .map_err(portal_error)?;
+        let state = Arc::new(ClipboardState {
+            active: Mutex::new(None),
+            cleared_through: Mutex::new(Default::default()),
+        });
+        let responder = tokio::spawn(clipboard_transfer_loop(
+            stream,
+            proxy.clone(),
+            session_path.clone(),
+            Arc::clone(&state),
+            closed.clone(),
+        ));
+        Ok(Arc::new(Self {
+            proxy,
+            session_path,
+            state,
+            closed,
+            responder: Mutex::new(Some(responder)),
+            needs_clear: AtomicBool::new(false),
+        }))
+    }
+
+    pub(crate) async fn begin(
+        self: &Arc<Self>,
+        text: &str,
+        progress: &crate::runtime::ActionProgress,
+    ) -> Result<ClipboardPaste, String> {
+        validate_clipboard_text(text)?;
+        if *self.closed.borrow() {
+            return Err("portal clipboard session is closed".into());
+        }
+        if self.needs_clear.load(Ordering::Acquire) {
+            return Err("previous portal clipboard selection requires cleanup".into());
+        }
+        let payload: Arc<[u8]> = Arc::from(text.as_bytes().to_owned());
+        let (sender, completion) = oneshot::channel();
+        {
+            let mut active = self
+                .state
+                .active
+                .lock()
+                .map_err(|_| "portal clipboard state mutex poisoned".to_owned())?;
+            if active.is_some() {
+                return Err("another portal clipboard transfer is active".into());
+            }
+            *active = Some(ActiveClipboardSelection {
+                payload,
+                completion: Some(sender),
+                cancel: watch::channel(false).0,
+            });
+        }
+        // Install the cancellation guard before the first await: SetSelection
+        // can be processed remotely even if its reply is never received.
+        let selection = ClipboardPaste {
+            controller: Arc::clone(self),
+            completion: Some(completion),
+        };
+        self.needs_clear.store(true, Ordering::Release);
+        let mut options = HashMap::new();
+        options.insert(
+            "mime_types",
+            Value::from(vec![
+                CLIPBOARD_TEXT_MIME.to_owned(),
+                CLIPBOARD_TEXT_UTF8_MIME.to_owned(),
+            ]),
+        );
+        // Selection ownership is the first external mutation, before Ctrl+V
+        // or its focus click. A lost reply cannot prove it did not happen.
+        progress.mark_started();
+        clipboard_call(
+            self.proxy
+                .call::<_, _, ()>("SetSelection", &(&self.session_path, options)),
+        )
+        .await?;
+        Ok(selection)
+    }
+
+    fn clear_active(&self) {
+        if let Ok(mut active) = self.state.active.lock() {
+            *active = None;
+        }
+    }
+
+    pub(crate) async fn clear_selection(&self) -> Result<(), String> {
+        self.clear_active();
+        if !self.needs_clear.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if *self.closed.borrow() {
+            self.needs_clear.store(false, Ordering::Release);
+            return Ok(());
+        }
+        let mut options = HashMap::new();
+        options.insert("mime_types", Value::from(Vec::<String>::new()));
+        let reply = clipboard_call(
+            self.proxy
+                .call_method("SetSelection", &(&self.session_path, options)),
+        )
+        .await?;
+        reply.body().deserialize::<()>().map_err(portal_error)?;
+        *self
+            .state
+            .cleared_through
+            .lock()
+            .expect("clipboard sequence mutex poisoned") = reply.recv_position();
+        self.needs_clear.store(false, Ordering::Release);
+        Ok(())
+    }
+}
+
+impl Drop for ClipboardController {
+    fn drop(&mut self) {
+        self.clear_active();
+        fail_active(&self.state, "portal clipboard responder stopped".into());
+        if let Ok(mut responder) = self.responder.lock()
+            && let Some(responder) = responder.take()
+        {
+            responder.abort();
+        }
+    }
+}
+
+impl ClipboardPaste {
+    pub(crate) async fn finish(mut self, dispatch: Result<(), String>) -> Result<(), String> {
+        let controller = Arc::clone(&self.controller);
+        let mut errors = Vec::new();
+        if let Err(error) = dispatch {
+            errors.push(error);
+        } else {
+            match self.completion.take() {
+                Some(completion) => {
+                    match tokio::time::timeout(CLIPBOARD_TRANSFER_TIMEOUT, completion).await {
+                        Ok(Ok(Ok(()))) => {}
+                        Ok(Ok(Err(error))) => errors.push(error),
+                        Ok(Err(_)) => {
+                            errors.push("portal clipboard transfer responder stopped".into())
+                        }
+                        Err(_) => errors.push("portal clipboard transfer timed out".into()),
+                    }
+                }
+                None => errors.push("portal clipboard completion was already consumed".into()),
+            }
+        }
+        if let Err(error) = controller.clear_selection().await {
+            errors.push(format!("portal clipboard cleanup failed: {error}"));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+}
+
+impl Drop for ClipboardPaste {
+    fn drop(&mut self) {
+        // Stop serving bytes immediately. The execution owner's cleanup_input
+        // awaits remote revocation, including cancellation during begin/finish.
+        self.controller.clear_active();
+    }
+}
+
+fn validate_clipboard_text(text: &str) -> Result<(), String> {
+    if text.is_empty() {
+        return Err("clipboard text must not be empty".into());
+    }
+    if text.contains('\0') {
+        return Err("clipboard text must not contain NUL".into());
+    }
+    if text.chars().count() > crate::validation::MAX_TEXT_LIMIT {
+        return Err(format!(
+            "clipboard text exceeds {} Unicode scalar values",
+            crate::validation::MAX_TEXT_LIMIT
+        ));
+    }
+    if text.len() > MAX_CLIPBOARD_BYTES {
+        return Err("clipboard text exceeds the bounded byte limit".into());
+    }
+    Ok(())
+}
+
+async fn clipboard_transfer_loop(
+    mut stream: MessageStream,
+    proxy: Proxy<'static>,
+    session_path: OwnedObjectPath,
+    state: Arc<ClipboardState>,
+    mut closed: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            changed = closed.changed() => {
+                if changed.is_err() || *closed.borrow() {
+                    fail_active(&state, "portal clipboard session closed".into());
+                    return;
+                }
+            }
+            message = stream.next() => {
+                let Some(message) = message else {
+                    fail_active(&state, "portal clipboard transfer stream ended".into());
+                    return;
+                };
+                let message = match message {
+                    Ok(message) => message,
+                    Err(error) => {
+                        fail_active(&state, format!("portal clipboard signal failed: {error}"));
+                        return;
+                    }
+                };
+                let (session, mime_type, serial): (OwnedObjectPath, String, u32) =
+                    match message.body().deserialize() {
+                        Ok(body) => body,
+                        Err(error) => {
+                            eprintln!("computer-use-mcp: invalid portal clipboard transfer signal: {error}");
+                            continue;
+                        }
+                    };
+                if session != session_path {
+                    continue;
+                }
+                let stale = message.recv_position() <= *state.cleared_through.lock()
+                    .expect("clipboard sequence mutex poisoned");
+                if stale {
+                    if let Err(error) = selection_write_done(proxy.clone(), session_path.clone(), serial, false).await {
+                        eprintln!("computer-use-mcp: stale clipboard transfer acknowledgment failed: {error}");
+                    }
+                    continue;
+                }
+                tokio::select! {
+                    biased;
+                    _ = closed.changed() => {
+                        fail_active(&state, "portal clipboard session closed".into());
+                        return;
+                    }
+                    () = respond_to_clipboard_transfer(&proxy, &session_path, &state, &mime_type, serial) => {}
+                }
+            }
+        }
+    }
+}
+
+async fn respond_to_clipboard_transfer(
+    proxy: &Proxy<'static>,
+    session_path: &OwnedObjectPath,
+    state: &ClipboardState,
+    mime_type: &str,
+    serial: u32,
+) {
+    let transfer = state.active.lock().ok().and_then(|mut active| {
+        let selection = active.as_mut()?;
+        if !matches!(mime_type, CLIPBOARD_TEXT_MIME | CLIPBOARD_TEXT_UTF8_MIME) {
+            return None;
+        }
+        Some((
+            Arc::clone(&selection.payload),
+            selection.cancel.subscribe(),
+            selection.completion.take(),
+        ))
+    });
+    let Some((payload, cancel, completion)) = transfer else {
+        if let Err(error) =
+            selection_write_done(proxy.clone(), session_path.clone(), serial, false).await
+        {
+            eprintln!(
+                "computer-use-mcp: rejected clipboard transfer acknowledgment failed: {error}"
+            );
+        }
+        return;
+    };
+    let result = finish_selection_transfer(
+        Ok(payload),
+        cancel,
+        |payload| selection_write_payload(proxy.clone(), session_path.clone(), serial, payload),
+        |success| selection_write_done(proxy.clone(), session_path.clone(), serial, success),
+    )
+    .await;
+    // The sender belongs to the selection captured above. A late response
+    // must never complete a newer paste after cancellation and cleanup.
+    if let Some(completion) = completion {
+        let _ = completion.send(result);
+    }
+}
+
+#[cfg(test)]
+fn selection_payload(state: &ClipboardState, mime_type: &str) -> Result<Arc<[u8]>, String> {
+    if !matches!(mime_type, CLIPBOARD_TEXT_MIME | CLIPBOARD_TEXT_UTF8_MIME) {
+        return Err("portal requested an unsupported clipboard MIME type".into());
+    }
+    let active = state
+        .active
+        .lock()
+        .map_err(|_| "portal clipboard state mutex poisoned".to_owned())?;
+    active
+        .as_ref()
+        .map(|selection| Arc::clone(&selection.payload))
+        .ok_or_else(|| "portal requested clipboard data without an active selection".into())
+}
+
+async fn write_clipboard_payload(
+    fd: zbus::zvariant::OwnedFd,
+    payload: Arc<[u8]>,
+) -> Result<(), String> {
+    let fd = OwnedFd::from(fd);
+    let flags = rustix::fs::fcntl_getfl(&fd).map_err(portal_error)?;
+    rustix::fs::fcntl_setfl(&fd, flags | OFlags::NONBLOCK).map_err(portal_error)?;
+    let fd = tokio::io::unix::AsyncFd::new(fd).map_err(portal_error)?;
+    let mut written = 0;
+    while written < payload.len() {
+        let mut ready = fd.writable().await.map_err(portal_error)?;
+        match ready.try_io(|fd| {
+            rustix::io::write(fd.get_ref(), &payload[written..]).map_err(std::io::Error::from)
+        }) {
+            Ok(Ok(0)) => return Err("portal clipboard payload write returned zero".into()),
+            Ok(Ok(count)) => written += count,
+            Ok(Err(error)) => {
+                return Err(format!("portal clipboard payload write failed: {error}"));
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(())
+}
+
+async fn selection_write_payload(
+    proxy: Proxy<'static>,
+    session_path: OwnedObjectPath,
+    serial: u32,
+    payload: Arc<[u8]>,
+) -> Result<(), String> {
+    let fd: zbus::zvariant::OwnedFd =
+        clipboard_call(proxy.call("SelectionWrite", &(&session_path, serial))).await?;
+    write_clipboard_payload(fd, payload).await
+}
+
+async fn selection_write_done(
+    proxy: Proxy<'static>,
+    session_path: OwnedObjectPath,
+    serial: u32,
+    success: bool,
+) -> Result<(), String> {
+    clipboard_call(proxy.call::<_, _, ()>("SelectionWriteDone", &(&session_path, serial, success)))
+        .await
+}
+
+async fn clipboard_call<T>(call: impl Future<Output = zbus::Result<T>>) -> Result<T, String> {
+    tokio::time::timeout(CLIPBOARD_CALL_TIMEOUT, call)
+        .await
+        .map_err(|_| "portal clipboard D-Bus call timed out".to_owned())?
+        .map_err(portal_error)
+}
+
+async fn finish_selection_transfer<W, WriteFuture, D, DoneFuture>(
+    payload: Result<Arc<[u8]>, String>,
+    mut cancel: watch::Receiver<bool>,
+    write: W,
+    done: D,
+) -> Result<(), String>
+where
+    W: FnOnce(Arc<[u8]>) -> WriteFuture,
+    WriteFuture: Future<Output = Result<(), String>>,
+    D: FnOnce(bool) -> DoneFuture,
+    DoneFuture: Future<Output = Result<(), String>>,
+{
+    let result = match payload {
+        Ok(payload) => tokio::select! {
+            biased;
+            _ = cancel.changed() => Err("portal clipboard transfer cancelled".into()),
+            result = tokio::time::timeout(CLIPBOARD_TRANSFER_TIMEOUT, write(payload)) => {
+                result.unwrap_or_else(|_| Err("portal clipboard payload transfer timed out".into()))
+            }
+        },
+        Err(error) => Err(error),
+    };
+    let done_result = done(result.is_ok()).await;
+    match done_result {
+        Ok(()) => result,
+        Err(error) => Err(match result {
+            Ok(()) => error,
+            Err(write_error) => format!("{write_error}; {error}"),
+        }),
+    }
+}
+
+fn complete_active(state: &ClipboardState, result: Result<(), String>) {
+    let sender = state.active.lock().ok().and_then(|mut active| {
+        active
+            .as_mut()
+            .and_then(|selection| selection.completion.take())
+    });
+    if let Some(sender) = sender {
+        let _ = sender.send(result);
+    }
+}
+
+fn fail_active(state: &ClipboardState, error: String) {
+    complete_active(state, Err(error));
+}
+
 impl std::fmt::Debug for PortalSessionLease {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -440,6 +997,7 @@ impl std::fmt::Debug for PortalSessionLease {
             .field("path", &self.path)
             .field("generation", &self.generation)
             .field("closed", &*self.closed.borrow())
+            .field("clipboard", &self.clipboard.is_some())
             .finish()
     }
 }
@@ -455,6 +1013,10 @@ impl PortalSessionLease {
 
     pub fn is_closed(&self) -> bool {
         *self.closed.borrow()
+    }
+
+    pub(crate) fn clipboard(&self) -> Option<Arc<ClipboardController>> {
+        self.clipboard.clone()
     }
 
     pub(crate) fn begin_eis_attempt(&self) -> Result<(), String> {
@@ -587,6 +1149,7 @@ impl PortalSessionLease {
                 closed,
                 closed_sender: sender.clone(),
                 connection: None,
+                clipboard: None,
                 input_state: Mutex::new(EisConnectionState::Available),
                 _close_guard: Mutex::new(CloseGuard::empty("portal session")),
                 _close_monitor: CloseMonitor(None),
@@ -692,6 +1255,11 @@ async fn select_sources(
     let mut request = RawRequest::new(connection, &token).await?;
     let mut options = HashMap::new();
     options.insert("handle_token", Value::from(token));
+    // Monitor capture with a single stream. The portal offers no per-monitor
+    // selection to the app (the user picks in the chooser) and xdp-kde does
+    // not attach routing metadata for a combined-desktop stream, so a
+    // per-monitor stream with mapping_id cannot be negotiated here; the EIS
+    // layer binds routes from whatever the approved stream carries instead.
     options.insert("types", Value::from(1_u32));
     options.insert("multiple", Value::from(false));
     options.insert(
@@ -707,22 +1275,46 @@ async fn select_sources(
     Ok(())
 }
 
+async fn request_clipboard(connection: &Connection, session_path: &str) -> Result<(), String> {
+    let proxy = Proxy::new(
+        connection,
+        PORTAL_DESTINATION,
+        PORTAL_OBJECT_PATH,
+        CLIPBOARD_INTERFACE,
+    )
+    .await
+    .map_err(portal_error)?;
+    let session = ObjectPath::try_from(session_path).map_err(portal_error)?;
+    let options: HashMap<&str, Value<'_>> = HashMap::new();
+    clipboard_call(proxy.call::<_, _, ()>("RequestClipboard", &(session, options))).await
+}
+
 async fn start_remote_desktop(
     connection: &Connection,
     remote: &RemoteDesktop,
     session_path: &str,
     closed: &watch::Receiver<bool>,
-) -> Result<HashMap<String, OwnedValue>, String> {
+) -> Result<HashMap<String, OwnedValue>, ApprovalError> {
     let token = random_token("start")?;
     let mut request = RawRequest::new(connection, &token).await?;
     let mut options = HashMap::new();
     options.insert("handle_token", Value::from(token));
     let path = ObjectPath::try_from(session_path).map_err(portal_error)?;
-    let returned: OwnedObjectPath = remote
-        .call("Start", &(path, "", options))
-        .await
-        .map_err(portal_error)?;
-    request.response(returned, "Start", closed).await
+    let result = consent_deadline(async {
+        let returned: OwnedObjectPath = remote
+            .call("Start", &(path, "", options))
+            .await
+            .map_err(portal_error)?;
+        request.response(returned, "Start", closed).await
+    })
+    .await;
+    match result {
+        Err(ApprovalError::Expired) => {
+            request.guard.close().await?;
+            Err(ApprovalError::Expired)
+        }
+        result => result,
+    }
 }
 
 struct RawRequest {
@@ -848,7 +1440,9 @@ fn classify_response(code: u32, operation: &str) -> Result<(), String> {
     match code {
         0 => Ok(()),
         1 => Err(format!("user cancelled portal {operation} consent")),
-        2 => Err(format!("user or portal denied portal {operation} consent")),
+        2 => Err(format!(
+            "portal {operation} interaction ended without approval (response 2; reason unspecified)"
+        )),
         other => Err(format!(
             "portal {operation} returned unknown response code {other}"
         )),
@@ -867,6 +1461,27 @@ struct CloseGuard {
 }
 
 impl CloseGuard {
+    async fn close(&mut self) -> Result<(), String> {
+        match &self.target {
+            Some(CloseTarget::Proxy(proxy)) => {
+                tokio::time::timeout(Duration::from_secs(2), proxy.call::<_, _, ()>("Close", &()))
+                    .await
+                    .map_err(|_| {
+                        "timed out closing portal interaction; automatic reprompt stopped"
+                            .to_owned()
+                    })?
+                    .map_err(portal_error)?;
+            }
+            #[cfg(test)]
+            Some(CloseTarget::Probe(probe)) => {
+                probe.fetch_add(1, Ordering::AcqRel);
+            }
+            None => {}
+        }
+        self.disarm();
+        Ok(())
+    }
+
     fn new(proxy: Proxy<'static>, label: &'static str) -> Self {
         Self {
             target: Some(CloseTarget::Proxy(proxy)),
@@ -1017,6 +1632,12 @@ fn parse_stream(
     mut properties: HashMap<String, OwnedValue>,
     screencast_version: u32,
 ) -> Result<PortalStream, String> {
+    // Raw routing properties in one log line so future multi-monitor
+    // diagnosis starts here: mapping_id/position/logical size decide how EIS
+    // regions bind (MappingId, ExactGeometry, or UniqueResumedRegion).
+    eprintln!(
+        "computer-use-mcp: ScreenCast stream {stream_index} raw properties: node_id={node_id} properties={properties:?}"
+    );
     let id = take_optional::<String>(&mut properties, "id")?;
     let mapping_id = take_optional::<String>(&mut properties, "mapping_id")?;
     let position = take_optional::<(i32, i32)>(&mut properties, "position")?;
@@ -1266,13 +1887,11 @@ fn open_private_directory(path: &Path, create: bool) -> Result<Option<File>, Str
     Ok(Some(directory))
 }
 
+/// Check the active session prerequisite before contacting its portal. A
+/// display name or socket alone does not establish isolation; the private
+/// session owner is responsible for the bus, portal and compositor routing.
 fn require_wayland() -> Result<(), String> {
-    if std::env::var("XDG_SESSION_TYPE").as_deref() != Ok("wayland")
-        || std::env::var_os("WAYLAND_DISPLAY").is_none()
-    {
-        return Err("capture requires the signed-in user's Linux Wayland session".into());
-    }
-    Ok(())
+    crate::session::require_active_session_from_env().map(|_| ())
 }
 
 fn portal_error(error: impl std::fmt::Display) -> String {
@@ -1292,6 +1911,65 @@ mod tests {
     use super::*;
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[tokio::test]
+    async fn consent_acknowledged_close_disarms_drop_cleanup() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut guard = CloseGuard {
+            target: Some(CloseTarget::Probe(Arc::clone(&count))),
+            label: "consent test",
+        };
+        guard.close().await.unwrap();
+        assert_eq!(count.load(AtomicOrdering::Acquire), 1);
+        drop(guard);
+        assert_eq!(count.load(AtomicOrdering::Acquire), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consent_expiration_reprompts_with_backoff_then_grants() {
+        let attempts = AtomicUsize::new(0);
+        let before = tokio::time::Instant::now();
+        let grant = retry_expired_approval(|| async {
+            match attempts.fetch_add(1, AtomicOrdering::AcqRel) {
+                0 | 1 => consent_deadline(std::future::pending()).await,
+                _ => Ok("approved"),
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(grant, "approved");
+        assert_eq!(attempts.load(AtomicOrdering::Acquire), 3);
+        assert_eq!(before.elapsed(), Duration::from_secs(93));
+    }
+
+    #[tokio::test]
+    async fn consent_explicit_cancel_and_unspecified_termination_do_not_reprompt() {
+        for code in [1, 2] {
+            let attempts = AtomicUsize::new(0);
+            let result = retry_expired_approval(|| async {
+                attempts.fetch_add(1, AtomicOrdering::AcqRel);
+                classify_response(code, "Start").map_err(ApprovalError::Terminal)
+            })
+            .await;
+            assert!(result.is_err());
+            assert_eq!(attempts.load(AtomicOrdering::Acquire), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consent_cancel_during_backoff_never_reprompts() {
+        let attempts = AtomicUsize::new(0);
+        {
+            let consent = retry_expired_approval(|| async {
+                attempts.fetch_add(1, AtomicOrdering::AcqRel);
+                Err::<(), _>(ApprovalError::Expired)
+            });
+            tokio::pin!(consent);
+            assert!(futures_util::poll!(&mut consent).is_pending());
+        }
+        tokio::time::advance(Duration::from_secs(100)).await;
+        assert_eq!(attempts.load(AtomicOrdering::Acquire), 1);
+    }
 
     fn temp_directory(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1321,7 +1999,7 @@ mod tests {
         assert!(
             classify_response(2, "Start")
                 .unwrap_err()
-                .contains("denied")
+                .contains("reason unspecified")
         );
         assert!(
             classify_response(9, "Start")
@@ -1514,5 +2192,168 @@ mod tests {
         let exhausted = AtomicU64::new(u64::MAX);
         assert!(next_session_generation(&exhausted).is_err());
         assert_eq!(exhausted.load(AtomicOrdering::Acquire), u64::MAX);
+    }
+
+    #[test]
+    fn clipboard_payload_validation_is_bounded_and_rejects_control_data() {
+        assert!(validate_clipboard_text("hello").is_ok());
+        assert!(validate_clipboard_text("").is_err());
+        assert!(validate_clipboard_text("bad\0text").is_err());
+        let too_long = "x".repeat(crate::validation::MAX_TEXT_LIMIT + 1);
+        assert!(validate_clipboard_text(&too_long).is_err());
+    }
+
+    #[tokio::test]
+    async fn clipboard_transfer_state_accepts_only_supported_mime_and_completes_once() {
+        let state = ClipboardState {
+            active: Mutex::new(None),
+            cleared_through: Mutex::new(Default::default()),
+        };
+        let (sender, receiver) = oneshot::channel();
+        *state.active.lock().unwrap() = Some(ActiveClipboardSelection {
+            payload: Arc::from(b"session-bound payload".as_slice()),
+            completion: Some(sender),
+            cancel: watch::channel(false).0,
+        });
+
+        assert_eq!(
+            selection_payload(&state, CLIPBOARD_TEXT_MIME)
+                .unwrap()
+                .as_ref(),
+            b"session-bound payload"
+        );
+        assert!(selection_payload(&state, "image/png").is_err());
+
+        complete_active(&state, Ok(()));
+        assert_eq!(receiver.await.unwrap(), Ok(()));
+        complete_active(&state, Err("late transfer".into()));
+    }
+
+    #[tokio::test]
+    async fn mocked_clipboard_transfer_writes_before_reporting_done() {
+        let (_cancel, cancelled) = watch::channel(false);
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let write_trace = Arc::clone(&trace);
+        let done_trace = Arc::clone(&trace);
+        let result = finish_selection_transfer(
+            Ok(Arc::from(b"payload".as_slice())),
+            cancelled,
+            move |payload| async move {
+                assert_eq!(payload.as_ref(), b"payload");
+                write_trace.lock().unwrap().push("SelectionWrite");
+                write_trace.lock().unwrap().push("payload write");
+                Ok(())
+            },
+            move |success| async move {
+                assert!(success);
+                done_trace.lock().unwrap().push("SelectionWriteDone");
+                Ok(())
+            },
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            *trace.lock().unwrap(),
+            ["SelectionWrite", "payload write", "SelectionWriteDone"]
+        );
+    }
+
+    #[tokio::test]
+    async fn clipboard_cancelled_transfer_reports_failure_and_drops_writer() {
+        let (cancel, cancelled) = watch::channel(false);
+        let entered = tokio::sync::Notify::new();
+        let (dropped, mut writer_dropped) = oneshot::channel::<()>();
+        let transfer = finish_selection_transfer(
+            Ok(Arc::from(b"payload".as_slice())),
+            cancelled,
+            |_| async {
+                let _held_until_drop = dropped;
+                entered.notify_one();
+                std::future::pending::<Result<(), String>>().await
+            },
+            |success| async move {
+                assert!(!success);
+                Ok(())
+            },
+        );
+        let (result, ()) = tokio::join!(transfer, async {
+            entered.notified().await;
+            drop(cancel);
+        });
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert_eq!(
+            writer_dropped.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clipboard_transfer_timeout_after_completed_shortcut_remains_an_error() {
+        let progress = crate::runtime::ActionProgress::default();
+        progress.mark_started();
+        progress.mark_completed();
+        let (_cancel, cancelled) = watch::channel(false);
+        let result = finish_selection_transfer(
+            Ok(Arc::from(b"payload".as_slice())),
+            cancelled,
+            |_| std::future::pending::<Result<(), String>>(),
+            |success| async move {
+                assert!(!success);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.unwrap_err().contains("timed out"));
+        assert_eq!(
+            progress.snapshot().outcome(),
+            crate::errors::ToolOutcome::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn clipboard_late_done_failure_is_not_success() {
+        let (_cancel, cancelled) = watch::channel(false);
+        let result = finish_selection_transfer(
+            Ok(Arc::from(b"payload".as_slice())),
+            cancelled,
+            |_| async { Ok(()) },
+            |success| async move {
+                assert!(success);
+                Err("late acknowledgment failure".into())
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), "late acknowledgment failure");
+    }
+
+    #[tokio::test]
+    async fn clipboard_cancelled_pipe_write_closes_fd_without_late_bytes() {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        let mut filled = 0;
+        loop {
+            match writer.write(&[0; 8192]) {
+                Ok(count) => filled += count,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("filling clipboard pipe: {error}"),
+            }
+        }
+        let fd: OwnedFd = writer.into();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                write_clipboard_payload(fd.into(), Arc::from(b"late bytes".as_slice())),
+            )
+            .await
+            .is_err()
+        );
+        reader
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes.len(), filled);
+        assert!(bytes.iter().all(|byte| *byte == 0));
     }
 }

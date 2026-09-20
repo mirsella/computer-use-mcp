@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, future::Future};
 
-use atspi::{CoordType, Interface};
+use atspi::{CoordType, Interface, InterfaceSet};
 use atspi_proxies::{
     accessible::AccessibleProxy,
     action::ActionProxy,
@@ -19,6 +19,7 @@ use crate::{
         NodeCapabilities, NodeInfo, ObjectId, Rect, SemanticAction, WindowInfo,
     },
     errors::RuntimeError,
+    validation::MAX_TEXT_LIMIT,
 };
 
 #[derive(Debug, Default)]
@@ -321,7 +322,7 @@ impl AtspiAdapter {
             Some(interfaces) => NodeCapabilities::Inspected(InspectedCapabilities {
                 actions,
                 component: has_component,
-                editable_text: interfaces.contains(Interface::EditableText),
+                editable_text: has_text_editing_interfaces(&interfaces),
                 value: has_value,
             }),
             None => NodeCapabilities::InspectionFailed,
@@ -350,27 +351,60 @@ impl AtspiAdapter {
         match action {
             SemanticAction::InvokeAction(index) => {
                 let proxy = action_proxy(connection, object).await?;
-                if !proxy.do_action(index).await.map_err(atspi_call_error)? {
-                    return Err(runtime_error("AT-SPI action reported failure"));
-                }
+                reported_ok(
+                    proxy.do_action(index).await.map_err(atspi_call_error)?,
+                    "AT-SPI action reported failure",
+                )?;
             }
             SemanticAction::GrabFocus => {
                 let proxy = component_proxy(connection, object).await?;
-                if !proxy.grab_focus().await.map_err(atspi_call_error)? {
-                    return Err(runtime_error("AT-SPI Component.GrabFocus reported failure"));
-                }
+                reported_ok(
+                    proxy.grab_focus().await.map_err(atspi_call_error)?,
+                    "AT-SPI Component.GrabFocus reported failure",
+                )?;
             }
             SemanticAction::ReplaceText(value) => {
-                let proxy = editable_text_proxy(connection, object).await?;
-                if !proxy
-                    .set_text_contents(&value)
-                    .await
-                    .map_err(atspi_call_error)?
-                {
-                    return Err(runtime_error(
-                        "AT-SPI EditableText replacement reported failure",
-                    ));
-                }
+                let component = component_proxy(connection, object).await?;
+                let editable = editable_text_proxy(connection, object).await?;
+                let text = text_proxy(connection, object).await?;
+                replace_text_with_fallback(
+                    &value,
+                    || async { component.grab_focus().await.map_err(atspi_call_error) },
+                    || async {
+                        editable
+                            .set_text_contents(&value)
+                            .await
+                            .map_err(atspi_call_error)
+                    },
+                    || read_full_text(&text),
+                    {
+                        let editable = editable.clone();
+                        move |count| {
+                            let editable = editable.clone();
+                            async move {
+                                editable
+                                    .delete_text(0, count)
+                                    .await
+                                    .map_err(atspi_call_error)
+                            }
+                        }
+                    },
+                    {
+                        let editable = editable.clone();
+                        let value = value.clone();
+                        move |length| {
+                            let editable = editable.clone();
+                            let value = value.clone();
+                            async move {
+                                editable
+                                    .insert_text(0, &value, length)
+                                    .await
+                                    .map_err(atspi_call_error)
+                            }
+                        }
+                    },
+                )
+                .await?;
             }
             SemanticAction::SetNumericValue(value) => {
                 value_proxy(connection, object)
@@ -602,6 +636,123 @@ fn bounded_text_end(count: i32, text_limit: usize) -> Option<(i32, bool)> {
     })
 }
 
+fn has_text_editing_interfaces(interfaces: &InterfaceSet) -> bool {
+    interfaces.contains(Interface::Component)
+        && interfaces.contains(Interface::Text)
+        && interfaces.contains(Interface::EditableText)
+}
+
+pub(crate) struct TextReadback {
+    pub(crate) actual: String,
+    pub(crate) character_count: i32,
+    pub(crate) truncated: bool,
+}
+
+pub(crate) async fn replace_text_with_fallback<G, GF, S, SF, R, RF, D, DF, I, IF>(
+    expected: &str,
+    mut grab_focus: G,
+    mut set_text: S,
+    mut read_text: R,
+    mut delete_text: D,
+    mut insert_text: I,
+) -> Result<(), RuntimeError>
+where
+    G: FnMut() -> GF,
+    GF: Future<Output = Result<bool, RuntimeError>>,
+    S: FnMut() -> SF,
+    SF: Future<Output = Result<bool, RuntimeError>>,
+    R: FnMut() -> RF,
+    RF: Future<Output = Result<TextReadback, RuntimeError>>,
+    D: FnMut(i32) -> DF,
+    DF: Future<Output = Result<bool, RuntimeError>>,
+    I: FnMut(i32) -> IF,
+    IF: Future<Output = Result<bool, RuntimeError>>,
+{
+    reported_ok(
+        grab_focus().await?,
+        "AT-SPI Component.GrabFocus reported failure before text replacement; refusing to set text on an unfocused element",
+    )?;
+    reported_ok(
+        set_text().await?,
+        "AT-SPI EditableText replacement reported failure",
+    )?;
+
+    let readback = read_text().await?;
+    if !readback.truncated
+        && check_text_replacement(expected, &readback.actual, readback.character_count).is_ok()
+    {
+        return Ok(());
+    }
+    if readback.truncated || readback.character_count < 0 {
+        return Err(text_replacement_error(readback.character_count));
+    }
+
+    let insert_length = i32::try_from(expected.len())
+        .map_err(|_| runtime_error("AT-SPI replacement text is too large to insert"))?;
+    reported_ok(
+        delete_text(readback.character_count).await?,
+        "AT-SPI EditableText delete reported failure",
+    )?;
+    reported_ok(
+        insert_text(insert_length).await?,
+        "AT-SPI EditableText insert reported failure",
+    )?;
+    let readback = read_text().await?;
+    if readback.truncated {
+        return Err(text_replacement_error(readback.character_count));
+    }
+    check_text_replacement(expected, &readback.actual, readback.character_count)
+}
+
+/// Fail closed when a text replacement cannot be proven: an ignored write
+/// still reports success, so the fresh read-back must equal the request.
+/// A negative provider count can never match, so it is unverified too.
+fn check_text_replacement(
+    expected: &str,
+    actual: &str,
+    character_count: i32,
+) -> Result<(), RuntimeError> {
+    if character_count < 0
+        || usize::try_from(character_count).ok() != Some(expected.chars().count())
+        || actual != expected
+    {
+        return Err(text_replacement_error(character_count));
+    }
+    Ok(())
+}
+
+fn text_replacement_error(character_count: i32) -> RuntimeError {
+    runtime_error(format!(
+        "AT-SPI text replacement unverified (character_count={character_count})"
+    ))
+}
+
+/// A D-Bus write that reports failure as `false` instead of erroring must
+/// fail the action explicitly rather than continuing silently.
+fn reported_ok(ok: bool, message: &str) -> Result<(), RuntimeError> {
+    if ok {
+        Ok(())
+    } else {
+        Err(runtime_error(message))
+    }
+}
+
+/// Fresh full-text read-back: the only proof a replacement landed, since an
+/// ignored write still reports success.
+async fn read_full_text(text: &TextProxy<'_>) -> Result<TextReadback, RuntimeError> {
+    let count = text.character_count().await.map_err(atspi_call_error)?;
+    let (end, source_truncated) = bounded_text_end(count, MAX_TEXT_LIMIT).ok_or_else(|| {
+        runtime_error("AT-SPI Text.CharacterCount was negative; replacement cannot be verified")
+    })?;
+    let actual = text.get_text(0, end).await.map_err(atspi_call_error)?;
+    let (actual, provider_truncated) = limit_metadata_with_truncation(actual, MAX_TEXT_LIMIT);
+    Ok(TextReadback {
+        actual,
+        character_count: count,
+        truncated: source_truncated || provider_truncated,
+    })
+}
+
 async fn read_value_metadata(connection: &Connection, object: &ObjectId) -> Option<String> {
     let proxy = optional(
         object,
@@ -681,9 +832,12 @@ fn runtime_error(message: impl Into<String>) -> RuntimeError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::{
-        AtspiAdapter, bounded_selection_end, bounded_text_end, limit_metadata_with_truncation,
-        optional,
+        AtspiAdapter, TextReadback, bounded_selection_end, bounded_text_end,
+        check_text_replacement, has_text_editing_interfaces, limit_metadata_with_truncation,
+        optional, replace_text_with_fallback,
     };
     use crate::accessibility::{AccessibilityAdapter, ObjectId};
 
@@ -737,6 +891,159 @@ mod tests {
         assert_eq!(value, "A😀");
         assert!(!source_truncated);
         assert!(provider_truncated);
+    }
+
+    #[test]
+    fn text_replacement_verify_passes_on_exact_read_back() {
+        assert!(
+            check_text_replacement("https://mail.proton.me", "https://mail.proton.me", 22).is_ok()
+        );
+        assert!(check_text_replacement("", "", 0).is_ok());
+    }
+
+    #[test]
+    fn text_replacement_requires_component_text_and_editable_text() {
+        assert!(has_text_editing_interfaces(&atspi::InterfaceSet::new(
+            atspi::Interface::Component | atspi::Interface::Text | atspi::Interface::EditableText,
+        )));
+        assert!(!has_text_editing_interfaces(&atspi::InterfaceSet::new(
+            atspi::Interface::Text | atspi::Interface::EditableText,
+        )));
+    }
+
+    #[tokio::test]
+    async fn text_replacement_orchestration_orders_fallback_and_uses_utf8_length() {
+        let steps = Arc::new(Mutex::new(Vec::new()));
+        let actual = Arc::new(Mutex::new(String::new()));
+        let insert_lengths = Arc::new(Mutex::new(Vec::new()));
+        let expected = "λ🙂";
+
+        replace_text_with_fallback(
+            expected,
+            {
+                let steps = Arc::clone(&steps);
+                move || {
+                    let steps = Arc::clone(&steps);
+                    async move {
+                        steps.lock().unwrap().push("focus");
+                        Ok(true)
+                    }
+                }
+            },
+            {
+                let steps = Arc::clone(&steps);
+                move || {
+                    let steps = Arc::clone(&steps);
+                    async move {
+                        steps.lock().unwrap().push("set");
+                        Ok(true)
+                    }
+                }
+            },
+            {
+                let steps = Arc::clone(&steps);
+                let actual = Arc::clone(&actual);
+                move || {
+                    let steps = Arc::clone(&steps);
+                    let actual = Arc::clone(&actual);
+                    async move {
+                        steps.lock().unwrap().push("verify");
+                        let actual = actual.lock().unwrap().clone();
+                        Ok(TextReadback {
+                            character_count: actual.chars().count() as i32,
+                            actual,
+                            truncated: false,
+                        })
+                    }
+                }
+            },
+            {
+                let steps = Arc::clone(&steps);
+                move |_count| {
+                    let steps = Arc::clone(&steps);
+                    async move {
+                        steps.lock().unwrap().push("delete_insert");
+                        Ok(true)
+                    }
+                }
+            },
+            {
+                let steps = Arc::clone(&steps);
+                let actual = Arc::clone(&actual);
+                let insert_lengths = Arc::clone(&insert_lengths);
+                move |length| {
+                    let steps = Arc::clone(&steps);
+                    let actual = Arc::clone(&actual);
+                    let insert_lengths = Arc::clone(&insert_lengths);
+                    async move {
+                        steps.lock().unwrap().push("insert");
+                        insert_lengths.lock().unwrap().push(length);
+                        *actual.lock().unwrap() = expected.to_owned();
+                        Ok(true)
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *steps.lock().unwrap(),
+            [
+                "focus",
+                "set",
+                "verify",
+                "delete_insert",
+                "insert",
+                "verify"
+            ]
+        );
+        assert_eq!(*insert_lengths.lock().unwrap(), [expected.len() as i32]);
+    }
+
+    #[tokio::test]
+    async fn text_replacement_rejects_truncated_final_readback() {
+        let mut reads = vec![
+            TextReadback {
+                actual: String::new(),
+                character_count: 0,
+                truncated: false,
+            },
+            TextReadback {
+                actual: "x".into(),
+                character_count: 1,
+                truncated: true,
+            },
+        ];
+        let error = replace_text_with_fallback(
+            "x",
+            || async { Ok(true) },
+            || async { Ok(true) },
+            || std::future::ready(Ok(reads.remove(0))),
+            |_count| async { Ok(true) },
+            |_length| async { Ok(true) },
+        )
+        .await
+        .expect_err("truncated readback must not prove replacement");
+
+        assert_eq!(
+            error.message,
+            "AT-SPI text replacement unverified (character_count=1)"
+        );
+    }
+
+    #[test]
+    fn text_replacement_verify_fails_closed_on_mismatch() {
+        // The live symptom: the write reports success but the URL bar still
+        // reads back empty. That must surface as an error, never completion.
+        let error = check_text_replacement("https://mail.proton.me", "", 0)
+            .expect_err("mismatch must fail");
+        assert_eq!(error.code, "backend_failed");
+        assert!(error.message.contains("AT-SPI text replacement unverified"));
+        assert!(!error.message.contains("https://mail.proton.me"));
+        // A negative provider count can never prove the text landed.
+        assert!(check_text_replacement("x", "x", -1).is_err());
+        assert!(check_text_replacement("x", "y", 1).is_err());
     }
 
     #[tokio::test]

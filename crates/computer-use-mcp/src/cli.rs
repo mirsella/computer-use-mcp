@@ -1,6 +1,5 @@
 use std::{
     io::{Read, Write},
-    sync::Arc,
     time::Duration,
 };
 
@@ -12,12 +11,10 @@ use crate::{
     atspi_adapter::AtspiAdapter,
     errors::CliError,
     portal::{PortalApproval, PortalBackend, XdgPortalBackend, validate_capabilities},
-    runtime::{ActionProgress, DesktopRuntime, tool_error_result, with_action_progress},
     server,
-    validation::validate_call,
 };
 
-const HELP: &str = "Computer Use MCP for Linux Wayland\n\nUsage:\n  computer-use-mcp [command]\n\nCommands:\n  init          Ask KDE to approve one monitor and save its restore token.\n  mcp           Start stdio immediately and initialize KDE capture in the background.\n  call FILE     Execute one call object or an array of calls in one stateful runtime; use - for stdin.\n  doctor        Report Wayland, portal, PipeWire, AT-SPI, and input prerequisites without prompting.\n  help          Show this help.\n  version       Print the CLI version.\n\nCall input uses {\"name\":\"list_desktop\",\"arguments\":{\"scope\":\"windows\"}} objects and prints one standard MCP result per line. Run init only to approve KDE access separately before enabling the MCP. KDE may ask again after revocation or display changes.\n";
+const HELP: &str = "Computer Use MCP for Linux Wayland\n\nUsage:\n  computer-use-mcp [command]\n\nCommands:\n  init          Ask KDE to approve one monitor and save its restore token.\n  mcp           Serve stdio with lazy foreground and private background desktops.\n  call FILE     Execute a call object or an array through one stateful desktop broker; use - for stdin.\n  doctor        Report Wayland, portal, PipeWire, AT-SPI, and input prerequisites without prompting.\n  help          Show this help.\n  version       Print the CLI version.\n\nCall input uses {\"name\":\"list_desktop\",\"arguments\":{\"scope\":\"windows\",\"desktop\":\"background\"}} objects and prints one standard MCP result per line. Discovery and launch accept desktop=foreground or background; returned IDs route later calls. Each CLI batch owns its sessions until exit. Run init only to approve foreground KDE access separately. KDE may ask again after revocation or display changes.\n";
 
 pub async fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), CliError> {
     let arguments: Vec<_> = arguments.into_iter().collect();
@@ -83,6 +80,21 @@ pub async fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), CliE
             require_no_extra_arguments(&arguments)?;
             server::serve_stdio().await
         }
+        "__desktop_worker" => {
+            require_no_extra_arguments(&arguments)?;
+            server::serve_worker_stdio().await
+        }
+        "__background_worker" => {
+            require_no_extra_arguments(&arguments)?;
+            let session = crate::session::describe_session_from_env();
+            if !session.isolated {
+                return Err(CliError::Mcp(format!(
+                    "background worker isolation verification failed: {}",
+                    session.isolation_reason
+                )));
+            }
+            server::serve_worker_stdio().await
+        }
         unknown => Err(CliError::InvalidCommand(unknown.to_owned())),
     }
 }
@@ -119,68 +131,33 @@ async fn run_calls(source: &str) -> Result<(), CliError> {
         ));
     }
 
-    let runtime = server::production_runtime();
+    let broker = crate::broker::DesktopBroker::new()?;
     let result = {
         let stdout = std::io::stdout();
-        execute_calls(runtime.as_ref(), calls, &mut stdout.lock()).await
+        execute_broker_calls(&broker, calls, &mut stdout.lock()).await
     };
-    let shutdown = runtime
-        .shutdown()
-        .await
-        .map_err(|error| CliError::Mcp(format!("direct-call shutdown failed: {error}")));
-    match (result, shutdown) {
-        (Ok(()), shutdown) => shutdown,
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(shutdown)) => {
-            eprintln!("computer-use-mcp: {shutdown}");
-            Err(error)
-        }
-    }
+    broker.shutdown().await;
+    result
 }
 
-async fn execute_calls<R: DesktopRuntime, W: Write>(
-    runtime: &R,
+async fn execute_broker_calls<W: Write>(
+    broker: &crate::broker::DesktopBroker,
     calls: Vec<Value>,
     output: &mut W,
 ) -> Result<(), CliError> {
     for (index, value) in calls.into_iter().enumerate() {
-        let number = index + 1;
         let (name, arguments) = parse_call(value, index)?;
-        let call = validate_call(&name, arguments).map_err(|error| {
-            CliError::InvalidArguments(format!("call {number} ({name}) is invalid: {error}"))
-        })?;
-        let progress = call
-            .tracks_action()
-            .then(|| Arc::new(ActionProgress::default()));
-        let (result, failed) = match runtime.execute(call, progress.clone()).await {
-            Ok(output) => {
-                let output = if let Some(progress) = progress.as_deref() {
-                    output.with_action_progress(progress)
-                } else {
-                    output
-                };
-                (output.into_mcp_result(), false)
-            }
-            Err(error) => {
-                let error = match progress.as_deref() {
-                    Some(progress) => with_action_progress(error, progress),
-                    None => error,
-                };
-                (tool_error_result(&error), true)
-            }
-        };
-        serde_json::to_writer(&mut *output, &result).map_err(|error| {
-            CliError::Mcp(format!("failed to write direct-call result: {error}"))
-        })?;
-        output.write_all(b"\n").map_err(|error| {
-            CliError::Mcp(format!("failed to write direct-call result: {error}"))
-        })?;
-        output.flush().map_err(|error| {
-            CliError::Mcp(format!("failed to flush direct-call result: {error}"))
-        })?;
-        if failed {
+        let result = broker.call(&name, arguments, std::future::pending()).await;
+        serde_json::to_writer(&mut *output, &result)
+            .map_err(|error| CliError::Mcp(format!("failed to write call result: {error}")))?;
+        output
+            .write_all(b"\n")
+            .and_then(|_| output.flush())
+            .map_err(|error| CliError::Mcp(format!("failed to flush call result: {error}")))?;
+        if result.is_error == Some(true) {
             return Err(CliError::Mcp(format!(
-                "call {number} ({name}) failed; remaining calls were not executed"
+                "call {} ({name}) failed; remaining calls were not executed",
+                index + 1
             )));
         }
     }
@@ -222,10 +199,9 @@ async fn doctor() {
     println!("Computer Use MCP doctor");
     println!("This check never opens a portal session or prompts for consent.");
 
+    let session = crate::session::describe_session_from_env();
     let session_type = std::env::var("XDG_SESSION_TYPE").ok();
-    let display = std::env::var("WAYLAND_DISPLAY")
-        .ok()
-        .filter(|value| !value.is_empty());
+    let display = session.display.clone();
     let wayland_ready = session_type.as_deref() == Some("wayland") && display.is_some();
     println!("\n[Wayland session]");
     print_doctor_status(wayland_ready);
@@ -234,8 +210,33 @@ async fn doctor() {
         session_type.as_deref().unwrap_or("<unset>")
     );
     println!("Display: {}", display.as_deref().unwrap_or("<unset>"));
+    match session.socket.as_ref() {
+        Some(socket) => println!(
+            "Socket: {} ({})",
+            socket.display(),
+            if session.socket_present {
+                "present"
+            } else {
+                "MISSING"
+            }
+        ),
+        None => println!("Socket: <unresolvable>"),
+    }
+    println!(
+        "Session isolation: {} ({})",
+        if session.isolated {
+            "ISOLATED virtual session"
+        } else {
+            "SHARED physical session"
+        },
+        session.isolation_reason
+    );
     if !wayland_ready {
-        println!("Action: run this command inside a KDE Plasma Wayland login session.");
+        println!("Action: run this command inside a KDE Plasma Wayland login session,");
+        println!("or start an isolated virtual session with scripts/run-isolated-session.sh.");
+    } else if !session.socket_present {
+        println!("Action: the display socket is missing; re-enter the Wayland session or");
+        println!("start an isolated virtual session with scripts/run-isolated-session.sh.");
     }
 
     println!("\n[Accessibility (AT-SPI)]");
@@ -284,10 +285,69 @@ async fn doctor() {
     println!("\n[PipeWire]");
     print_doctor_result(check_pipewire());
 
+    // Read-only KWin virtual-desktop probe: snapshot only, never switches.
+    // Fail-closed: a missing session bus reports UNAVAILABLE with its reason.
+    println!("\n[Virtual desktop (KWin)]");
+    match crate::virtual_desktop::VirtualDesktopProvider::live()
+        .snapshot()
+        .await
+    {
+        Some(Ok(snapshot)) => {
+            print_doctor_status(true);
+            println!("Current: {}", snapshot.summary_text());
+            println!("Desktops: {}", snapshot.count);
+        }
+        Some(Err(error)) => {
+            print_doctor_status(false);
+            println!("Detail: {error}");
+        }
+        None => {
+            print_doctor_status(false);
+            println!("Detail: virtual desktop provider is disabled");
+        }
+    }
+
     println!("\n[Portal approval and EIS input]");
     println!("Status: NOT TESTED");
     println!("Reason: verifying monitor approval and EIS routing would require consent.");
     println!("Action: run `computer-use-mcp init`, then use the MCP server.");
+
+    println!("\n[Human takeover]");
+    let takeover_file = crate::takeover::takeover_file_path_from_env();
+    let takeover_armed = crate::takeover::takeover_requested();
+    println!(
+        "Status: {}",
+        if takeover_armed {
+            "TAKEOVER REQUESTED"
+        } else {
+            "clear (no handoff signal)"
+        }
+    );
+    match takeover_file.as_ref() {
+        Some(path) => println!("Handoff file: {}", path.display()),
+        None => println!("Handoff file: <none: set COMPUTER_USE_MCP_TAKEOVER_FILE>"),
+    }
+    println!("Env override: COMPUTER_USE_MCP_TAKEOVER (1 forces handoff)");
+    match crate::takeover::hardware_watcher_status() {
+        crate::takeover::HardwareWatcherStatus::Watching { devices } => println!(
+            "Physical input watcher: watching {devices} input device(s) via /dev/input \
+             (requires input group membership)"
+        ),
+        crate::takeover::HardwareWatcherStatus::Disabled { reason } => {
+            println!("Physical input watcher: disabled ({reason})");
+        }
+    }
+    if crate::takeover::device_paths_from_env().is_none() {
+        println!(
+            "Device override: COMPUTER_USE_MCP_INPUT_DEVICES (colon-separated paths, for tests)"
+        );
+    }
+    println!("InputCapture portal monitoring: not used (pointer-barrier capture API, wrong tool);");
+    println!("EIS physical-modifier refusals still surface as UserTakeoverInterrupted.");
+    if takeover_armed {
+        println!("Action: act and wait_for will refuse with UserTakeoverInterrupted until");
+        println!("the handoff signal is cleared; held input is released first.");
+    }
 }
 
 fn print_doctor_result<T, E: std::fmt::Display>(result: Result<T, E>) {
@@ -328,58 +388,21 @@ fn require_no_extra_arguments(arguments: &[String]) -> Result<(), CliError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use serde_json::json;
 
     use super::*;
-    use crate::{errors::RuntimeError, runtime::ToolOutput, validation::ToolCall};
-
-    struct FakeRuntime {
-        calls: Mutex<Vec<ToolCall>>,
-        fail_at: Option<usize>,
-    }
-
-    impl DesktopRuntime for FakeRuntime {
-        async fn execute(
-            &self,
-            call: ToolCall,
-            _progress: Option<Arc<ActionProgress>>,
-        ) -> Result<ToolOutput, RuntimeError> {
-            let mut calls = self.calls.lock().unwrap();
-            calls.push(call);
-            if self.fail_at == Some(calls.len()) {
-                Err(RuntimeError::not_started(
-                    "planned_failure",
-                    "planned failure",
-                ))
-            } else {
-                Ok(ToolOutput::text(format!("call {}", calls.len())))
-            }
-        }
-
-        async fn cleanup(
-            &self,
-            _progress: Option<Arc<ActionProgress>>,
-        ) -> Result<(), RuntimeError> {
-            Ok(())
-        }
-    }
+    use crate::validation::validate_call;
 
     #[tokio::test]
-    async fn direct_calls_share_one_runtime_and_stop_after_an_error() {
-        let runtime = FakeRuntime {
-            calls: Mutex::new(Vec::new()),
-            fail_at: Some(2),
-        };
+    async fn direct_calls_stop_after_a_broker_validation_error() {
+        let broker = crate::broker::DesktopBroker::new().unwrap();
         let calls = vec![
-            json!({"name":"list_desktop","arguments":{"scope":"windows"}}),
-            json!({"name":"list_desktop","arguments":{"scope":"windows"}}),
-            json!({"name":"list_desktop","arguments":{"scope":"windows"}}),
+            json!({"name":"list_desktop","arguments":{"scope":"windows","desktop":"invalid"}}),
+            json!({"name":"list_desktop","arguments":{"scope":"windows","desktop":"background"}}),
         ];
         let mut output = Vec::new();
 
-        let error = execute_calls(&runtime, calls, &mut output)
+        let error = execute_broker_calls(&broker, calls, &mut output)
             .await
             .unwrap_err();
 
@@ -388,15 +411,15 @@ mod tests {
                 .to_string()
                 .contains("remaining calls were not executed")
         );
-        assert_eq!(runtime.calls.lock().unwrap().len(), 2);
         let results = String::from_utf8(output).unwrap();
         let results = results
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0]["isError"], false);
-        assert_eq!(results[1]["isError"], true);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["isError"], true);
+        assert_eq!(results[0]["structuredContent"]["code"], "invalid_arguments");
+        broker.shutdown().await;
     }
 
     #[test]

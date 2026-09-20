@@ -15,6 +15,35 @@ use crate::accessibility::{AppInfo, WindowInfo};
 
 pub const KDE_RICH_ENV: &str = "COMPUTER_USE_MCP_KDE_WINDOW_MANAGEMENT";
 
+/// Substrings (case-insensitive) identifying protected system surfaces such as
+/// privilege-escalation prompts, permission portals, password askers, screen
+/// lockers, and pinentry dialogs. Matched against app ID, title, and resource
+/// name. Titles, app IDs, and resource names are descriptive only and never
+/// target keys; they are used here solely as a fail-closed refusal signal.
+pub const PROTECTED_SURFACE_PATTERNS: &[&str] = &[
+    "org.kde.polkit-kde-authentication-agent-1",
+    "org.freedesktop.impl.portal.desktop.kde",
+    "systemd-ask-password",
+    "org.kde.kscreenlocker",
+    "pinentry",
+];
+
+/// Returns true when any of the descriptive surface fields matches a known
+/// protected-surface pattern (substring, ASCII case-insensitive).
+pub fn is_protected_surface(
+    app_id: Option<&str>,
+    title: &str,
+    resource_name: Option<&str>,
+) -> bool {
+    fn matches(value: &str) -> bool {
+        let lowered = value.to_ascii_lowercase();
+        PROTECTED_SURFACE_PATTERNS
+            .iter()
+            .any(|pattern| lowered.contains(pattern))
+    }
+    app_id.is_some_and(matches) || matches(title) || resource_name.is_some_and(matches)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BackendKind {
     Atspi,
@@ -165,6 +194,9 @@ pub struct BackendWindow {
     pub source: BackendKind,
     pub capabilities: WindowCapabilities,
     pub atspi: Option<AtspiBinding>,
+    /// True when descriptive surface fields match a known protected-surface
+    /// pattern (polkit, sudo/password askers, screen locker, pinentry).
+    pub is_protected_surface: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,6 +237,9 @@ pub struct WindowEntry {
     pub source: BackendKind,
     pub capabilities: WindowCapabilities,
     pub atspi: Option<AtspiBinding>,
+    /// Mirrors the backend record flag; mutations targeting such entries are
+    /// refused before dispatch with `ProtectedSurfaceRefused`.
+    pub is_protected_surface: bool,
 }
 
 impl WindowEntry {
@@ -236,6 +271,7 @@ impl WindowEntry {
                 "kind": self.source.as_str(),
             },
             "capabilities": self.capabilities.as_json(),
+            "is_protected_surface": self.is_protected_surface,
         })
     }
 }
@@ -371,6 +407,15 @@ impl WindowCatalog {
                     pid: record.pid,
                 },
             );
+            // Recompute from descriptive fields so a record built without the
+            // flag is still refused; OR with the supplied flag for backends
+            // that already classified the surface.
+            let is_protected_surface = record.is_protected_surface
+                || is_protected_surface(
+                    record.app_id.as_deref(),
+                    record.title.as_str(),
+                    record.resource_name.as_deref(),
+                );
             let entry = WindowEntry {
                 target: WindowTarget {
                     app_instance_id,
@@ -388,6 +433,7 @@ impl WindowCatalog {
                 source: record.source,
                 capabilities: record.capabilities,
                 atspi: record.atspi,
+                is_protected_surface,
             };
             next_entries.insert(entry.target.clone(), entry.clone());
             entries.push(entry);
@@ -439,6 +485,11 @@ impl WindowCatalog {
                     app: app.clone(),
                     window: window.clone(),
                 }),
+                is_protected_surface: is_protected_surface(
+                    Some(&app.name),
+                    window.title.as_str(),
+                    None,
+                ),
             })
         });
         self.reconcile(atspi.chain(compositor))
@@ -449,6 +500,12 @@ impl WindowCatalog {
             .get(target)
             .cloned()
             .ok_or_else(|| CatalogError::StaleTarget(target.clone()))
+    }
+
+    /// Borrow all live entries. Used by catalog-scoped waits that match on
+    /// backend-reported identity rather than an exact opaque target.
+    pub fn entries(&self) -> impl Iterator<Item = &WindowEntry> {
+        self.entries.values()
     }
 }
 
@@ -544,7 +601,76 @@ mod tests {
                 WindowCapabilities::foreign_toplevel()
             },
             atspi: None,
+            is_protected_surface: false,
         }
+    }
+
+    #[test]
+    fn protected_surfaces_match_known_patterns_case_insensitively() {
+        assert!(is_protected_surface(
+            Some("org.kde.polkit-kde-authentication-agent-1"),
+            "Authentication",
+            None,
+        ));
+        assert!(is_protected_surface(
+            Some("org.freedesktop.impl.portal.desktop.kde"),
+            "Permission",
+            None,
+        ));
+        assert!(is_protected_surface(
+            None,
+            "systemd-ask-password prompt",
+            None,
+        ));
+        assert!(is_protected_surface(
+            None,
+            "Screen locker",
+            Some("org.kde.kscreenlocker"),
+        ));
+        assert!(is_protected_surface(None, "PINENTRY dialog", None));
+        assert!(is_protected_surface(
+            Some("ORG.KDE.POLKIT-KDE-AUTHENTICATION-AGENT-1"),
+            "x",
+            None,
+        ));
+        assert!(!is_protected_surface(
+            Some("org.example.App"),
+            "Ordinary window",
+            None,
+        ));
+        assert!(!is_protected_surface(None, "", None));
+    }
+
+    #[test]
+    fn protected_flag_propagates_through_reconcile_and_serializes() {
+        let mut catalog = WindowCatalog::default();
+        let mut polkit = record(
+            BackendKind::ForeignToplevel,
+            "app-polkit",
+            "win-polkit",
+            "Authentication Required",
+        );
+        polkit.app_id = Some("org.kde.polkit-kde-authentication-agent-1".into());
+        // Leave the stored flag false: reconcile must recompute it from the
+        // descriptive fields rather than trusting the record.
+        let entries = catalog.reconcile([polkit]).unwrap();
+        assert!(entries[0].is_protected_surface);
+        let json = entries[0].as_json();
+        assert_eq!(json["is_protected_surface"], serde_json::Value::Bool(true));
+
+        let ordinary = catalog
+            .reconcile([record(
+                BackendKind::ForeignToplevel,
+                "app-plain",
+                "win-plain",
+                "Editor",
+            )])
+            .unwrap();
+        assert!(!ordinary[0].is_protected_surface);
+        assert_eq!(
+            ordinary[0].as_json()["is_protected_surface"],
+            serde_json::Value::Bool(false)
+        );
     }
 
     #[test]

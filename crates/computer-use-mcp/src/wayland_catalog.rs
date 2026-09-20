@@ -218,6 +218,11 @@ impl ForeignToplevelReducer {
                 source: BackendKind::ForeignToplevel,
                 capabilities: WindowCapabilities::foreign_toplevel(),
                 atspi: None,
+                is_protected_surface: crate::window_backend::is_protected_surface(
+                    properties.app_id.as_deref(),
+                    properties.title.as_str(),
+                    None,
+                ),
             });
         }
         Ok(result)
@@ -406,6 +411,11 @@ impl KdeRichReducer {
                 source: BackendKind::KdePlasma,
                 capabilities: WindowCapabilities::kde_rich(),
                 atspi: None,
+                is_protected_surface: crate::window_backend::is_protected_surface(
+                    record.app_id.as_deref(),
+                    record.title.as_str(),
+                    record.resource_name.as_deref(),
+                ),
             })
             .collect()
     }
@@ -594,6 +604,7 @@ struct ProtocolState {
     kde_manager: Option<OrgKdePlasmaWindowManagement>,
     snapshot: CompositorSnapshot,
     activation: Option<ActivationWait>,
+    pending_window_requests: Vec<PendingWindowRequest>,
     initial_sync: Option<wl_callback::WlCallback>,
     initial_done: bool,
 }
@@ -602,6 +613,11 @@ struct ActivationWait {
     tracker: ActivationTracker,
     reply: oneshot::Sender<Result<(), BackendError>>,
     dispatched: bool,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct PendingWindowRequest {
+    reply: oneshot::Sender<Result<(), BackendError>>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -640,6 +656,7 @@ impl ProtocolState {
                 },
             },
             activation: None,
+            pending_window_requests: Vec::new(),
             initial_sync: None,
             initial_done: false,
         }
@@ -682,6 +699,7 @@ impl ProtocolState {
     fn fail_kde(&mut self, reason: impl Into<String>) {
         let reason = reason.into();
         self.snapshot.kde = BackendStatus::Unavailable(reason.clone());
+        fail_pending_window_requests(self, reason.clone());
         if let Some(activation) = self.activation.take() {
             let _ = activation.reply.send(Err(BackendError::Unknown(format!(
                 "KDE activation outcome is unknown after backend failure: {reason}"
@@ -707,6 +725,28 @@ impl ProtocolState {
         }
         destroy_foreign_resources(self);
         destroy_kde_resources(self);
+    }
+}
+
+fn fail_pending_window_requests(state: &mut ProtocolState, reason: String) {
+    for request in state.pending_window_requests.drain(..) {
+        let _ = request.reply.send(Err(BackendError::Unknown(format!(
+            "KDE window request outcome is unknown after backend failure: {reason}"
+        ))));
+    }
+}
+
+fn finish_pending_window_requests(state: &mut ProtocolState, result: Result<(), BackendError>) {
+    for request in state.pending_window_requests.drain(..) {
+        let outcome = if request.cancel.load(std::sync::atomic::Ordering::Acquire) {
+            Err(BackendError::Unknown(
+                "KDE window request was cancelled after protocol dispatch; outcome is unknown"
+                    .into(),
+            ))
+        } else {
+            result.clone()
+        };
+        let _ = request.reply.send(outcome);
     }
 }
 
@@ -1105,6 +1145,29 @@ enum WaylandCommand {
         reply: oneshot::Sender<Result<(), BackendError>>,
         cancel: Arc<std::sync::atomic::AtomicBool>,
     },
+    SetMinimized {
+        uuid: String,
+        minimized: bool,
+        reply: oneshot::Sender<Result<(), BackendError>>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    },
+    SetMaximized {
+        uuid: String,
+        maximized: bool,
+        reply: oneshot::Sender<Result<(), BackendError>>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    },
+    SetFullscreen {
+        uuid: String,
+        fullscreen: bool,
+        reply: oneshot::Sender<Result<(), BackendError>>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    },
+    Close {
+        uuid: String,
+        reply: oneshot::Sender<Result<(), BackendError>>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    },
     Shutdown(oneshot::Sender<Result<(), BackendError>>),
 }
 
@@ -1113,6 +1176,14 @@ impl WaylandCatalog {
         Self {
             standard: Arc::new(BackendThread::start(ProtocolBackend::Standard)),
             kde: Arc::new(BackendThread::start(ProtocolBackend::Kde)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            standard: Arc::new(BackendThread::disabled()),
+            kde: Arc::new(BackendThread::disabled()),
         }
     }
 
@@ -1130,6 +1201,53 @@ impl WaylandCatalog {
         self.kde.begin_activation(uuid, timeout)
     }
 
+    /// Request a minimized state change on the KDE thread.
+    pub async fn set_minimized(&self, uuid: String, minimized: bool) -> Result<(), BackendError> {
+        self.kde
+            .window_request(|reply, cancel| WaylandCommand::SetMinimized {
+                uuid,
+                minimized,
+                reply,
+                cancel,
+            })
+            .await
+    }
+
+    /// Request a maximized state change on the KDE thread.
+    pub async fn set_maximized(&self, uuid: String, maximized: bool) -> Result<(), BackendError> {
+        self.kde
+            .window_request(|reply, cancel| WaylandCommand::SetMaximized {
+                uuid,
+                maximized,
+                reply,
+                cancel,
+            })
+            .await
+    }
+
+    /// Request a fullscreen state change on the KDE thread.
+    pub async fn set_fullscreen(&self, uuid: String, fullscreen: bool) -> Result<(), BackendError> {
+        self.kde
+            .window_request(|reply, cancel| WaylandCommand::SetFullscreen {
+                uuid,
+                fullscreen,
+                reply,
+                cancel,
+            })
+            .await
+    }
+
+    /// Request a window close on the KDE thread.
+    pub async fn close_window(&self, uuid: String) -> Result<(), BackendError> {
+        self.kde
+            .window_request(|reply, cancel| WaylandCommand::Close {
+                uuid,
+                reply,
+                cancel,
+            })
+            .await
+    }
+
     pub async fn shutdown(&self) -> Result<(), BackendError> {
         let standard = self.standard.shutdown().await;
         let kde = self.kde.shutdown().await;
@@ -1144,6 +1262,18 @@ impl WaylandCatalog {
 }
 
 impl BackendThread {
+    #[cfg(test)]
+    fn disabled() -> Self {
+        let (command, receiver) = std::sync::mpsc::channel();
+        drop(receiver);
+        Self {
+            command,
+            wake: None,
+            join: Arc::new(Mutex::new(None)),
+            done: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+
     fn start(backend: ProtocolBackend) -> Self {
         let (command, receiver) = std::sync::mpsc::channel();
         let join = Arc::new(Mutex::new(None));
@@ -1256,7 +1386,48 @@ impl BackendThread {
         })
     }
 
+    /// Send a fire-and-verify window state command (minimize, maximize,
+    /// fullscreen, close) and wait for the bounded thread reply. Unlike
+    /// activation there is no post-dispatch event verification here; callers
+    /// confirm the outcome with a follow-up snapshot.
+    async fn window_request(
+        &self,
+        build: impl FnOnce(
+            oneshot::Sender<Result<(), BackendError>>,
+            Arc<std::sync::atomic::AtomicBool>,
+        ) -> WaylandCommand,
+    ) -> Result<(), BackendError> {
+        let (reply, result) = oneshot::channel();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let Some(cancellation) = self.wake.as_ref().map(|wake| WindowCancellation {
+            cancel: Arc::clone(&cancel),
+            wake: Arc::clone(wake),
+        }) else {
+            return Err(BackendError::Unavailable(
+                "Wayland catalog wake channel is unavailable".into(),
+            ));
+        };
+        if let Err(error) = self.send_with_wake(build(reply, cancel), false) {
+            drop(cancellation);
+            return Err(error);
+        }
+        let result = match tokio::time::timeout(Duration::from_secs(3), result).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => Err(BackendError::Unavailable(
+                "Wayland catalog thread stopped".into(),
+            )),
+            Err(_) => Err(BackendError::Unavailable(
+                "Wayland window command exceeded its bounded deadline".into(),
+            )),
+        };
+        drop(cancellation);
+        result
+    }
+
     async fn shutdown(&self) -> Result<(), BackendError> {
+        if self.thread_finished() {
+            return self.join_bounded(Duration::from_secs(1)).await;
+        }
         let (reply, result) = oneshot::channel();
         let command_result = match self.send(WaylandCommand::Shutdown(reply)) {
             Err(error) => Err(error),
@@ -1413,6 +1584,26 @@ struct ActivationCancellation {
     wake: Arc<Mutex<UnixStream>>,
 }
 
+struct WindowCancellation {
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    wake: Arc<Mutex<UnixStream>>,
+}
+
+impl Drop for WindowCancellation {
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+        match self.wake.lock() {
+            Ok(mut wake) => {
+                let _ = wake.write(&[1]);
+            }
+            Err(_) => {
+                eprintln!("computer-use-mcp: window command cancellation wake mutex was poisoned")
+            }
+        }
+    }
+}
+
 pub(crate) struct PendingActivation {
     result: oneshot::Receiver<Result<(), BackendError>>,
     cancellation: Option<ActivationCancellation>,
@@ -1556,7 +1747,11 @@ fn drain_without_wayland(
             Ok(WaylandCommand::Snapshot(reply)) => {
                 let _ = reply.send(Ok(snapshot.clone()));
             }
-            Ok(WaylandCommand::Activate { reply, .. }) => {
+            Ok(WaylandCommand::Activate { reply, .. })
+            | Ok(WaylandCommand::SetMinimized { reply, .. })
+            | Ok(WaylandCommand::SetMaximized { reply, .. })
+            | Ok(WaylandCommand::SetFullscreen { reply, .. })
+            | Ok(WaylandCommand::Close { reply, .. }) => {
                 let _ = reply.send(Err(error.clone()));
             }
             Ok(WaylandCommand::Shutdown(reply)) => {
@@ -1842,13 +2037,16 @@ fn flush_with_deadline(runtime: &mut ProtocolRuntime) -> Result<(), BackendError
                 &mut runtime.state,
                 "KDE activation was cancelled before request flush",
             );
-            return Ok(());
+            if runtime.state.pending_window_requests.is_empty() {
+                return Ok(());
+            }
         }
         match runtime.connection.flush() {
             Ok(()) => {
                 if let Some(activation) = &mut runtime.state.activation {
                     activation.dispatched = true;
                 }
+                finish_pending_window_requests(&mut runtime.state, Ok(()));
                 return Ok(());
             }
             Err(wayland_backend::client::WaylandError::Io(error))
@@ -1869,6 +2067,13 @@ fn flush_with_deadline(runtime: &mut ProtocolRuntime) -> Result<(), BackendError
                         );
                         return Ok(());
                     }
+                    finish_pending_window_requests(
+                        &mut runtime.state,
+                        Err(BackendError::Unknown(
+                            "KDE window request could not be flushed before its bounded deadline"
+                                .into(),
+                        )),
+                    );
                     return Err(BackendError::Unavailable(
                         "Wayland request flush remained blocked past its bounded deadline".into(),
                     ));
@@ -1887,6 +2092,13 @@ fn flush_with_deadline(runtime: &mut ProtocolRuntime) -> Result<(), BackendError
                             );
                             return Ok(());
                         }
+                        finish_pending_window_requests(
+                            &mut runtime.state,
+                            Err(BackendError::Unknown(
+                                "KDE window request could not be flushed before its bounded deadline"
+                                    .into(),
+                            )),
+                        );
                         return Err(BackendError::Unavailable(
                             "Wayland request flush remained blocked past its bounded deadline"
                                 .into(),
@@ -1902,6 +2114,12 @@ fn flush_with_deadline(runtime: &mut ProtocolRuntime) -> Result<(), BackendError
                 }
             }
             Err(error) => {
+                finish_pending_window_requests(
+                    &mut runtime.state,
+                    Err(BackendError::Unknown(format!(
+                        "KDE window request flush failed after dispatch began: {error}"
+                    ))),
+                );
                 if runtime.state.activation.is_some() {
                     expire_activation(
                         &mut runtime.state,
@@ -2032,6 +2250,71 @@ fn fail_protocol_runtime(runtime: &mut ProtocolRuntime, reason: impl Into<String
     }
 }
 
+/// Resolve a KDE UUID to its protocol object id, mirroring the activation
+/// arm's presence checks without touching the activation tracker. State and
+/// close commands never contend with a pending activation verification.
+fn find_kde_window_protocol_id(state: &ProtocolState, uuid: &str) -> Result<u32, BackendError> {
+    if state.kde_manager.is_none() {
+        return Err(BackendError::Unsupported(
+            "KDE rich window management is not available".into(),
+        ));
+    }
+    state
+        .kde_windows
+        .iter()
+        .find(|(id, mapped_uuid)| mapped_uuid.as_str() == uuid && !state.kde_unmapped.contains(id))
+        .map(|(id, _)| *id)
+        .ok_or_else(|| BackendError::Stale(format!("KDE UUID {uuid:?} is no longer present")))
+}
+
+fn kde_window_proxy(
+    state: &ProtocolState,
+    protocol_id: u32,
+) -> Result<&OrgKdePlasmaWindow, BackendError> {
+    state.kde_proxies.get(&protocol_id).ok_or_else(|| {
+        eprintln!(
+            "computer-use-mcp: KDE catalog invariant missing proxy for protocol id {protocol_id}"
+        );
+        BackendError::Unavailable("KDE window proxy is unavailable".into())
+    })
+}
+
+fn set_kde_window_state(
+    state: &mut ProtocolState,
+    uuid: &str,
+    flag: u32,
+    enabled: bool,
+) -> Result<(), BackendError> {
+    let protocol_id = find_kde_window_protocol_id(state, uuid)?;
+    let window = kde_window_proxy(state, protocol_id)?;
+    let (flags, state) = if enabled { (flag, flag) } else { (flag, 0) };
+    window.set_state(flags, state);
+    Ok(())
+}
+
+fn close_kde_window(state: &mut ProtocolState, uuid: &str) -> Result<(), BackendError> {
+    let protocol_id = find_kde_window_protocol_id(state, uuid)?;
+    let window = kde_window_proxy(state, protocol_id)?;
+    window.close();
+    Ok(())
+}
+
+fn queue_window_request(
+    state: &mut ProtocolState,
+    reply: oneshot::Sender<Result<(), BackendError>>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    outcome: Result<(), BackendError>,
+) {
+    match outcome {
+        Ok(()) => state
+            .pending_window_requests
+            .push(PendingWindowRequest { reply, cancel }),
+        Err(error) => {
+            let _ = reply.send(Err(error));
+        }
+    }
+}
+
 fn process_commands(
     receiver: &std::sync::mpsc::Receiver<WaylandCommand>,
     runtime: &mut ProtocolRuntime,
@@ -2117,6 +2400,72 @@ fn process_commands(
                     dispatched: false,
                     cancel,
                 });
+            }
+            WaylandCommand::SetMinimized {
+                uuid,
+                minimized,
+                reply,
+                cancel,
+            } => {
+                if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                    let _ = reply.send(Err(BackendError::Unavailable(
+                        "KDE window request was cancelled before dispatch".into(),
+                    )));
+                    continue;
+                }
+                let outcome =
+                    set_kde_window_state(&mut runtime.state, &uuid, KDE_STATE_MINIMIZED, minimized);
+                queue_window_request(&mut runtime.state, reply, cancel, outcome);
+            }
+            WaylandCommand::SetMaximized {
+                uuid,
+                maximized,
+                reply,
+                cancel,
+            } => {
+                if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                    let _ = reply.send(Err(BackendError::Unavailable(
+                        "KDE window request was cancelled before dispatch".into(),
+                    )));
+                    continue;
+                }
+                let outcome =
+                    set_kde_window_state(&mut runtime.state, &uuid, KDE_STATE_MAXIMIZED, maximized);
+                queue_window_request(&mut runtime.state, reply, cancel, outcome);
+            }
+            WaylandCommand::SetFullscreen {
+                uuid,
+                fullscreen,
+                reply,
+                cancel,
+            } => {
+                if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                    let _ = reply.send(Err(BackendError::Unavailable(
+                        "KDE window request was cancelled before dispatch".into(),
+                    )));
+                    continue;
+                }
+                let outcome = set_kde_window_state(
+                    &mut runtime.state,
+                    &uuid,
+                    KDE_STATE_FULLSCREEN,
+                    fullscreen,
+                );
+                queue_window_request(&mut runtime.state, reply, cancel, outcome);
+            }
+            WaylandCommand::Close {
+                uuid,
+                reply,
+                cancel,
+            } => {
+                if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                    let _ = reply.send(Err(BackendError::Unavailable(
+                        "KDE window request was cancelled before dispatch".into(),
+                    )));
+                    continue;
+                }
+                let outcome = close_kde_window(&mut runtime.state, &uuid);
+                queue_window_request(&mut runtime.state, reply, cancel, outcome);
             }
             WaylandCommand::Shutdown(reply) => {
                 runtime.state.shutdown_resources();
@@ -2510,6 +2859,23 @@ mod tests {
         assert!(error.to_string().contains("panicked"));
     }
 
+    #[tokio::test]
+    async fn shutdown_joins_finished_backend_before_waking_it() {
+        let (command, receiver) = std::sync::mpsc::channel();
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        let join = Arc::new(Mutex::new(Some(thread::spawn(|| {}))));
+        let backend = BackendThread {
+            command,
+            wake: Some(Arc::new(Mutex::new(writer))),
+            join,
+            done: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+
+        backend.shutdown().await.unwrap();
+        assert!(receiver.try_recv().is_err());
+    }
+
     #[test]
     fn queued_activation_with_failed_wake_is_unknown() {
         let (command, receiver) = std::sync::mpsc::channel();
@@ -2550,5 +2916,327 @@ mod tests {
         drop(peer);
         let error = connection.flush().unwrap_err();
         assert!(error.to_string().contains("I/O") || error.to_string().contains("Broken pipe"));
+    }
+
+    fn window_command_thread() -> (
+        BackendThread,
+        std::sync::mpsc::Receiver<WaylandCommand>,
+        UnixStream,
+    ) {
+        let (command, receiver) = std::sync::mpsc::channel();
+        let (reader, writer) = UnixStream::pair().unwrap();
+        let backend = BackendThread {
+            command,
+            wake: Some(Arc::new(Mutex::new(writer))),
+            join: Arc::new(Mutex::new(None)),
+            done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        (backend, receiver, reader)
+    }
+
+    fn uncancelled() -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::new(std::sync::atomic::AtomicBool::new(false))
+    }
+
+    #[test]
+    fn window_state_commands_route_uuid_and_flag_to_the_kde_thread() {
+        let (backend, receiver, _wake_reader) = window_command_thread();
+        let (min_reply, _min_result) = oneshot::channel();
+        backend
+            .send(WaylandCommand::SetMinimized {
+                uuid: "u-min".into(),
+                minimized: true,
+                reply: min_reply,
+                cancel: uncancelled(),
+            })
+            .unwrap();
+        let (max_reply, _max_result) = oneshot::channel();
+        backend
+            .send(WaylandCommand::SetMaximized {
+                uuid: "u-max".into(),
+                maximized: false,
+                reply: max_reply,
+                cancel: uncancelled(),
+            })
+            .unwrap();
+        let (full_reply, _full_result) = oneshot::channel();
+        backend
+            .send(WaylandCommand::SetFullscreen {
+                uuid: "u-full".into(),
+                fullscreen: true,
+                reply: full_reply,
+                cancel: uncancelled(),
+            })
+            .unwrap();
+        let (close_reply, _close_result) = oneshot::channel();
+        backend
+            .send(WaylandCommand::Close {
+                uuid: "u-close".into(),
+                reply: close_reply,
+                cancel: uncancelled(),
+            })
+            .unwrap();
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(WaylandCommand::SetMinimized { uuid, minimized: true, .. }) if uuid == "u-min"
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(WaylandCommand::SetMaximized { uuid, maximized: false, .. }) if uuid == "u-max"
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(WaylandCommand::SetFullscreen { uuid, fullscreen: true, .. }) if uuid == "u-full"
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(WaylandCommand::Close { uuid, .. }) if uuid == "u-close"
+        ));
+    }
+
+    #[test]
+    fn failed_backend_rejects_window_state_commands_with_its_error() {
+        type StateCommandBuilder = fn(oneshot::Sender<Result<(), BackendError>>) -> WaylandCommand;
+        let builders: [StateCommandBuilder; 4] = [
+            |reply| WaylandCommand::SetMinimized {
+                uuid: "u".into(),
+                minimized: true,
+                reply,
+                cancel: uncancelled(),
+            },
+            |reply| WaylandCommand::SetMaximized {
+                uuid: "u".into(),
+                maximized: true,
+                reply,
+                cancel: uncancelled(),
+            },
+            |reply| WaylandCommand::SetFullscreen {
+                uuid: "u".into(),
+                fullscreen: true,
+                reply,
+                cancel: uncancelled(),
+            },
+            |reply| WaylandCommand::Close {
+                uuid: "u".into(),
+                reply,
+                cancel: uncancelled(),
+            },
+        ];
+        for build in builders {
+            let (command, receiver) = std::sync::mpsc::channel();
+            let (reply, result) = oneshot::channel();
+            command.send(build(reply)).unwrap();
+            drop(command);
+            let (mut reader, writer) = UnixStream::pair().unwrap();
+            // Drop the wake writer so the drain's blocking wake read observes
+            // EOF instead of waiting for a byte no sender will ever write.
+            drop(writer);
+            drain_without_wayland(
+                receiver,
+                &mut reader,
+                ProtocolBackend::Kde,
+                BackendError::Unavailable("test backend is down".into()),
+            )
+            .unwrap();
+            assert!(matches!(
+                result.blocking_recv(),
+                Ok(Err(BackendError::Unavailable(reason))) if reason.contains("test backend is down")
+            ));
+        }
+    }
+
+    #[test]
+    fn window_state_commands_require_the_kde_manager() {
+        let mut state = ProtocolState::new(ProtocolBackend::Kde);
+        assert!(matches!(
+            set_kde_window_state(&mut state, "u1", KDE_STATE_MINIMIZED, true),
+            Err(BackendError::Unsupported(_))
+        ));
+        assert!(matches!(
+            set_kde_window_state(&mut state, "u1", KDE_STATE_MAXIMIZED, false),
+            Err(BackendError::Unsupported(_))
+        ));
+        assert!(matches!(
+            set_kde_window_state(&mut state, "u1", KDE_STATE_FULLSCREEN, true),
+            Err(BackendError::Unsupported(_))
+        ));
+        assert!(matches!(
+            close_kde_window(&mut state, "u1"),
+            Err(BackendError::Unsupported(_))
+        ));
+    }
+
+    fn write_registry_global(stream: &mut UnixStream, registry_id: u32) {
+        let interface = b"org_kde_plasma_window_management";
+        let interface_size = (interface.len() + 1 + 3) & !3;
+        let size = 8 + 4 + 4 + interface_size + 4;
+        let mut message = Vec::with_capacity(size);
+        message.extend_from_slice(&registry_id.to_ne_bytes());
+        message.extend_from_slice(&((size as u32) << 16).to_ne_bytes());
+        message.extend_from_slice(&1u32.to_ne_bytes());
+        message.extend_from_slice(&((interface.len() + 1) as u32).to_ne_bytes());
+        message.extend_from_slice(interface);
+        message.push(0);
+        message.resize(message.len() + interface_size - interface.len() - 1, 0);
+        message.extend_from_slice(&18u32.to_ne_bytes());
+        stream.write_all(&message).unwrap();
+    }
+
+    fn read_wayland_request(stream: &mut UnixStream) -> (u32, u16, Vec<u8>) {
+        let mut header = [0; 8];
+        stream.read_exact(&mut header).unwrap();
+        let object_id = u32::from_ne_bytes(header[..4].try_into().unwrap());
+        let word = u32::from_ne_bytes(header[4..].try_into().unwrap());
+        let size = (word >> 16) as usize;
+        let opcode = (word & 0xffff) as u16;
+        let mut payload = vec![0; size - 8];
+        stream.read_exact(&mut payload).unwrap();
+        (object_id, opcode, payload)
+    }
+
+    fn kde_window_socket_fixture() -> (Connection, ProtocolState, UnixStream, u32) {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let connection = Connection::from_socket(client).unwrap();
+        let mut queue: EventQueue<ProtocolState> = connection.new_event_queue();
+        let qh = queue.handle();
+        let registry = connection.display().get_registry(&qh, ());
+        connection.flush().unwrap();
+        let (display_id, _, _) = read_wayland_request(&mut server);
+        assert_eq!(display_id, connection.display().id().protocol_id());
+        write_registry_global(&mut server, registry.id().protocol_id());
+
+        let mut state = ProtocolState::new(ProtocolBackend::Kde);
+        queue.blocking_dispatch(&mut state).unwrap();
+        let manager = registry.bind::<OrgKdePlasmaWindowManagement, _, _>(1, 18, &qh, ());
+        let window = manager.get_window_by_uuid("uuid-1".into(), &qh, "uuid-1".into());
+        let protocol_id = window.id().protocol_id();
+        state.kde_manager = Some(manager);
+        state.kde_windows.insert(protocol_id, "uuid-1".into());
+        state.kde_proxies.insert(protocol_id, window);
+        (connection, state, server, protocol_id)
+    }
+
+    #[test]
+    fn kde_set_state_wire_arguments_use_flags_as_mask_and_state_as_value() {
+        let (connection, mut state, mut server, window_id) = kde_window_socket_fixture();
+        assert!(set_kde_window_state(&mut state, "uuid-1", KDE_STATE_MINIMIZED, true).is_ok());
+        connection.flush().unwrap();
+        loop {
+            let (object_id, opcode, payload) = read_wayland_request(&mut server);
+            if object_id == window_id && opcode == 0 {
+                assert_eq!(payload, [0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,]);
+                break;
+            }
+        }
+
+        assert!(set_kde_window_state(&mut state, "uuid-1", KDE_STATE_MINIMIZED, false).is_ok());
+        connection.flush().unwrap();
+        loop {
+            let (object_id, opcode, payload) = read_wayland_request(&mut server);
+            if object_id == window_id && opcode == 0 {
+                assert_eq!(payload, [0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,]);
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_queued_window_request_is_not_dispatched_or_completed() {
+        let (connection, state, mut server, _) = kde_window_socket_fixture();
+        let queue = connection.new_event_queue();
+        let (command, receiver) = std::sync::mpsc::channel();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (reply, result) = oneshot::channel();
+        command
+            .send(WaylandCommand::SetMinimized {
+                uuid: "uuid-1".into(),
+                minimized: true,
+                reply,
+                cancel,
+            })
+            .unwrap();
+        let mut runtime = ProtocolRuntime {
+            connection,
+            queue,
+            state,
+        };
+        assert!(process_commands(&receiver, &mut runtime));
+        assert!(runtime.state.pending_window_requests.is_empty());
+        assert!(matches!(
+            result.blocking_recv(),
+            Ok(Err(BackendError::Unavailable(reason))) if reason.contains("cancelled before dispatch")
+        ));
+        server
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
+        let mut byte = [0; 1];
+        assert!(matches!(
+            server.read(&mut byte),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut
+        ));
+    }
+
+    #[test]
+    fn window_request_reply_waits_for_flush_and_cancel_after_dispatch_is_unknown() {
+        let (connection, state, mut server, window_id) = kde_window_socket_fixture();
+        let queue = connection.new_event_queue();
+        let (command, receiver) = std::sync::mpsc::channel();
+        let cancel = uncancelled();
+        let (reply, mut result) = oneshot::channel();
+        command
+            .send(WaylandCommand::SetMinimized {
+                uuid: "uuid-1".into(),
+                minimized: true,
+                reply,
+                cancel: Arc::clone(&cancel),
+            })
+            .unwrap();
+        let mut runtime = ProtocolRuntime {
+            connection,
+            queue,
+            state,
+        };
+        assert!(process_commands(&receiver, &mut runtime));
+        assert!(matches!(
+            result.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        runtime.connection.flush().unwrap();
+        loop {
+            let (object_id, opcode, _) = read_wayland_request(&mut server);
+            if object_id == window_id && opcode == 0 {
+                break;
+            }
+        }
+        finish_pending_window_requests(&mut runtime.state, Ok(()));
+        assert!(matches!(result.blocking_recv(), Ok(Ok(()))));
+
+        let cancel = uncancelled();
+        let (reply, result) = oneshot::channel();
+        let (command, receiver) = std::sync::mpsc::channel();
+        command
+            .send(WaylandCommand::SetMinimized {
+                uuid: "uuid-1".into(),
+                minimized: false,
+                reply,
+                cancel: Arc::clone(&cancel),
+            })
+            .unwrap();
+        assert!(process_commands(&receiver, &mut runtime));
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        runtime.connection.flush().unwrap();
+        loop {
+            let (object_id, opcode, _) = read_wayland_request(&mut server);
+            if object_id == window_id && opcode == 0 {
+                break;
+            }
+        }
+        finish_pending_window_requests(&mut runtime.state, Ok(()));
+        assert!(matches!(
+            result.blocking_recv(),
+            Ok(Err(BackendError::Unknown(reason))) if reason.contains("cancelled after protocol dispatch")
+        ));
     }
 }

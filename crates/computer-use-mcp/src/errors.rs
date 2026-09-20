@@ -67,6 +67,20 @@ impl RuntimeError {
         )
     }
 
+    /// Refusal when a human takes over physical input during an agent
+    /// session. Returned before any further dispatch (or mapped from an EIS
+    /// physical-modifier refusal) with outcome NotStarted so agents stop and
+    /// hand off instead of retrying against the user.
+    pub(crate) fn user_takeover() -> Self {
+        Self::new(
+            "UserTakeoverInterrupted",
+            "human input takeover detected; further agent dispatch was interrupted; inspect action progress for dispatch and cleanup status",
+            ToolOutcome::NotStarted,
+            false,
+            "Stop: do not retry. Ask the user whether to resume or hand off. Resume requires the user to clear any cooperative takeover signal and restart the MCP after authorizing resume, then obtain a fresh observation. Restart does not undo dispatched input.",
+        )
+    }
+
     pub fn new(
         code: &'static str,
         message: impl Into<String>,

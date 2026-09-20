@@ -7,20 +7,21 @@ use crate::{
     accessibility::{ObjectId, Snapshot},
     capture::{CaptureBackend, CaptureSession, FrameMetadata, OwnedFrame, PipeWireCapture},
     encoder,
+    geometry::window_crop_in_frame,
     input::{
         GeneratedInputAction,
         backend::{ActionProgress, InputBackend, InputError},
-        coordinates::ValidatedMapping,
+        coordinates::{StreamExtent, ValidatedMapping},
         eis::ReisInputBackend,
         keyboard_input, pointer,
     },
     portal::{PortalBackend, PortalSessionLease, PortalStream, XdgPortalBackend},
     runtime::PostStatus,
-    validation::{KeyboardPoint, PointerAction},
+    validation::{KeyboardEvent, KeyboardFocus, KeyboardPoint, ObserveCrop, PointerAction},
+    window_backend::WindowGeometry,
 };
 
-pub(crate) const SESSION_UNAVAILABLE: &str =
-    "desktop session is unavailable; disable and re-enable the MCP to request KDE approval again";
+pub(crate) const SESSION_UNAVAILABLE: &str = "desktop session is unavailable; request a new approved desktop session and fresh observation; do not retry dispatched input blindly";
 const FRAME_WAIT_BOUND: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +62,20 @@ pub struct ScreenshotMapping {
     pub stream: PortalStream,
     pub source: FrameMetadata,
     pub output_size: (u32, u32),
+    /// Requested PNG scope. Monitor is the authoritative full-frame capture;
+    /// TargetWindow is an advisory server-side crop with input remapping.
+    pub crop: ObserveCrop,
+    /// Effective pre-transform source-pixel rect actually encoded when
+    /// crop is TargetWindow. Input coordinates remap through this rect back
+    /// to monitor space; None for full-monitor captures.
+    pub window_crop_source: Option<crate::geometry::PixelRect>,
+    /// KDE geometry that justified `window_crop_source`. Waits and input must
+    /// never reuse a target crop without this authoritative binding.
+    pub window_crop_geometry: Option<WindowGeometry>,
+    /// True only when `window_crop_source` was applied before transform and
+    /// PNG budgeting. Legacy providers may expose a post-encoded crop for the
+    /// initial observation, but waits must invalidate that view and reobserve.
+    pub window_crop_is_preencoded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -101,6 +116,17 @@ pub trait ScreenshotProvider: Send + Sync + 'static {
         &'a self,
         snapshot: &'a Snapshot,
     ) -> impl Future<Output = Result<ScreenshotObservation, ScreenshotError>> + Send + 'a;
+    /// Capture the requested observation view using authoritative KDE window
+    /// geometry when a target-window crop was requested. Backends without a
+    /// raw-frame crop path retain the old capture behavior; the observation
+    /// layer may then apply its explicit compatibility fallback.
+    fn capture_with_window_geometry<'a>(
+        &'a self,
+        snapshot: &'a Snapshot,
+        _window_geometry: Option<WindowGeometry>,
+    ) -> impl Future<Output = Result<ScreenshotObservation, ScreenshotError>> + Send + 'a {
+        async move { self.capture(snapshot).await }
+    }
     fn wait_for_frame<'a>(
         &'a self,
         _condition: FrameWaitCondition,
@@ -127,8 +153,47 @@ pub trait ScreenshotProvider: Send + Sync + 'static {
         action: GeneratedInputAction,
         progress: Arc<ActionProgress>,
     ) -> impl Future<Output = Result<(), InputError>> + Send + 'a;
+    /// Prepare EIS dispatch for the already-focused element: same live
+    /// session, keyboard capability, and text-bound checks as
+    /// [`ScreenshotProvider::prepare_input`] but with no screenshot mapping
+    /// and no coordinate validation, for windows screenshots cannot see.
+    fn prepare_focused_input<'a>(
+        &'a self,
+        _action: &'a GeneratedInputAction,
+    ) -> impl Future<Output = Result<(), String>> + Send + 'a {
+        async { Ok(()) }
+    }
+    /// Dispatch EIS keystrokes to the already-focused element without moving
+    /// the pointer. Callers must verify AT-SPI focus first.
+    fn perform_focused_input<'a>(
+        &'a self,
+        _action: GeneratedInputAction,
+        _progress: Arc<ActionProgress>,
+    ) -> impl Future<Output = Result<(), InputError>> + Send + 'a {
+        async {
+            Err(InputError::SessionUnavailable(
+                "focused-element typing requires a live screenshot provider".into(),
+            ))
+        }
+    }
     fn cleanup_input(&self) -> impl Future<Output = Result<(), String>> + Send + '_ {
         async { Ok(()) }
+    }
+    /// Union-disambiguation evidence for the last prepared/dispatched pointer
+    /// action, if several resumed EIS regions were resolved into one binding.
+    /// Defaults to none so test backends are unaffected.
+    fn eis_region_evidence(&self) -> Option<String> {
+        None
+    }
+    /// Mechanism for the last successfully dispatched paste. Read after a
+    /// successful perform_input/perform_focused_input, before the next action.
+    /// A portal transfer confirms bytes were supplied, not application consumption.
+    fn paste_delivery_mechanism(&self) -> Option<&'static str> {
+        None
+    }
+    /// Completed lifecycle state for worker retirement, not action retry.
+    fn desktop_session_exhausted(&self) -> bool {
+        false
     }
     fn shutdown_input(&self) -> impl Future<Output = Result<(), String>> + Send + '_ {
         self.cleanup_input()
@@ -197,6 +262,11 @@ pub struct ScreenshotCoordinator<P, C> {
     portal: P,
     capture: C,
     state: Mutex<CaptureState>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    /// Last union-disambiguation evidence (`eis_region=...`), set during
+    /// pointer preparation/dispatch and read after dispatch completes.
+    eis_evidence: std::sync::Mutex<Option<String>>,
+    paste_delivery: std::sync::Mutex<Option<&'static str>>,
 }
 
 impl<P, C> std::fmt::Debug for ScreenshotCoordinator<P, C>
@@ -225,6 +295,27 @@ impl<P, C> ScreenshotCoordinator<P, C> {
             portal,
             capture,
             state: Mutex::new(CaptureState::Fresh),
+            shutdown: tokio::sync::watch::channel(false).0,
+            eis_evidence: std::sync::Mutex::new(None),
+            paste_delivery: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Drop any previous disambiguation evidence. A poisoned evidence cell
+    /// only loses a diagnostic string (the mapping itself stays fail-closed),
+    /// so poisoning is ignored rather than fatal.
+    fn clear_eis_evidence(&self) {
+        if let Ok(mut guard) = self.eis_evidence.lock() {
+            *guard = None;
+        }
+    }
+
+    fn store_eis_evidence(&self, evidence: Option<String>) {
+        if evidence.is_none() {
+            return;
+        }
+        if let Ok(mut guard) = self.eis_evidence.lock() {
+            *guard = evidence;
         }
     }
 }
@@ -317,8 +408,25 @@ where
     P: PortalBackend,
     C: CaptureBackend,
 {
+    fn desktop_session_exhausted(&self) -> bool {
+        // A lock owner is still preparing or using the session. In particular,
+        // prepare temporarily stores Exhausted while consent is pending. Only
+        // inspect idle state, as the broker does after the original response.
+        self.state.try_lock().is_ok_and(|state| match &*state {
+            CaptureState::Fresh => false,
+            CaptureState::Exhausted => true,
+            CaptureState::Active(active) => terminal_failure(active).is_some(),
+        })
+    }
+
     async fn prepare(&self) -> Result<(), ScreenshotError> {
+        let mut shutdown = self.shutdown.subscribe();
         let mut state = self.state.lock().await;
+        if *shutdown.borrow() {
+            return Err(ScreenshotError(
+                "desktop initialization cancelled by shutdown".into(),
+            ));
+        }
         let unavailable = match &*state {
             CaptureState::Active(active) => match terminal_failure(active) {
                 Some(reason) => Some(reason),
@@ -334,9 +442,15 @@ where
             exhaust_capture(&mut state, "desktop session became unavailable").await;
             return Err(session_unavailable());
         }
-        // Cancellation or any startup failure is terminal and must not open another chooser.
+        // One caller owns initialization under this lock. Portal expiration is
+        // retried inside establish; cancellation/denial must not let a queued
+        // caller silently reopen a chooser for the same initialization request.
         *state = CaptureState::Exhausted;
-        let connection = self.portal.establish().await.map_err(ScreenshotError)?;
+        let connection = tokio::select! {
+            biased;
+            _ = shutdown.changed() => return Err(ScreenshotError("desktop initialization cancelled by shutdown".into())),
+            connection = self.portal.establish() => connection.map_err(ScreenshotError)?,
+        };
         let session = Arc::clone(&connection.session);
         let active = async {
             let mut capture = self
@@ -381,6 +495,14 @@ where
         &'a self,
         snapshot: &'a Snapshot,
     ) -> Result<ScreenshotObservation, ScreenshotError> {
+        self.capture_with_window_geometry(snapshot, None).await
+    }
+
+    async fn capture_with_window_geometry<'a>(
+        &'a self,
+        snapshot: &'a Snapshot,
+        window_geometry: Option<WindowGeometry>,
+    ) -> Result<ScreenshotObservation, ScreenshotError> {
         let mut state = self.state.lock().await;
         let result: Result<ScreenshotObservation, ScreenshotError> = async {
             let active = state.active_mut().ok_or_else(session_unavailable)?;
@@ -392,14 +514,94 @@ where
                 .latest_after(None, Duration::from_secs(2))
                 .await
                 .map_err(ScreenshotError)?;
-            let frame = active
+            let frame = match active
                 .capture
                 .latest_after(Some(baseline.metadata.generation), Duration::from_secs(2))
                 .await
-                .map_err(ScreenshotError)?;
+            {
+                Ok(frame) => frame,
+                Err(error) if error == "timed out waiting for a complete frame" => {
+                    let current = active
+                        .capture
+                        .current_metadata()
+                        .map_err(ScreenshotError)?;
+                    let Some(current) = current else {
+                        return Err(ScreenshotError(
+                            "cannot reuse startup baseline: no current complete frame remains"
+                                .into(),
+                        ));
+                    };
+                    if current.generation != baseline.metadata.generation
+                        || current.format_generation != baseline.metadata.format_generation
+                    {
+                        return Err(ScreenshotError(format!(
+                            "cannot reuse startup baseline generation={} format_generation={}; latest available frame is generation={} format_generation={}",
+                            baseline.metadata.generation,
+                            baseline.metadata.format_generation,
+                            current.generation,
+                            current.format_generation,
+                        )));
+                    }
+                    eprintln!(
+                        "computer-use-mcp: reusing latest available capture frame generation={} format_generation={} after no newer startup frame",
+                        baseline.metadata.generation, baseline.metadata.format_generation
+                    );
+                    // A complete baseline is still the latest available
+                    // frame. A newly-started portal stream can briefly
+                    // deliver only that frame while its producer settles;
+                    // explicit frame waits remain strict.
+                    baseline
+                }
+                Err(error) => return Err(ScreenshotError(error)),
+            };
             let source = frame.metadata;
+            let (encode_crop, window_crop_source, window_crop_geometry, effective_crop) =
+                match snapshot.crop {
+                    ObserveCrop::Monitor => (source.crop, None, None, ObserveCrop::Monitor),
+                    ObserveCrop::TargetWindow => match window_geometry {
+                        None => {
+                            // Keep the full monitor when KDE did not provide an
+                            // authoritative geometry. The observation layer emits
+                            // an explicit monitor-fallback report; it must not
+                            // invent a crop from AT-SPI extents.
+                            (source.crop, None, None, ObserveCrop::Monitor)
+                        }
+                        Some(geometry) => {
+                            let source_rect = window_crop_in_frame(
+                                (geometry.x, geometry.y, geometry.width, geometry.height),
+                                active.stream.position,
+                                active.stream.logical_size,
+                                source.size,
+                            )
+                            .map_err(ScreenshotError)?;
+                            if !source_rect.is_valid_within(source.size)
+                                || source_rect.x < source.crop.x
+                                || source_rect.y < source.crop.y
+                                || source_rect.x.checked_add(source_rect.width).is_none_or(
+                                    |right| right > source.crop.x.saturating_add(source.crop.width),
+                                )
+                                || source_rect.y.checked_add(source_rect.height).is_none_or(
+                                    |bottom| {
+                                        bottom > source.crop.y.saturating_add(source.crop.height)
+                                    },
+                                )
+                            {
+                                return Err(ScreenshotError(
+                                "authoritative KDE window crop is outside the encoded source crop"
+                                    .into(),
+                            ));
+                            }
+                            (
+                                source_rect,
+                                Some(source_rect),
+                                Some(geometry),
+                                ObserveCrop::TargetWindow,
+                            )
+                        }
+                    },
+                };
             let encoded =
-                encoder::encode_frame(frame.rgba, source.size, source.crop, source.transform)
+                encoder::encode_frame(frame.rgba, source.size, encode_crop, source.transform)
                     .map_err(ScreenshotError)?;
             if active.session.is_closed() {
                 return Err(session_unavailable());
@@ -416,6 +618,10 @@ where
                     stream: active.stream.clone(),
                     source,
                     output_size: encoded.size,
+                    crop: effective_crop,
+                    window_crop_source,
+                    window_crop_geometry,
+                    window_crop_is_preencoded: window_crop_source.is_some(),
                 },
             })
         }
@@ -527,16 +733,71 @@ where
             FrameWaitCondition::Stable { .. } => stable_elapsed_ms,
             _ => None,
         };
-        let mut bound_mapping = mapping.clone();
+        verify_current_frame_metadata(&frame.metadata, mapping).map_err(ScreenshotError)?;
+        let encode_crop = match (mapping.crop, mapping.window_crop_source) {
+            (ObserveCrop::Monitor, None) => frame.metadata.crop,
+            (ObserveCrop::TargetWindow, Some(source_rect)) => source_rect,
+            (ObserveCrop::TargetWindow, None) => {
+                return Err(ScreenshotError(
+                    "target-window frame wait has no authoritative crop binding; re-observe".into(),
+                ));
+            }
+            (ObserveCrop::Monitor, Some(_)) => {
+                return Err(ScreenshotError(
+                    "monitor frame wait has an inconsistent target crop binding; re-observe".into(),
+                ));
+            }
+        };
+        if mapping.crop == ObserveCrop::TargetWindow && !mapping.window_crop_is_preencoded {
+            return Err(ScreenshotError(
+                "target-window frame wait cannot extend a legacy post-encoded crop; re-observe"
+                    .into(),
+            ));
+        }
+        if !encode_crop.is_valid_within(frame.metadata.size)
+            || encode_crop.x < frame.metadata.crop.x
+            || encode_crop.y < frame.metadata.crop.y
+            || encode_crop
+                .x
+                .checked_add(encode_crop.width)
+                .is_none_or(|right| {
+                    right
+                        > frame
+                            .metadata
+                            .crop
+                            .x
+                            .saturating_add(frame.metadata.crop.width)
+                })
+            || encode_crop
+                .y
+                .checked_add(encode_crop.height)
+                .is_none_or(|bottom| {
+                    bottom
+                        > frame
+                            .metadata
+                            .crop
+                            .y
+                            .saturating_add(frame.metadata.crop.height)
+                })
+        {
+            return Err(ScreenshotError(
+                "frame wait crop binding is outside the current source crop; re-observe".into(),
+            ));
+        }
         let encoded = encoder::encode_frame(
             frame.rgba,
             frame.metadata.size,
-            frame.metadata.crop,
+            encode_crop,
             frame.metadata.transform,
         )
         .map_err(ScreenshotError)?;
+        if encoded.size != mapping.output_size {
+            return Err(ScreenshotError(
+                "frame wait changed the encoded view size; re-observe before acting".into(),
+            ));
+        }
+        let mut bound_mapping = mapping.clone();
         bound_mapping.source = frame.metadata;
-        bound_mapping.output_size = encoded.size;
         Ok(FrameWaitEvidence {
             changed: match condition {
                 FrameWaitCondition::Changed { .. } => Some(true),
@@ -563,6 +824,9 @@ where
         mapping: &'a ScreenshotMapping,
         action: &'a GeneratedInputAction,
     ) -> Result<(), String> {
+        // A new preparation invalidates any previous disambiguation evidence;
+        // the fresh evidence is stored below and read after dispatch.
+        self.clear_eis_evidence();
         let mut state = self.state.lock().await;
         if state
             .active()
@@ -578,7 +842,10 @@ where
             ValidatedMapping::new(snapshot, mapping, &active.session, &active.stream)?;
         }
         validate_current_capture_state(&mut state, mapping, "before input preparation").await?;
-        let keyboard_required = matches!(action, GeneratedInputAction::KeyboardTransaction { .. });
+        let keyboard_required = matches!(
+            action,
+            GeneratedInputAction::KeyboardTransaction { .. } | GeneratedInputAction::Paste { .. }
+        );
         let connected_now = state
             .active()
             .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
@@ -614,8 +881,20 @@ where
             .as_ref()
             .ok_or_else(|| "EIS backend disappeared after setup".to_owned())?;
         let input = Arc::clone(input);
-        let region = match input.wait_for_action(keyboard_required).await {
-            Ok(region) => region,
+        let points = action_png_points(action)?;
+        let window_cropped = mapping.window_crop_source.is_some();
+        let stream_extent = StreamExtent::from_portal_stream(&mapping.stream);
+        let resolved = match input
+            .wait_for_resolved_action(
+                keyboard_required,
+                mapping.output_size,
+                stream_extent,
+                window_cropped,
+                &points,
+            )
+            .await
+        {
+            Ok(resolved) => resolved,
             Err(error) => {
                 if state.active().and_then(terminal_failure).is_some() {
                     exhaust_capture(&mut state, "desktop session failed while preparing input")
@@ -633,12 +912,22 @@ where
         let active = state
             .active()
             .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?;
+        let clipboard_available = active.session.clipboard().is_some();
         let mapper = ValidatedMapping::new(snapshot, mapping, &active.session, &active.stream)?
-            .eis_mapper(region)?;
+            .eis_mapper(resolved.region)?;
+        if let Some(evidence) = resolved.evidence {
+            eprintln!(
+                "computer-use-mcp: EIS union disambiguation engaged; several resumed regions resolved to one binding (eis_region={evidence})"
+            );
+            self.store_eis_evidence(Some(evidence));
+        }
         require_action_capabilities(input.as_ref(), action)?;
         match action {
             GeneratedInputAction::Pointer(action) => preflight_pointer(&mapper, action)?,
-            GeneratedInputAction::KeyboardTransaction { focus, events } => {
+            GeneratedInputAction::KeyboardTransaction {
+                focus: KeyboardFocus::Point(focus),
+                events,
+            } => {
                 let focus = mapper.point(focus.x, focus.y)?;
                 keyboard_input::preflight_transaction(
                     &input,
@@ -648,6 +937,31 @@ where
                     },
                     events,
                 )?;
+            }
+            GeneratedInputAction::Paste {
+                focus: KeyboardFocus::Point(focus),
+                text,
+            } => {
+                let focus = mapper.point(focus.x, focus.y)?;
+                let focus = KeyboardPoint {
+                    x: focus.0,
+                    y: focus.1,
+                };
+                if clipboard_available {
+                    keyboard_input::preflight_transaction(
+                        &input,
+                        focus,
+                        &[KeyboardEvent::Press("CTRL+V".into())],
+                    )?;
+                } else {
+                    keyboard_input::preflight_paste(&input, focus, text).map(drop)?;
+                }
+            }
+            GeneratedInputAction::KeyboardTransaction { .. }
+            | GeneratedInputAction::Paste { .. } => {
+                return Err(
+                    "semantic-focus typing requires the focused-element input path".to_owned(),
+                );
             }
         }
         Ok(())
@@ -660,6 +974,10 @@ where
         action: GeneratedInputAction,
         progress: Arc<ActionProgress>,
     ) -> Result<(), InputError> {
+        *self
+            .paste_delivery
+            .lock()
+            .expect("paste delivery mutex poisoned") = None;
         let mut state = self.state.lock().await;
         if state
             .active()
@@ -686,9 +1004,18 @@ where
         let active = state
             .active()
             .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?;
+        let clipboard = active.session.clipboard();
         let validated = ValidatedMapping::new(snapshot, mapping, &active.session, &active.stream)?;
-        let region = input.region()?;
-        let mapper = validated.eis_mapper(region)?;
+        let points = action_png_points(&action)?;
+        let stream_extent = StreamExtent::from_portal_stream(&mapping.stream);
+        let resolved = input.resolved_region(
+            mapping.output_size,
+            stream_extent,
+            mapping.window_crop_source.is_some(),
+            &points,
+        )?;
+        let mapper = validated.eis_mapper(resolved.region)?;
+        self.store_eis_evidence(resolved.evidence);
         require_action_capabilities(input.as_ref(), &action)?;
 
         let result: Result<(), String> = async {
@@ -725,7 +1052,10 @@ where
                             .await?;
                     }
                 },
-                GeneratedInputAction::KeyboardTransaction { focus, events } => {
+                GeneratedInputAction::KeyboardTransaction {
+                    focus: KeyboardFocus::Point(focus),
+                    events,
+                } => {
                     let focus = mapper.point(focus.x, focus.y)?;
                     let focus = KeyboardPoint {
                         x: focus.0,
@@ -739,6 +1069,229 @@ where
                     )
                     .await?;
                 }
+                GeneratedInputAction::Paste {
+                    focus: KeyboardFocus::Point(focus),
+                    text,
+                } => {
+                    let focus = mapper.point(focus.x, focus.y)?;
+                    let focus = KeyboardPoint {
+                        x: focus.0,
+                        y: focus.1,
+                    };
+                    let mechanism = perform_clipboard_paste(
+                        clipboard,
+                        input,
+                        Some(focus),
+                        text,
+                        Arc::clone(&progress),
+                    )
+                    .await?;
+                    *self
+                        .paste_delivery
+                        .lock()
+                        .expect("paste delivery mutex poisoned") = Some(mechanism);
+                }
+                GeneratedInputAction::KeyboardTransaction { .. }
+                | GeneratedInputAction::Paste { .. } => {
+                    return Err(
+                        "semantic-focus typing requires the focused-element input path".to_owned(),
+                    );
+                }
+            }
+            Ok(())
+        }
+        .await;
+        result.map_err(InputError::from)
+    }
+
+    async fn prepare_focused_input<'a>(
+        &'a self,
+        action: &'a GeneratedInputAction,
+    ) -> Result<(), String> {
+        if !matches!(
+            action,
+            GeneratedInputAction::KeyboardTransaction {
+                focus: KeyboardFocus::Semantic { .. },
+                ..
+            } | GeneratedInputAction::Paste {
+                focus: KeyboardFocus::Semantic { .. },
+                ..
+            }
+        ) {
+            return Err("focused-element input requires semantic focus".into());
+        }
+        let mut state = self.state.lock().await;
+        if state
+            .active()
+            .is_none_or(|active| active.session.is_closed())
+        {
+            exhaust_capture(
+                &mut state,
+                "portal session closed before focused input preparation",
+            )
+            .await;
+            return Err(SESSION_UNAVAILABLE.into());
+        }
+        // No screenshot mapping is consulted: the target window may live on
+        // a virtual desktop screenshots cannot see. EIS keystrokes land in
+        // the focused window, so only a live session, keyboard capability,
+        // and text bounds are required. The stream below only identifies the
+        // portal session for EIS setup; no pixels are read from it.
+        let connected_now = state
+            .active()
+            .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
+            .input
+            .is_none();
+        if connected_now {
+            let session = Arc::clone(
+                &state
+                    .active()
+                    .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
+                    .session,
+            );
+            let stream = state
+                .active()
+                .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
+                .stream
+                .clone();
+            match ReisInputBackend::connect(session, &stream).await {
+                Ok(input) => {
+                    state
+                        .active_mut()
+                        .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
+                        .input = Some(input)
+                }
+                Err(error) => {
+                    exhaust_capture(&mut state, "EIS setup failed").await;
+                    return Err(format!("{SESSION_UNAVAILABLE}: EIS setup failed: {error}"));
+                }
+            }
+        }
+        let input = state
+            .active()
+            .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
+            .input
+            .as_ref()
+            .ok_or_else(|| "EIS backend disappeared after setup".to_owned())?;
+        let input = Arc::clone(input);
+        // Focused-element typing needs only the unique keyboard: resolving a
+        // pointer region here would let ambiguous multi-monitor EIS
+        // advertisements block typing into a verified focused element.
+        if let Err(error) = input.wait_for_keyboard().await {
+            if state.active().and_then(terminal_failure).is_some() {
+                exhaust_capture(&mut state, "desktop session failed while preparing input").await;
+                return Err(SESSION_UNAVAILABLE.into());
+            }
+            return Err(error);
+        }
+        if let Some(failure) = state.active().and_then(terminal_failure) {
+            exhaust_capture(&mut state, "desktop session failed while preparing input").await;
+            return Err(format!("{SESSION_UNAVAILABLE}: {failure}"));
+        }
+        require_focused_capabilities(input.as_ref(), action)?;
+        let clipboard_available = state
+            .active()
+            .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
+            .session
+            .clipboard()
+            .is_some();
+        match action {
+            GeneratedInputAction::KeyboardTransaction {
+                focus: KeyboardFocus::Semantic { .. },
+                events,
+            } => {
+                keyboard_input::preflight_transaction_focused(&input, events)?;
+            }
+            GeneratedInputAction::Paste {
+                focus: KeyboardFocus::Semantic { .. },
+                text,
+            } => {
+                if clipboard_available {
+                    keyboard_input::preflight_transaction_focused(
+                        &input,
+                        &[KeyboardEvent::Press("CTRL+V".into())],
+                    )?;
+                } else {
+                    keyboard_input::preflight_paste_focused(&input, text).map(drop)?;
+                }
+            }
+            _ => {
+                return Err("focused-element input requires semantic focus".into());
+            }
+        }
+        Ok(())
+    }
+
+    async fn perform_focused_input(
+        &self,
+        action: GeneratedInputAction,
+        progress: Arc<ActionProgress>,
+    ) -> Result<(), InputError> {
+        *self
+            .paste_delivery
+            .lock()
+            .expect("paste delivery mutex poisoned") = None;
+        let mut state = self.state.lock().await;
+        if state
+            .active()
+            .is_none_or(|active| active.session.is_closed())
+        {
+            exhaust_capture(&mut state, "portal session closed before focused input").await;
+            return Err(InputError::SessionUnavailable(SESSION_UNAVAILABLE.into()));
+        }
+        if let Some(failure) = state.active().and_then(terminal_failure) {
+            exhaust_capture(&mut state, "desktop session failed before focused input").await;
+            return Err(InputError::SessionUnavailable(format!(
+                "{SESSION_UNAVAILABLE}: {failure}"
+            )));
+        }
+        let input = state
+            .active()
+            .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
+            .input
+            .as_ref()
+            .ok_or_else(|| "EIS input was not prepared for this action".to_owned())?
+            .clone();
+        let clipboard = state
+            .active()
+            .ok_or_else(|| SESSION_UNAVAILABLE.to_owned())?
+            .session
+            .clipboard();
+        require_focused_capabilities(input.as_ref(), &action)?;
+
+        let result: Result<(), String> = async {
+            match action {
+                GeneratedInputAction::KeyboardTransaction {
+                    focus: KeyboardFocus::Semantic { .. },
+                    events,
+                } => {
+                    keyboard_input::perform_transaction_focused(
+                        input,
+                        events,
+                        Arc::clone(&progress),
+                    )
+                    .await?;
+                }
+                GeneratedInputAction::Paste {
+                    focus: KeyboardFocus::Semantic { .. },
+                    text,
+                } => {
+                    let mechanism = perform_clipboard_paste(
+                        clipboard,
+                        input,
+                        None,
+                        text,
+                        Arc::clone(&progress),
+                    )
+                    .await?;
+                    *self
+                        .paste_delivery
+                        .lock()
+                        .expect("paste delivery mutex poisoned") = Some(mechanism);
+                }
+                _ => {
+                    return Err("focused-element input requires semantic focus".to_owned());
+                }
             }
             Ok(())
         }
@@ -747,26 +1300,105 @@ where
     }
 
     async fn cleanup_input(&self) -> Result<(), String> {
-        let input = {
+        let (input, clipboard) = {
             let state = self.state.lock().await;
             let Some(active) = state.active() else {
                 return Ok(());
             };
-            active.input.clone()
+            (active.input.clone(), active.session.clipboard())
         };
-        match input {
-            Some(input) => input.cleanup_barrier().await,
-            None => Ok(()),
+        // Both are independently necessary, including when begin() or finish()
+        // was dropped. A clipboard failure must not skip held-key release.
+        let (input, clipboard) = tokio::join!(
+            async {
+                match input {
+                    Some(input) => input.cleanup_barrier().await,
+                    None => Ok(()),
+                }
+            },
+            async {
+                match clipboard {
+                    Some(clipboard) => clipboard.clear_selection().await,
+                    None => Ok(()),
+                }
+            },
+        );
+        match (input, clipboard) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(input), Err(clipboard)) => {
+                Err(format!("{input}; clipboard cleanup failed: {clipboard}"))
+            }
         }
     }
 
     async fn shutdown_input(&self) -> Result<(), String> {
+        // Wake the initializer before waiting for its state lock. Dropping the
+        // establishment future closes its request/session and stops retries.
+        self.shutdown.send_replace(true);
         let active = take_active(&mut *self.state.lock().await);
         let Some(active) = active else {
             return Ok(());
         };
         close_active(active, "computer-use shutdown").await
     }
+
+    fn eis_region_evidence(&self) -> Option<String> {
+        self.eis_evidence
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn paste_delivery_mechanism(&self) -> Option<&'static str> {
+        *self
+            .paste_delivery
+            .lock()
+            .expect("paste delivery mutex poisoned")
+    }
+}
+
+async fn perform_clipboard_paste(
+    clipboard: Option<Arc<crate::portal::ClipboardController>>,
+    input: Arc<ReisInputBackend>,
+    focus: Option<KeyboardPoint>,
+    text: String,
+    progress: Arc<ActionProgress>,
+) -> Result<&'static str, String> {
+    let Some(clipboard) = clipboard else {
+        return match focus {
+            Some(focus) => keyboard_input::perform_paste(input, focus, text, progress)
+                .await
+                .map(|_| "eis_typed_insertion"),
+            None => keyboard_input::perform_paste_focused(input, text, progress)
+                .await
+                .map(|_| "eis_typed_insertion"),
+        };
+    };
+    let selection = clipboard.begin(&text, &progress).await?;
+    let dispatch = match focus {
+        Some(focus) => {
+            keyboard_input::perform_transaction(
+                input,
+                focus,
+                vec![KeyboardEvent::Press("CTRL+V".into())],
+                progress,
+            )
+            .await
+        }
+        None => {
+            keyboard_input::perform_transaction_focused(
+                input,
+                vec![KeyboardEvent::Press("CTRL+V".into())],
+                progress,
+            )
+            .await
+        }
+    };
+    // Completed progress refers to the Ctrl+V dispatch. A later transfer or
+    // revocation failure remains an error, never a successful paste result.
+    selection.finish(dispatch).await?;
+    Ok("portal_clipboard")
 }
 
 fn take_active(state: &mut CaptureState) -> Option<ActiveCapture> {
@@ -847,7 +1479,9 @@ fn validate_current_capture(
         return Err(reason);
     }
     if metadata.stream_health == crate::capture::StreamHealth::Degraded {
-        return Err("capture stream health is degraded; refusing generated input".into());
+        eprintln!(
+            "computer-use-mcp: proceeding with degraded capture health; frame discontinuity risk — coordinates may misdeliver"
+        );
     }
     verify_current_frame_metadata(&metadata, mapping)?;
     Ok(())
@@ -894,7 +1528,42 @@ fn verify_current_frame_metadata(
             metadata.format_generation, metadata.size, metadata.crop, metadata.transform
         ));
     }
+    if mapping.crop == ObserveCrop::TargetWindow
+        && (mapping.window_crop_source.is_none() || mapping.window_crop_geometry.is_none())
+    {
+        return Err(
+            "target-window mapping has no authoritative KDE crop binding; re-observe".into(),
+        );
+    }
+    if mapping.crop == ObserveCrop::Monitor
+        && (mapping.window_crop_source.is_some() || mapping.window_crop_geometry.is_some())
+    {
+        return Err("monitor mapping retains a target crop binding; re-observe".into());
+    }
     Ok(())
+}
+
+/// PNG points an action needs bound to EIS regions: every pointer target
+/// plus the point-focus of keyboard actions. Semantic-focus typing takes the
+/// coordinate-free focused path and never reaches here.
+fn action_png_points(action: &GeneratedInputAction) -> Result<Vec<(f64, f64)>, String> {
+    match action {
+        GeneratedInputAction::Pointer(PointerAction::Move { x, y }) => Ok(vec![(*x, *y)]),
+        GeneratedInputAction::Pointer(PointerAction::Click { x, y, .. }) => Ok(vec![(*x, *y)]),
+        GeneratedInputAction::Pointer(PointerAction::Scroll { x, y, .. }) => Ok(vec![(*x, *y)]),
+        GeneratedInputAction::Pointer(PointerAction::Drag { path }) => Ok(path.clone()),
+        GeneratedInputAction::KeyboardTransaction {
+            focus: KeyboardFocus::Point(focus),
+            ..
+        }
+        | GeneratedInputAction::Paste {
+            focus: KeyboardFocus::Point(focus),
+            ..
+        } => Ok(vec![(focus.x, focus.y)]),
+        GeneratedInputAction::KeyboardTransaction { .. } | GeneratedInputAction::Paste { .. } => {
+            Err("semantic-focus typing requires the focused-element input path".to_owned())
+        }
+    }
 }
 
 fn require_action_capabilities(
@@ -907,9 +1576,30 @@ fn require_action_capabilities(
             (true, false, false)
         }
         GeneratedInputAction::Pointer(PointerAction::Scroll { .. }) => (false, true, false),
-        GeneratedInputAction::KeyboardTransaction { .. } => (false, false, true),
+        GeneratedInputAction::KeyboardTransaction { .. } | GeneratedInputAction::Paste { .. } => {
+            (false, false, true)
+        }
     };
     backend.require_capabilities(button, scroll, keyboard)
+}
+
+/// Capability gate for focused-element typing: only the bound unique
+/// keyboard is required, never a pointer region.
+fn require_focused_capabilities(
+    backend: &ReisInputBackend,
+    action: &GeneratedInputAction,
+) -> Result<(), String> {
+    match action {
+        GeneratedInputAction::KeyboardTransaction {
+            focus: KeyboardFocus::Semantic { .. },
+            ..
+        }
+        | GeneratedInputAction::Paste {
+            focus: KeyboardFocus::Semantic { .. },
+            ..
+        } => backend.require_focused_keyboard(),
+        _ => Err("focused-element input requires semantic focus".into()),
+    }
 }
 
 fn preflight_pointer(
@@ -955,11 +1645,18 @@ mod tests {
     struct FakePortal {
         connections: StdMutex<VecDeque<PortalConnection>>,
         establishes: AtomicUsize,
+        consent: Option<tokio::sync::watch::Receiver<bool>>,
     }
 
     impl PortalBackend for FakePortal {
         async fn establish(&self) -> Result<PortalConnection, String> {
             self.establishes.fetch_add(1, Ordering::AcqRel);
+            if let Some(mut consent) = self.consent.clone() {
+                consent
+                    .wait_for(|ready| *ready)
+                    .await
+                    .map_err(|_| "consent gate closed".to_owned())?;
+            }
             self.connections
                 .lock()
                 .unwrap()
@@ -979,8 +1676,14 @@ mod tests {
         drops: AtomicUsize,
         never_fresh: AtomicUsize,
         failed_health: AtomicUsize,
+        degraded_health: AtomicUsize,
         format_generation: AtomicUsize,
         current_metadata_checks: AtomicUsize,
+        single_frame: AtomicUsize,
+        renegotiate_after_baseline: AtomicUsize,
+        fail_after_baseline: AtomicUsize,
+        invalidated: AtomicUsize,
+        rgba: StdMutex<Option<Vec<u8>>>,
     }
 
     struct FakeCaptureBackend(Arc<FakeCaptureState>);
@@ -1005,6 +1708,7 @@ mod tests {
                 failure,
                 drops: Arc::clone(&self.0),
                 never_fresh: self.0.never_fresh.load(Ordering::Acquire) != 0,
+                single_frame: self.0.single_frame.load(Ordering::Acquire) != 0,
             }))
         }
     }
@@ -1013,6 +1717,7 @@ mod tests {
         failure: Arc<StdMutex<Option<String>>>,
         drops: Arc<FakeCaptureState>,
         never_fresh: bool,
+        single_frame: bool,
     }
 
     impl CaptureSession for FakeCaptureSession {
@@ -1032,10 +1737,13 @@ mod tests {
             if let Some(error) = self.failure() {
                 return Err(error);
             }
+            if self.drops.invalidated.load(Ordering::Acquire) != 0 {
+                return Ok(None);
+            }
             Ok(Some(fake_metadata(
                 1,
                 self.drops.format_generation.load(Ordering::Acquire).max(1) as u64,
-                self.drops.failed_health.load(Ordering::Acquire) != 0,
+                fake_health(&self.drops),
             )))
         }
 
@@ -1046,7 +1754,17 @@ mod tests {
         ) -> CaptureFuture<'_, OwnedFrame> {
             let failure = self.failure();
             let never_fresh = self.never_fresh;
-            let failed_health = self.drops.failed_health.load(Ordering::Acquire) != 0;
+            let single_frame = self.single_frame;
+            let health = fake_health(&self.drops);
+            let rgba = self
+                .drops
+                .rgba
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| vec![255; 16]);
+            let drops = Arc::clone(&self.drops);
+            let failure_state = Arc::clone(&self.failure);
             Box::pin(async move {
                 if let Some(error) = failure {
                     return Err(error);
@@ -1054,10 +1772,21 @@ mod tests {
                 if never_fresh {
                     return Err("timed out waiting for a complete frame".into());
                 }
+                if single_frame && after_generation.is_some() {
+                    if drops.fail_after_baseline.swap(0, Ordering::AcqRel) != 0 {
+                        *failure_state.lock().unwrap() = Some("stream disappeared".into());
+                        return Err("stream disappeared".into());
+                    }
+                    if drops.renegotiate_after_baseline.swap(0, Ordering::AcqRel) != 0 {
+                        drops.format_generation.store(2, Ordering::Release);
+                        drops.invalidated.store(1, Ordering::Release);
+                    }
+                    return Err("timed out waiting for a complete frame".into());
+                }
                 let generation = after_generation.unwrap_or(0) + 1;
                 Ok(OwnedFrame {
-                    metadata: fake_metadata(generation, 1, failed_health),
-                    rgba: vec![255; 16],
+                    metadata: fake_metadata(generation, 1, health),
+                    rgba,
                 })
             })
         }
@@ -1069,10 +1798,20 @@ mod tests {
         }
     }
 
+    fn fake_health(state: &FakeCaptureState) -> crate::capture::StreamHealth {
+        if state.failed_health.load(Ordering::Acquire) != 0 {
+            crate::capture::StreamHealth::Failed
+        } else if state.degraded_health.load(Ordering::Acquire) != 0 {
+            crate::capture::StreamHealth::Degraded
+        } else {
+            crate::capture::StreamHealth::Healthy
+        }
+    }
+
     fn fake_metadata(
         generation: u64,
         format_generation: u64,
-        failed_health: bool,
+        health: crate::capture::StreamHealth,
     ) -> FrameMetadata {
         FrameMetadata {
             generation,
@@ -1089,14 +1828,11 @@ mod tests {
             },
             transform: Transform::Normal,
             timestamp_authority: crate::capture::TimestampAuthority::SpaHeader,
-            stream_health: if failed_health {
-                crate::capture::StreamHealth::Failed
-            } else {
-                crate::capture::StreamHealth::Healthy
-            },
+            stream_health: health,
             content_hash: 0,
             change_epoch: 0,
             changed_from_previous: None,
+            changed_rect: None,
             sequence_gap: None,
         }
     }
@@ -1144,6 +1880,7 @@ mod tests {
             FakePortal {
                 connections: StdMutex::new(connections.into_iter().collect()),
                 establishes: AtomicUsize::new(0),
+                consent: None,
             },
             FakeCaptureBackend(capture),
         )
@@ -1157,9 +1894,51 @@ mod tests {
                     .await
                     .unwrap_err()
                     .0
-                    .contains("disable and re-enable the MCP")
+                    .contains("request a new approved desktop session")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn consent_concurrent_prepare_has_only_one_pending_prompt() {
+        let (connection, _closed) = test_connection(1, 1);
+        let mut coordinator = test_coordinator([connection], Arc::new(FakeCaptureState::default()));
+        let (ready, receiver) = tokio::sync::watch::channel(false);
+        coordinator.portal.consent = Some(receiver);
+        let first = coordinator.prepare();
+        let second = coordinator.prepare();
+        tokio::pin!(first, second);
+        assert!(futures_util::poll!(&mut first).is_pending());
+        assert!(futures_util::poll!(&mut second).is_pending());
+        assert_eq!(coordinator.portal.establishes.load(Ordering::Acquire), 1);
+        assert!(!coordinator.desktop_session_exhausted());
+        ready.send_replace(true);
+        let (first, second) = tokio::join!(first, second);
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(coordinator.portal.establishes.load(Ordering::Acquire), 1);
+        assert!(!coordinator.desktop_session_exhausted());
+    }
+
+    #[tokio::test]
+    async fn consent_shutdown_cancels_pending_prompt_and_queued_prepare() {
+        let mut coordinator = test_coordinator([], Arc::new(FakeCaptureState::default()));
+        let (_ready, receiver) = tokio::sync::watch::channel(false);
+        coordinator.portal.consent = Some(receiver);
+        let first = coordinator.prepare();
+        let second = coordinator.prepare();
+        tokio::pin!(first, second);
+        assert!(futures_util::poll!(&mut first).is_pending());
+        assert!(futures_util::poll!(&mut second).is_pending());
+        let (first, second, shutdown) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(first, second, coordinator.shutdown_input())
+        })
+        .await
+        .expect("shutdown must not wait behind the consent lock");
+        assert!(first.unwrap_err().0.contains("shutdown"));
+        assert!(second.unwrap_err().0.contains("shutdown"));
+        shutdown.unwrap();
+        assert_eq!(coordinator.portal.establishes.load(Ordering::Acquire), 1);
     }
 
     fn test_snapshot() -> Snapshot {
@@ -1199,6 +1978,7 @@ mod tests {
             accessibility_reason: None,
             requires_atspi_revalidation: true,
             screenshot_requested: true,
+            crop: crate::validation::ObserveCrop::Monitor,
         }
     }
 
@@ -1245,24 +2025,179 @@ mod tests {
                 content_hash: 0,
                 change_epoch: 0,
                 changed_from_previous: None,
+                changed_rect: None,
                 sequence_gap: None,
             },
             output_size: (2, 2),
+            crop: ObserveCrop::Monitor,
+            window_crop_source: None,
+            window_crop_geometry: None,
+            window_crop_is_preencoded: false,
         }
     }
 
     #[tokio::test]
-    async fn failed_or_closed_session_requires_mcp_restart_without_another_prompt() {
+    async fn target_crop_wait_reuses_raw_view_and_input_mapping() {
+        let (connection, _) = test_connection(1, 11);
+        let capture = Arc::new(FakeCaptureState::default());
+        *capture.rgba.lock().unwrap() = Some(vec![
+            255, 0, 0, 255, 0, 255, 0, 255, // top row
+            0, 0, 255, 255, 255, 255, 0, 255, // bottom row
+        ]);
+        let coordinator = test_coordinator([connection], Arc::clone(&capture));
+        coordinator.prepare().await.unwrap();
+
+        let mut snapshot = test_snapshot();
+        snapshot.crop = ObserveCrop::TargetWindow;
+        let geometry = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 2,
+            client: true,
+        };
+        let observation = coordinator
+            .capture_with_window_geometry(&snapshot, Some(geometry))
+            .await
+            .unwrap();
+        assert_eq!(observation.mapping.crop, ObserveCrop::TargetWindow);
+        assert_eq!(
+            observation.mapping.window_crop_source,
+            Some(PixelRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 2,
+            })
+        );
+        assert_eq!(observation.mapping.window_crop_geometry, Some(geometry));
+        assert!(observation.mapping.window_crop_is_preencoded);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&observation.png_base64)
+            .unwrap();
+        let image = image::load_from_memory(&bytes).unwrap().to_rgba8();
+        assert_eq!(image.dimensions(), (1, 2));
+        assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(image.get_pixel(0, 1).0, [0, 0, 255, 255]);
+
+        let waited = coordinator
+            .wait_for_frame(
+                FrameWaitCondition::Advanced {
+                    after_generation: observation.mapping.source.generation,
+                },
+                &observation.mapping,
+            )
+            .await
+            .unwrap();
+        assert_eq!(waited.mapping.output_size, (1, 2));
+        assert_eq!(
+            waited.mapping.window_crop_source,
+            observation.mapping.window_crop_source
+        );
+        assert_eq!(
+            waited.mapping.window_crop_geometry,
+            observation.mapping.window_crop_geometry
+        );
+        let (session, _) = PortalSessionLease::for_test("/session/test", 1);
+        let mapped = crate::input::coordinates::ValidatedMapping::new(
+            &snapshot,
+            &waited.mapping,
+            &session,
+            &waited.mapping.stream,
+        )
+        .unwrap()
+        .eis_mapper(crate::input::coordinates::EisRegion {
+            position: (0, 0),
+            size: (2, 2),
+            mapping_id: Some("mapping".into()),
+        })
+        .unwrap()
+        .point(0.0, 1.0)
+        .unwrap();
+        assert_eq!(mapped, (0.0, 1.0));
+    }
+
+    #[tokio::test]
+    async fn capture_reuses_one_current_complete_frame_after_startup_timeout() {
+        let (connection, _) = test_connection(1, 11);
+        let capture_state = Arc::new(FakeCaptureState::default());
+        capture_state.single_frame.store(1, Ordering::Release);
+        let coordinator = test_coordinator([connection], Arc::clone(&capture_state));
+        coordinator.prepare().await.unwrap();
+
+        let observation = coordinator.capture(&test_snapshot()).await.unwrap();
+
+        assert_eq!(observation.mapping.source.generation, 1);
+        assert_eq!(observation.mapping.source.format_generation, 1);
+        assert_eq!(
+            capture_state
+                .current_metadata_checks
+                .load(Ordering::Acquire),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_does_not_resurrect_baseline_after_format_renegotiation() {
+        let (connection, _) = test_connection(1, 11);
+        let capture_state = Arc::new(FakeCaptureState::default());
+        capture_state.single_frame.store(1, Ordering::Release);
+        capture_state
+            .renegotiate_after_baseline
+            .store(1, Ordering::Release);
+        let coordinator = test_coordinator([connection], Arc::clone(&capture_state));
+        coordinator.prepare().await.unwrap();
+
+        let error = coordinator.capture(&test_snapshot()).await.unwrap_err();
+
+        assert!(error.0.contains("no current complete frame remains"));
+        assert_eq!(
+            capture_state
+                .current_metadata_checks
+                .load(Ordering::Acquire),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_refuses_stream_failure_during_startup_fallback() {
+        let (connection, _) = test_connection(1, 11);
+        let capture_state = Arc::new(FakeCaptureState::default());
+        capture_state.single_frame.store(1, Ordering::Release);
+        capture_state
+            .fail_after_baseline
+            .store(1, Ordering::Release);
+        let coordinator = test_coordinator([connection], Arc::clone(&capture_state));
+        coordinator.prepare().await.unwrap();
+
+        let error = coordinator.capture(&test_snapshot()).await.unwrap_err();
+
+        assert!(error.0.contains("request a new approved desktop session"));
+        assert!(coordinator.desktop_session_exhausted());
+        assert_eq!(
+            capture_state
+                .current_metadata_checks
+                .load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_or_closed_session_requires_new_session_without_automatic_reprompt() {
         let (first, _) = test_connection(1, 11);
         let (second, _) = test_connection(2, 22);
         let capture_state = Arc::new(FakeCaptureState::default());
         let coordinator = test_coordinator([first, second], Arc::clone(&capture_state));
 
+        assert!(!coordinator.desktop_session_exhausted());
         coordinator.prepare().await.unwrap();
+        assert!(!coordinator.desktop_session_exhausted());
         assert_eq!(*capture_state.markers.lock().unwrap(), [11]);
         *capture_state.failures.lock().unwrap()[0].lock().unwrap() =
             Some("target node disappeared".into());
+        assert!(coordinator.desktop_session_exhausted());
         assert!(coordinator.capture(&test_snapshot()).await.is_err());
+        assert!(coordinator.desktop_session_exhausted());
         assert_terminal(&coordinator).await;
         assert_eq!(*capture_state.markers.lock().unwrap(), [11]);
         assert_eq!(capture_state.drops.load(Ordering::Acquire), 1);
@@ -1271,6 +2206,7 @@ mod tests {
         let coordinator = test_coordinator([connection], Arc::new(FakeCaptureState::default()));
         coordinator.prepare().await.unwrap();
         closed.send_replace(true);
+        assert!(coordinator.desktop_session_exhausted());
         assert!(coordinator.capture(&test_snapshot()).await.is_err());
         assert_terminal(&coordinator).await;
         assert_eq!(coordinator.portal.establishes.load(Ordering::Acquire), 1);
@@ -1296,6 +2232,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.0.contains("timed out"));
+        assert!(!coordinator.desktop_session_exhausted());
     }
 
     #[tokio::test]
@@ -1333,8 +2270,22 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.contains("disable and re-enable the MCP"));
+        assert!(error.contains("request a new approved desktop session"));
         assert_terminal(&coordinator).await;
+    }
+
+    #[tokio::test]
+    async fn degraded_capture_health_passes_current_validation_for_generated_input() {
+        let (connection, _) = test_connection(1, 11);
+        let capture_state = Arc::new(FakeCaptureState::default());
+        capture_state.degraded_health.store(1, Ordering::Release);
+        let coordinator = test_coordinator([connection], Arc::clone(&capture_state));
+        coordinator.prepare().await.unwrap();
+
+        let mut state = coordinator.state.lock().await;
+        validate_current_capture_state(&mut state, &test_mapping(), "degraded health validation")
+            .await
+            .expect("degraded stream health is an approved downgrade, not a refusal");
     }
 
     #[tokio::test]
@@ -1424,6 +2375,7 @@ mod tests {
             content_hash,
             change_epoch,
             changed_from_previous: None,
+            changed_rect: None,
             sequence_gap: None,
         };
 

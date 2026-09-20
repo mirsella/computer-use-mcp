@@ -78,6 +78,17 @@ impl StreamHealth {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangedRect {
+    /// Minimum tile-aligned bounding box of changed tiles, in full-frame
+    /// pixels. This is advisory change evidence only: it never replaces the
+    /// change_epoch/content_hash staleness authority.
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameMetadata {
     /// Local arrival counter. This is never an authority claim about the
     /// compositor or source sequence.
@@ -96,6 +107,10 @@ pub struct FrameMetadata {
     /// returns to an earlier hash so transient changes cannot be missed.
     pub change_epoch: u64,
     pub changed_from_previous: Option<bool>,
+    /// Tile-aligned bounding box of changed tiles versus the previous
+    /// committed frame, or None when there was no previous frame or nothing
+    /// changed. Advisory only; never a staleness authority.
+    pub changed_rect: Option<ChangedRect>,
     pub sequence_gap: Option<u64>,
 }
 
@@ -232,7 +247,8 @@ impl CaptureSession for CaptureHandle {
                     if let Some(Err(error)) = status.borrow().clone() {
                         return Err(error);
                     }
-                    if let Some(frame) = receiver.borrow().clone()
+                    let observed = receiver.borrow_and_update().clone();
+                    if let Some(frame) = observed
                         && after_generation
                             .is_none_or(|generation| frame.metadata.generation > generation)
                     {
@@ -287,6 +303,9 @@ struct StreamUserData {
     last_source_sequence: Option<u64>,
     last_content_hash: Option<u64>,
     change_epoch: u64,
+    /// Downsampled per-tile hashes of the last committed frame, used to
+    /// derive the advisory changed_rect without retaining a full frame copy.
+    prev_tiles: Option<TileGrid>,
     sender: watch::Sender<Option<OwnedFrame>>,
     failure: Arc<Mutex<Option<String>>>,
 }
@@ -333,6 +352,7 @@ fn run_pipewire(
         last_source_sequence: None,
         last_content_hash: None,
         change_epoch: 0,
+        prev_tiles: None,
         sender,
         failure: Arc::clone(&failure),
     };
@@ -457,6 +477,7 @@ fn begin_format(data: &mut StreamUserData) -> Result<(), String> {
     data.format = None;
     data.last_source_sequence = None;
     data.last_content_hash = None;
+    data.prev_tiles = None;
     // Keep change_epoch monotonic across format generations. Stability waits
     // bind both epochs, so renegotiation is independently observable.
     data.sender.send_replace(None);
@@ -467,6 +488,7 @@ fn invalidate_format(data: &mut StreamUserData) {
     data.format = None;
     data.last_source_sequence = None;
     data.last_content_hash = None;
+    data.prev_tiles = None;
     data.sender.send_replace(None);
 }
 
@@ -550,7 +572,7 @@ fn negotiated_parameter_pods(format: RawFormat) -> Result<Vec<Vec<u8>>, String> 
         .and_then(|stride| stride.checked_mul(format.height))
         .and_then(|value| i32::try_from(value).ok())
         .ok_or_else(|| "negotiated video buffer size is too large".to_owned())?;
-    let data_type_mask = data_type_mask(&[DataType::MemFd, DataType::MemPtr])?;
+    let data_type_mask = data_type_mask(&supported_data_types())?;
     let buffer = Object {
         type_: SpaTypes::ObjectParamBuffers.as_raw(),
         id: ParamType::Buffers.as_raw(),
@@ -614,6 +636,14 @@ fn negotiated_parameter_pods(format: RawFormat) -> Result<Vec<Vec<u8>>, String> 
         )?);
     }
     Ok(pods)
+}
+
+/// SPA data types this build can consume on the CPU. This is converted to a
+/// capability mask; the array order has no negotiation meaning. DMA-BUF
+/// (GPU-only) buffers are deliberately never negotiated because this build has
+/// no GPU import path (no libgbm/EGL/Vulkan) and forbids unsafe code.
+fn supported_data_types() -> [DataType; 2] {
+    [DataType::MemFd, DataType::MemPtr]
 }
 
 fn data_type_mask(types: &[DataType]) -> Result<i32, String> {
@@ -703,13 +733,24 @@ fn process_frame(stream: &pw::stream::Stream, user_data: &mut StreamUserData) {
     }
     let data = &mut datas[0];
     if data.type_() == DataType::DmaBuf {
-        report_failure(
-            &user_data.failure,
-            format!(
-                "PipeWire stream {} ignored the shared-memory request and supplied DMA-BUF-only data",
+        // Best effort before failing closed: some PipeWire versions leave a
+        // DMA-BUF CPU-mapped, in which case the shared-memory conversion
+        // below applies unchanged. Otherwise this is a GPU-only buffer this
+        // build cannot import, which is distinct from a corrupt frame.
+        match try_dmabuf_cpu_frame(data, format) {
+            Ok(Some(rgba)) => {
+                let header = buffer.find_meta::<MetaHeader>();
+                publish_frame(user_data, format, crop, transform, header, rgba);
+            }
+            Ok(None) => report_failure(
+                &user_data.failure,
+                dmabuf_only_error(user_data.stream_index),
+            ),
+            Err(error) => eprintln!(
+                "computer-use-mcp: rejecting corrupt DMA-BUF frame for stream {}: {error}",
                 user_data.stream_index
             ),
-        );
+        }
         return;
     }
     if !matches!(data.type_(), DataType::MemFd | DataType::MemPtr) {
@@ -764,8 +805,64 @@ fn process_frame(stream: &pw::stream::Stream, user_data: &mut StreamUserData) {
         }
     };
     let header = buffer.find_meta::<MetaHeader>();
-    let source_sequence = header.map(MetaHeader::seq);
-    let pts_ns = header.map(MetaHeader::pts).filter(|pts| *pts >= 0);
+    publish_frame(user_data, format, crop, transform, header, rgba);
+}
+
+/// Best-effort CPU read of a DMA-BUF plane using the same conversion as the
+/// shared-memory path. `Ok(None)` means the buffer is not CPU-mapped or is not
+/// readable, so the caller reports the unsupported GPU-only transport;
+/// conversion and corruption errors are returned separately and skipped
+/// without mislabelling them as GPU-only. Never touches GPU import APIs.
+fn try_dmabuf_cpu_frame(
+    data: &mut pw::spa::buffer::Data,
+    format: RawFormat,
+) -> Result<Option<Vec<u8>>, String> {
+    if !data.flags().contains(DataFlags::READABLE) {
+        return Ok(None);
+    }
+    let chunk = data.chunk();
+    if chunk.flags().contains(ChunkFlags::CORRUPTED) {
+        return Err("SPA chunk is marked corrupted".into());
+    }
+    if chunk.size() == 0 {
+        return Err("SPA chunk is empty".into());
+    }
+    let layout = RawLayout {
+        width: format.width,
+        height: format.height,
+        offset: chunk.offset(),
+        size: chunk.size(),
+        stride: chunk.stride(),
+        format: format.format,
+    };
+    let Some(bytes) = data.data() else {
+        return Ok(None);
+    };
+    convert_raw_frame(bytes, layout).map(Some)
+}
+
+/// Fail-closed diagnostic for GPU-only DMA-BUF streams. This is distinct from
+/// a corrupt or empty frame (which only skips that frame): a DMA-BUF-only
+/// stream can never be consumed by this build, so it is terminal.
+fn dmabuf_only_error(stream_index: usize) -> String {
+    format!(
+        "PipeWire stream {stream_index} supplied DMA-BUF-only data with no CPU mapping. \
+         This build negotiates the supported shared-memory buffers (MemFd and MemPtr) and has no GPU import path \
+         (no libgbm/EGL/Vulkan), so GPU-only buffers cannot be read; failing closed. \
+         Recovery: restart the MCP server to renegotiate shared memory, or use a compositor/driver offering SHM screencast buffers."
+    )
+}
+
+fn publish_frame(
+    user_data: &mut StreamUserData,
+    format: RawFormat,
+    crop: PixelRect,
+    transform: Transform,
+    header: Option<&MetaHeader>,
+    rgba: Vec<u8>,
+) {
+    let source_sequence = header.map(|header| header.seq());
+    let pts_ns = header.map(|header| header.pts()).filter(|pts| *pts >= 0);
     let sequence_gap = source_sequence.and_then(|sequence| {
         user_data.last_source_sequence.and_then(|previous| {
             (sequence > previous.saturating_add(1)).then_some(sequence - previous - 1)
@@ -774,7 +871,7 @@ fn process_frame(stream: &pw::stream::Stream, user_data: &mut StreamUserData) {
     let discontinuity = header
         .is_some_and(|header| header.flags().contains(MetaHeaderFlags::DISCONT))
         || sequence_gap.is_some();
-    let content_hash = hash_rgba(&rgba);
+    let (content_hash, grid) = hash_rgba_and_tile_grid(&rgba, format);
     let changed_from_previous = user_data
         .last_content_hash
         .map(|previous| previous != content_hash || discontinuity);
@@ -802,6 +899,16 @@ fn process_frame(stream: &pw::stream::Stream, user_data: &mut StreamUserData) {
     };
     user_data.last_source_sequence = source_sequence;
     user_data.last_content_hash = Some(content_hash);
+    // Advisory dirty bounding box: compare downsampled tile hashes against
+    // the previous committed frame. Never a staleness authority. The content
+    // and tile hashes were computed in the same RGBA traversal above.
+    let changed_rect = match (&user_data.prev_tiles, &grid) {
+        (Some(previous), Some(current)) => changed_rect_between(previous, current),
+        _ => None,
+    };
+    if grid.is_some() {
+        user_data.prev_tiles = grid;
+    }
     let stream_health = if discontinuity {
         StreamHealth::Degraded
     } else {
@@ -826,6 +933,7 @@ fn process_frame(stream: &pw::stream::Stream, user_data: &mut StreamUserData) {
             content_hash,
             change_epoch: user_data.change_epoch,
             changed_from_previous,
+            changed_rect,
             sequence_gap,
         },
         rgba,
@@ -848,6 +956,134 @@ fn hash_rgba(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+/// Tile edge in pixels for the advisory dirty-rect grid. Per-tile hashes keep
+/// per-frame change detection without retaining a full copy of the previous
+/// frame.
+const CHANGE_TILE_EDGE: u32 = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TileGrid {
+    tiles_x: u32,
+    tiles_y: u32,
+    frame_width: u32,
+    frame_height: u32,
+    hashes: Vec<u64>,
+}
+
+fn hash_rgba_and_tile_grid(rgba: &[u8], format: RawFormat) -> (u64, Option<TileGrid>) {
+    if format.width == 0 || format.height == 0 {
+        return (hash_rgba(rgba), None);
+    }
+    let (Ok(width), Ok(height), Ok(edge)) = (
+        usize::try_from(format.width),
+        usize::try_from(format.height),
+        usize::try_from(CHANGE_TILE_EDGE),
+    ) else {
+        return (hash_rgba(rgba), None);
+    };
+    let Some(expected_len) = width
+        .checked_mul(height)
+        .and_then(|value| value.checked_mul(4))
+    else {
+        return (hash_rgba(rgba), None);
+    };
+    if rgba.len() != expected_len {
+        return (hash_rgba(rgba), None);
+    }
+    let tiles_x = width.div_ceil(edge);
+    let tiles_y = height.div_ceil(edge);
+    let Some(tile_count) = tiles_x.checked_mul(tiles_y) else {
+        return (hash_rgba(rgba), None);
+    };
+    let mut content_hash = 0xcbf29ce484222325_u64;
+    let mut hashes = vec![0xcbf29ce484222325_u64; tile_count];
+    for y in 0..height {
+        let row = y * width * 4;
+        let tile_y = y / edge;
+        for x in 0..width {
+            let tile_index = tile_y * tiles_x + x / edge;
+            for byte in &rgba[row + x * 4..row + x * 4 + 4] {
+                let byte = u64::from(*byte);
+                content_hash ^= byte;
+                content_hash = content_hash.wrapping_mul(0x100000001b3);
+                hashes[tile_index] ^= byte;
+                hashes[tile_index] = hashes[tile_index].wrapping_mul(0x100000001b3);
+            }
+        }
+    }
+    let (Ok(tiles_x), Ok(tiles_y)) = (u32::try_from(tiles_x), u32::try_from(tiles_y)) else {
+        return (content_hash, None);
+    };
+    (
+        content_hash,
+        Some(TileGrid {
+            tiles_x,
+            tiles_y,
+            frame_width: format.width,
+            frame_height: format.height,
+            hashes,
+        }),
+    )
+}
+
+#[cfg(test)]
+fn tile_grid_for_frame(rgba: &[u8], format: RawFormat) -> Option<TileGrid> {
+    hash_rgba_and_tile_grid(rgba, format).1
+}
+
+/// Minimum tile-aligned bounding box covering every changed tile, in
+/// full-frame pixels. Returns None when nothing changed. A dimension or tile
+/// mismatch conservatively reports the whole current frame.
+fn changed_rect_between(previous: &TileGrid, current: &TileGrid) -> Option<ChangedRect> {
+    if previous.hashes.len() != current.hashes.len()
+        || previous.tiles_x != current.tiles_x
+        || previous.tiles_y != current.tiles_y
+        || previous.frame_width != current.frame_width
+        || previous.frame_height != current.frame_height
+    {
+        return Some(ChangedRect {
+            x: 0,
+            y: 0,
+            width: current.frame_width,
+            height: current.frame_height,
+        });
+    }
+    let mut min_tx: Option<u32> = None;
+    let mut max_tx: u32 = 0;
+    let mut min_ty: Option<u32> = None;
+    let mut max_ty: u32 = 0;
+    for (index, (before, after)) in previous
+        .hashes
+        .iter()
+        .zip(current.hashes.iter())
+        .enumerate()
+    {
+        if before == after {
+            continue;
+        }
+        let tile_x = u32::try_from(index % usize::try_from(current.tiles_x).ok()?).ok()?;
+        let tile_y = u32::try_from(index / usize::try_from(current.tiles_x).ok()?).ok()?;
+        min_tx = Some(min_tx.map_or(tile_x, |value| value.min(tile_x)));
+        max_tx = max_tx.max(tile_x);
+        min_ty = Some(min_ty.map_or(tile_y, |value| value.min(tile_y)));
+        max_ty = max_ty.max(tile_y);
+    }
+    let (min_tx, min_ty) = match (min_tx, min_ty) {
+        (Some(x), Some(y)) => (x, y),
+        _ => return None,
+    };
+    let right = (max_tx.checked_add(1)?.checked_mul(CHANGE_TILE_EDGE)?).min(current.frame_width);
+    let bottom = (max_ty.checked_add(1)?.checked_mul(CHANGE_TILE_EDGE)?).min(current.frame_height);
+    let x = min_tx.checked_mul(CHANGE_TILE_EDGE)?;
+    let y = min_ty.checked_mul(CHANGE_TILE_EDGE)?;
+    Some(ChangedRect {
+        x,
+        y,
+        width: right.checked_sub(x)?,
+        height: bottom.checked_sub(y)?,
+    })
 }
 
 pub fn frame_id(metadata: &FrameMetadata) -> String {
@@ -927,8 +1163,10 @@ fn convert_raw_frame(data: &[u8], layout: RawLayout) -> Result<Vec<u8>, String> 
     if chunk_size > data.len() {
         return Err("SPA chunk size exceeds mapped maxsize".into());
     }
-    let offset =
-        usize::try_from(layout.offset).map_err(|_| "offset is too large".to_owned())? % data.len();
+    let offset = usize::try_from(layout.offset).map_err(|_| "offset is too large".to_owned())?;
+    if offset >= data.len() {
+        return Err("SPA chunk offset exceeds mapped maxsize".into());
+    }
     let mut rgba = Vec::with_capacity(
         row_bytes
             .checked_mul(height)
@@ -938,25 +1176,22 @@ fn convert_raw_frame(data: &[u8], layout: RawLayout) -> Result<Vec<u8>, String> 
         let displacement = row
             .checked_mul(stride)
             .ok_or_else(|| "row offset overflow".to_owned())?;
-        let distance = displacement % data.len();
         let start = if layout.stride > 0 {
-            (offset + distance) % data.len()
-        } else if distance <= offset {
-            offset - distance
+            offset
+                .checked_add(displacement)
+                .ok_or_else(|| "row offset overflow".to_owned())?
         } else {
-            data.len() - (distance - offset)
+            offset
+                .checked_sub(displacement)
+                .ok_or_else(|| "negative-stride row precedes mapped data".to_owned())?
         };
-        if row_bytes > data.len() {
-            return Err("a pixel row is larger than mapped maxsize".into());
+        let end = start
+            .checked_add(row_bytes)
+            .ok_or_else(|| "pixel row end overflow".to_owned())?;
+        if end > data.len() {
+            return Err("pixel row exceeds mapped maxsize".into());
         }
-        let first_len = row_bytes.min(data.len() - start);
-        if first_len < row_bytes && first_len % 4 != 0 {
-            return Err("wrapped SPA row splits a pixel and is not safely contiguous".into());
-        }
-        append_rgba_pixels(&data[start..start + first_len], layout.format, &mut rgba)?;
-        if first_len < row_bytes {
-            append_rgba_pixels(&data[..row_bytes - first_len], layout.format, &mut rgba)?;
-        }
+        append_rgba_pixels(&data[start..end], layout.format, &mut rgba)?;
     }
     Ok(rgba)
 }
@@ -1015,6 +1250,7 @@ mod tests {
             last_source_sequence: Some(8),
             last_content_hash: Some(9),
             change_epoch: 7,
+            prev_tiles: None,
             sender,
             failure: Arc::new(Mutex::new(None)),
         };
@@ -1096,9 +1332,9 @@ mod tests {
     }
 
     #[test]
-    fn chunk_offset_is_modulo_maxsize_and_aligned_wrapped_rows_are_copied() {
+    fn chunk_offsets_and_rows_must_stay_inside_mapped_maxsize() {
         let pixels = [1, 0, 0, 255, 2, 0, 0, 255, 3, 0, 0, 255, 4, 0, 0, 255];
-        let modulo = convert_raw_frame(
+        let error = convert_raw_frame(
             &pixels,
             RawLayout {
                 width: 2,
@@ -1109,10 +1345,10 @@ mod tests {
                 format: VideoFormat::RGBA,
             },
         )
-        .unwrap();
-        assert_eq!(modulo, pixels[4..12]);
+        .unwrap_err();
+        assert!(error.contains("offset"), "{error}");
 
-        let wrapped = convert_raw_frame(
+        let error = convert_raw_frame(
             &pixels,
             RawLayout {
                 width: 2,
@@ -1123,8 +1359,8 @@ mod tests {
                 format: VideoFormat::RGBA,
             },
         )
-        .unwrap();
-        assert_eq!(wrapped, [4, 0, 0, 255, 1, 0, 0, 255]);
+        .unwrap_err();
+        assert!(error.contains("exceeds"), "{error}");
 
         let error = convert_raw_frame(
             &pixels,
@@ -1141,7 +1377,10 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(error.contains("splits a pixel"));
+        assert!(
+            error.contains("exceeds") || error.contains("offset"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1289,6 +1528,7 @@ mod tests {
                 content_hash: hash_rgba(&vec![value; (size.0 * size.1 * 4) as usize]),
                 change_epoch: 0,
                 changed_from_previous: None,
+                changed_rect: None,
                 sequence_gap: None,
             },
             rgba: vec![value; (size.0 * size.1 * 4) as usize],
@@ -1342,6 +1582,7 @@ mod tests {
             last_source_sequence: None,
             last_content_hash: None,
             change_epoch: 0,
+            prev_tiles: None,
             sender: sender.clone(),
             failure,
         };
@@ -1391,6 +1632,7 @@ mod tests {
             last_source_sequence: None,
             last_content_hash: None,
             change_epoch: 0,
+            prev_tiles: None,
             sender,
             failure: Arc::new(Mutex::new(None)),
         };
@@ -1400,5 +1642,210 @@ mod tests {
         assert_eq!(data.format_generation, 2);
         assert!(data.format.is_none());
         assert!(receiver.borrow().is_none());
+    }
+
+    #[test]
+    fn format_negotiation_supports_shared_memory_and_excludes_dmabuf() {
+        assert_eq!(supported_data_types(), [DataType::MemFd, DataType::MemPtr]);
+        let mask = data_type_mask(&supported_data_types()).unwrap();
+        let bit = |data_type: DataType| 1_i32 << data_type.as_raw();
+        assert_ne!(mask & bit(DataType::MemFd), 0);
+        assert_ne!(mask & bit(DataType::MemPtr), 0);
+        assert_eq!(mask & bit(DataType::DmaBuf), 0);
+        let pods = negotiated_parameter_pods(RawFormat {
+            format: VideoFormat::BGRx,
+            width: 64,
+            height: 64,
+        })
+        .unwrap();
+        assert!(!pods.is_empty());
+    }
+
+    #[test]
+    fn dmabuf_only_error_is_terminal_and_distinct_from_corruption() {
+        let error = dmabuf_only_error(3);
+        assert!(error.contains("stream 3"), "{error}");
+        assert!(error.contains("DMA-BUF-only"), "{error}");
+        assert!(error.contains("shared-memory"), "{error}");
+        assert!(error.contains("no GPU import path"), "{error}");
+        assert!(error.contains("Recovery"), "{error}");
+        assert!(!error.contains("corrupt"), "{error}");
+    }
+
+    fn solid_rgba(width: u32, height: u32, value: u8) -> Vec<u8> {
+        vec![value; (width as usize) * (height as usize) * 4]
+    }
+
+    fn raw_format(width: u32, height: u32) -> RawFormat {
+        RawFormat {
+            format: VideoFormat::RGBA,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn first_published_frame_has_no_previous_comparison() {
+        let (sender, receiver) = watch::channel(None);
+        let mut user_data = StreamUserData {
+            stream_index: 0,
+            generation: 0,
+            format_generation: 1,
+            format: Some(raw_format(1, 1)),
+            last_source_sequence: None,
+            last_content_hash: None,
+            change_epoch: 0,
+            prev_tiles: None,
+            sender,
+            failure: Arc::new(Mutex::new(None)),
+        };
+        let rgba = vec![1, 2, 3, 255];
+        let crop = PixelRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        publish_frame(
+            &mut user_data,
+            raw_format(1, 1),
+            crop,
+            Transform::Normal,
+            None,
+            rgba.clone(),
+        );
+        let first = receiver.borrow().clone().expect("first frame");
+        assert_eq!(first.metadata.changed_from_previous, None);
+        assert_eq!(first.metadata.changed_rect, None);
+        assert_eq!(first.metadata.content_hash, hash_rgba(&rgba));
+
+        publish_frame(
+            &mut user_data,
+            raw_format(1, 1),
+            crop,
+            Transform::Normal,
+            None,
+            rgba,
+        );
+        let second = receiver.borrow().clone().expect("second frame");
+        assert_eq!(second.metadata.changed_from_previous, Some(false));
+        assert_eq!(second.metadata.changed_rect, None);
+    }
+
+    #[test]
+    fn changed_rect_is_none_without_a_previous_frame() {
+        let grid = tile_grid_for_frame(&solid_rgba(64, 64, 7), raw_format(64, 64)).unwrap();
+        assert_eq!((grid.tiles_x, grid.tiles_y), (2, 2));
+        assert!(changed_rect_between(&grid, &grid).is_none());
+    }
+
+    #[test]
+    fn changed_rect_bounds_only_changed_tiles() {
+        let format = raw_format(64, 64);
+        let before = tile_grid_for_frame(&solid_rgba(64, 64, 7), format).unwrap();
+        let mut changed = solid_rgba(64, 64, 7);
+        // Pixel inside tile (1, 0).
+        let offset = (10 * 64 + 40) * 4;
+        changed[offset] = 8;
+        let after = tile_grid_for_frame(&changed, format).unwrap();
+        assert_eq!(
+            changed_rect_between(&before, &after),
+            Some(ChangedRect {
+                x: 32,
+                y: 0,
+                width: 32,
+                height: 32,
+            })
+        );
+    }
+
+    #[test]
+    fn changed_rect_spans_all_changed_tiles() {
+        let format = raw_format(64, 64);
+        let before = tile_grid_for_frame(&solid_rgba(64, 64, 7), format).unwrap();
+        let mut changed = solid_rgba(64, 64, 7);
+        changed[(5 * 64 + 5) * 4] = 8;
+        changed[(50 * 64 + 50) * 4] = 9;
+        let after = tile_grid_for_frame(&changed, format).unwrap();
+        assert_eq!(
+            changed_rect_between(&before, &after),
+            Some(ChangedRect {
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 64,
+            })
+        );
+    }
+
+    #[test]
+    fn changed_rect_clamps_partial_edge_tiles() {
+        let format = raw_format(48, 48);
+        let before = tile_grid_for_frame(&solid_rgba(48, 48, 7), format).unwrap();
+        let mut changed = solid_rgba(48, 48, 7);
+        changed[(40 * 48 + 40) * 4] = 8;
+        let after = tile_grid_for_frame(&changed, format).unwrap();
+        assert_eq!(
+            changed_rect_between(&before, &after),
+            Some(ChangedRect {
+                x: 32,
+                y: 32,
+                width: 16,
+                height: 16,
+            })
+        );
+    }
+
+    #[test]
+    fn changed_rect_reports_full_frame_on_dimension_mismatch() {
+        let before = tile_grid_for_frame(&solid_rgba(64, 64, 7), raw_format(64, 64)).unwrap();
+        let after = tile_grid_for_frame(&solid_rgba(32, 32, 7), raw_format(32, 32)).unwrap();
+        assert_eq!(
+            changed_rect_between(&before, &after),
+            Some(ChangedRect {
+                x: 0,
+                y: 0,
+                width: 32,
+                height: 32,
+            })
+        );
+    }
+
+    #[test]
+    fn tile_grid_rejects_size_mismatches() {
+        assert!(tile_grid_for_frame(&solid_rgba(64, 64, 7), raw_format(32, 32)).is_none());
+        assert!(
+            tile_grid_for_frame(
+                &solid_rgba(64, 64, 7),
+                RawFormat {
+                    format: VideoFormat::RGBA,
+                    width: 0,
+                    height: 64,
+                }
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn format_renegotiation_clears_tile_state() {
+        let (sender, _receiver) = watch::channel(None);
+        let format = raw_format(64, 64);
+        let mut data = StreamUserData {
+            stream_index: 0,
+            generation: 5,
+            format_generation: 2,
+            format: Some(format),
+            last_source_sequence: Some(8),
+            last_content_hash: Some(9),
+            change_epoch: 7,
+            prev_tiles: tile_grid_for_frame(&solid_rgba(64, 64, 7), format),
+            sender,
+            failure: Arc::new(Mutex::new(None)),
+        };
+        assert!(data.prev_tiles.is_some());
+        begin_format(&mut data).unwrap();
+        assert!(data.prev_tiles.is_none());
+        assert_eq!(data.change_epoch, 7);
     }
 }

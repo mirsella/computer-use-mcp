@@ -10,7 +10,7 @@ use super::{
 };
 use crate::validation::{
     KeyboardEvent, KeyboardPoint, MAX_KEYBOARD_EVENTS, MAX_KEYBOARD_EXPANDED_ACTIONS,
-    MAX_KEYBOARD_TRANSACTION_TEXT, MouseButton,
+    MAX_KEYBOARD_TRANSACTION_TEXT, MAX_TEXT_LIMIT, MouseButton,
 };
 
 const FOCUS_SETTLE_DELAY: Duration = Duration::from_millis(50);
@@ -19,14 +19,40 @@ type ResolvedStroke = (Vec<KeyboardKey>, KeyboardKey);
 type ResolvedAction = Vec<ResolvedStroke>;
 type ResolvedTransaction = Vec<ResolvedAction>;
 
+struct ResolvedPaste {
+    keys: Vec<ResolvedKey>,
+    chunk_ends: Vec<usize>,
+}
+
+impl ResolvedPaste {
+    fn chunks(&self) -> impl Iterator<Item = &[ResolvedKey]> {
+        let mut start = 0;
+        self.chunk_ends.iter().map(move |&end| {
+            let chunk = &self.keys[start..end];
+            start = end;
+            chunk
+        })
+    }
+}
+
 pub fn preflight_transaction(
-    backend: &ReisInputBackend,
+    _backend: &ReisInputBackend,
     focus: KeyboardPoint,
     events: &[KeyboardEvent],
 ) -> Result<(), String> {
     validate_transaction_shape(events)?;
     validate_focus(focus)?;
-    resolve_transaction(backend, events).map(drop)?;
+    Ok(())
+}
+
+/// Preflight a keyboard transaction for the already-focused element without
+/// resolving keys. Execution resolves the complete transaction before its
+/// first event, so preparation does not duplicate that work.
+pub fn preflight_transaction_focused(
+    _backend: &ReisInputBackend,
+    events: &[KeyboardEvent],
+) -> Result<(), String> {
+    validate_transaction_shape(events)?;
     Ok(())
 }
 
@@ -39,6 +65,119 @@ pub async fn perform_transaction(
     validate_focus(focus)?;
     let resolved = resolve_transaction(&backend, &events)?;
     tap_sequence(backend, focus, resolved, progress).await
+}
+
+/// Type into the already-focused element without moving the pointer or
+/// clicking: the caller must have verified AT-SPI focus (element focused, its
+/// window active) before dispatch. Held keys are released through the same
+/// cleanup guard as the point-click path.
+pub async fn perform_transaction_focused(
+    backend: Arc<ReisInputBackend>,
+    events: Vec<KeyboardEvent>,
+    progress: Arc<ActionProgress>,
+) -> Result<(), String> {
+    let resolved = resolve_transaction(&backend, &events)?;
+    type_into_focus(backend, resolved, progress).await
+}
+
+/// Split paste text into bounded typing chunks. The split is on Unicode scalar
+/// value boundaries so no chunk exceeds the single-transaction text limit.
+pub fn paste_chunks(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    paste_chunk_slices(text).map(str::to_owned).collect()
+}
+
+struct PasteChunkSlices<'a> {
+    text: &'a str,
+    next_byte: usize,
+}
+
+impl<'a> Iterator for PasteChunkSlices<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next_byte == self.text.len() {
+            return None;
+        }
+        let start = self.next_byte;
+        let mut end = start;
+        for (count, (offset, scalar)) in self.text[start..].char_indices().enumerate() {
+            if count == MAX_KEYBOARD_TRANSACTION_TEXT {
+                break;
+            }
+            end = start + offset + scalar.len_utf8();
+        }
+        self.next_byte = end;
+        Some(&self.text[start..end])
+    }
+}
+
+fn paste_chunk_slices(text: &str) -> PasteChunkSlices<'_> {
+    PasteChunkSlices { text, next_byte: 0 }
+}
+
+fn validate_paste_shape(text: &str) -> Result<(), String> {
+    if text.is_empty() {
+        return Err("paste text must not be empty".into());
+    }
+    if text.chars().count() > MAX_TEXT_LIMIT {
+        return Err(format!(
+            "paste text must contain at most {MAX_TEXT_LIMIT} Unicode scalar values"
+        ));
+    }
+    if text.contains('\0') {
+        return Err("paste text must not contain NUL".into());
+    }
+    Ok(())
+}
+
+pub fn preflight_paste(
+    _backend: &ReisInputBackend,
+    focus: KeyboardPoint,
+    text: &str,
+) -> Result<usize, String> {
+    validate_paste_shape(text)?;
+    validate_focus(focus)?;
+    Ok(paste_chunk_slices(text).count())
+}
+
+/// Preflight a paste for the already-focused element without resolving keys.
+/// Execution resolves every bounded chunk before its first event.
+pub fn preflight_paste_focused(_backend: &ReisInputBackend, text: &str) -> Result<usize, String> {
+    validate_paste_shape(text)?;
+    Ok(paste_chunk_slices(text).count())
+}
+
+/// Paste long text without touching any clipboard: focus-click the point, then
+/// type the text in bounded chunks. Each chunk runs through the same
+/// cleanup-guarded transaction path as a single `type` event, so held keys are
+/// released even when a later chunk fails. Never logs the text itself.
+pub async fn perform_paste(
+    backend: Arc<ReisInputBackend>,
+    focus: KeyboardPoint,
+    text: String,
+    progress: Arc<ActionProgress>,
+) -> Result<usize, String> {
+    validate_paste_shape(&text)?;
+    validate_focus(focus)?;
+    let resolved = resolve_paste(&backend, &text)?;
+    stream_paste(backend, Some(focus), resolved, progress).await
+}
+
+/// Paste into the already-focused element without moving the pointer or
+/// clicking. Same chunking and cleanup guarantees as [`perform_paste`]; the
+/// caller must have verified AT-SPI focus before dispatch. Never logs the
+/// text itself.
+pub async fn perform_paste_focused(
+    backend: Arc<ReisInputBackend>,
+    text: String,
+    progress: Arc<ActionProgress>,
+) -> Result<usize, String> {
+    validate_paste_shape(&text)?;
+    let resolved = resolve_paste(&backend, &text)?;
+    stream_paste(backend, None, resolved, progress).await
 }
 
 fn validate_focus(focus: KeyboardPoint) -> Result<(), String> {
@@ -89,27 +228,7 @@ fn resolve_action(
 ) -> Result<ResolvedAction, String> {
     match action {
         KeyboardEvent::Press(chord) => resolve_chord(backend, &parse_chord(chord)?),
-        KeyboardEvent::Type(text) => {
-            if text.is_empty() {
-                return Err("keyboard type event text must not be empty".into());
-            }
-            if text.chars().count() > MAX_KEYBOARD_TRANSACTION_TEXT {
-                return Err(format!(
-                    "keyboard type event text must contain at most {MAX_KEYBOARD_TRANSACTION_TEXT} Unicode scalar values"
-                ));
-            }
-            let keysyms = text
-                .chars()
-                .map(unicode_keysym)
-                .collect::<Result<Vec<_>, _>>()?;
-            let resolved = resolve_text(backend, &keysyms)?;
-            if resolved.len() > MAX_KEYBOARD_EXPANDED_ACTIONS {
-                return Err(format!(
-                    "keyboard expanded action count exceeds {MAX_KEYBOARD_EXPANDED_ACTIONS}"
-                ));
-            }
-            Ok(resolved)
-        }
+        KeyboardEvent::Type(text) => Ok(resolved_text_action(&resolve_text_keys(backend, text)?)),
     }
 }
 
@@ -144,20 +263,54 @@ fn resolve_chord(backend: &ReisInputBackend, chord: &KeyChord) -> Result<Resolve
     Ok(vec![(modifiers, keyboard_key(&key, key.keycode))])
 }
 
-fn resolve_text(backend: &ReisInputBackend, keysyms: &[u32]) -> Result<ResolvedAction, String> {
-    backend
-        .resolve_keysyms(keysyms)?
-        .into_iter()
+fn resolve_text_keys(backend: &ReisInputBackend, text: &str) -> Result<Vec<ResolvedKey>, String> {
+    if text.is_empty() {
+        return Err("keyboard type event text must not be empty".into());
+    }
+    if text.chars().count() > MAX_KEYBOARD_TRANSACTION_TEXT {
+        return Err(format!(
+            "keyboard type event text must contain at most {MAX_KEYBOARD_TRANSACTION_TEXT} Unicode scalar values"
+        ));
+    }
+    let keysyms = text
+        .chars()
+        .map(unicode_keysym)
+        .collect::<Result<Vec<_>, _>>()?;
+    let resolved = backend.resolve_keysyms(&keysyms)?;
+    if resolved.len() > MAX_KEYBOARD_EXPANDED_ACTIONS {
+        return Err(format!(
+            "keyboard expanded action count exceeds {MAX_KEYBOARD_EXPANDED_ACTIONS}"
+        ));
+    }
+    if resolved.len() != keysyms.len() {
+        return Err("EIS returned an incomplete keyboard resolution".into());
+    }
+    Ok(resolved)
+}
+
+fn resolved_text_action(resolved: &[ResolvedKey]) -> ResolvedAction {
+    resolved
+        .iter()
         .map(|key| {
             let modifiers = key
                 .modifiers
                 .into_iter()
                 .flatten()
-                .map(|keycode| keyboard_key(&key, keycode))
+                .map(|keycode| keyboard_key(key, keycode))
                 .collect();
-            Ok((modifiers, keyboard_key(&key, key.keycode)))
+            (modifiers, keyboard_key(key, key.keycode))
         })
         .collect()
+}
+
+fn resolve_paste(backend: &ReisInputBackend, text: &str) -> Result<ResolvedPaste, String> {
+    let mut keys = Vec::new();
+    let mut chunk_ends = Vec::new();
+    for chunk in paste_chunk_slices(text) {
+        keys.extend(resolve_text_keys(backend, chunk)?);
+        chunk_ends.push(keys.len());
+    }
+    Ok(ResolvedPaste { keys, chunk_ends })
 }
 
 fn keyboard_key(resolved: &ResolvedKey, keycode: u32) -> KeyboardKey {
@@ -196,31 +349,116 @@ where
             format!("focus click was dispatched but synchronization failed: {error}")
         })?;
         sleep(FOCUS_SETTLE_DELAY).await;
-        let action_count = actions.len();
-        for (index, action) in actions.into_iter().enumerate() {
-            for (modifiers, keycode) in action {
-                for &modifier in &modifiers {
-                    guard.press(HeldInput::Keycode(modifier)).await?;
-                }
-                let key = HeldInput::Keycode(keycode);
-                guard.press(key).await?;
-                guard.release(key).await?;
-                for &modifier in modifiers.iter().rev() {
-                    guard.release(HeldInput::Keycode(modifier)).await?;
-                }
-            }
-            if index + 1 < action_count {
-                backend.sync_barrier().await.map_err(|error| {
-                    format!("keyboard phase dispatched but synchronization failed: {error}")
-                })?;
-                sleep(FOCUS_SETTLE_DELAY).await;
-            }
-        }
+        emit_keys(&backend, &mut guard, actions).await?;
         progress.mark_completed();
         Ok(())
     }
     .await;
     super::backend::finish_with_cleanup(result, &mut guard, &progress).await
+}
+
+async fn stream_paste<B>(
+    backend: Arc<B>,
+    focus: Option<KeyboardPoint>,
+    resolved: ResolvedPaste,
+    progress: Arc<ActionProgress>,
+) -> Result<usize, String>
+where
+    B: InputBackend,
+{
+    if let Some(focus) = focus {
+        validate_focus(focus)?;
+    }
+    let backend: Arc<dyn InputBackend> = backend;
+    let mut guard = HeldInputGuard::new(Arc::clone(&backend));
+    guard.begin().await?;
+    let result = async {
+        progress.mark_started();
+        if let Some(focus) = focus {
+            backend
+                .emit(InputEvent::Absolute {
+                    x: focus.x,
+                    y: focus.y,
+                })
+                .await?;
+            let button = HeldInput::Button(button_code(MouseButton::Left));
+            guard.press(button).await?;
+            guard.release(button).await?;
+            backend.sync_barrier().await.map_err(|error| {
+                format!("focus click was dispatched but synchronization failed: {error}")
+            })?;
+            sleep(FOCUS_SETTLE_DELAY).await;
+        }
+
+        let chunk_count = resolved.chunk_ends.len();
+        for (index, chunk) in resolved.chunks().enumerate() {
+            emit_keys(&backend, &mut guard, vec![resolved_text_action(chunk)])
+                .await
+                .map_err(|error| format!("paste chunk {} failed: {error}", index + 1))?;
+            if index + 1 < chunk_count {
+                backend.sync_barrier().await.map_err(|error| {
+                    format!("paste chunk {} synchronization failed: {error}", index + 1)
+                })?;
+            }
+        }
+        progress.mark_completed();
+        Ok(chunk_count)
+    }
+    .await;
+    super::backend::finish_with_cleanup(result, &mut guard, &progress).await
+}
+
+/// Type resolved key actions into the already-focused element: no pointer
+/// movement, no click, no focus barrier. Held keys are released through the
+/// same cleanup guard as [`tap_sequence`], so interrupted typing still
+/// restores modifiers.
+async fn type_into_focus<B>(
+    backend: Arc<B>,
+    actions: ResolvedTransaction,
+    progress: Arc<ActionProgress>,
+) -> Result<(), String>
+where
+    B: InputBackend,
+{
+    let backend: Arc<dyn InputBackend> = backend;
+    let mut guard = HeldInputGuard::new(Arc::clone(&backend));
+    guard.begin().await?;
+    let result = async {
+        progress.mark_started();
+        emit_keys(&backend, &mut guard, actions).await?;
+        progress.mark_completed();
+        Ok(())
+    }
+    .await;
+    super::backend::finish_with_cleanup(result, &mut guard, &progress).await
+}
+
+async fn emit_keys(
+    backend: &Arc<dyn InputBackend>,
+    guard: &mut HeldInputGuard,
+    actions: ResolvedTransaction,
+) -> Result<(), String> {
+    let action_count = actions.len();
+    for (index, action) in actions.into_iter().enumerate() {
+        for (modifiers, keycode) in action {
+            for &modifier in &modifiers {
+                guard.press(HeldInput::Keycode(modifier)).await?;
+            }
+            let key = HeldInput::Keycode(keycode);
+            guard.press(key).await?;
+            guard.release(key).await?;
+            for &modifier in modifiers.iter().rev() {
+                guard.release(HeldInput::Keycode(modifier)).await?;
+            }
+        }
+        if index + 1 < action_count {
+            backend.sync_barrier().await.map_err(|error| {
+                format!("keyboard phase dispatched but synchronization failed: {error}")
+            })?;
+            sleep(FOCUS_SETTLE_DELAY).await;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -229,9 +467,150 @@ mod tests {
 
     use super::*;
     use crate::input::backend::test_support::{FakeBackend, TraceEvent};
+    use crate::runtime::DispatchStage;
 
     fn progress() -> Arc<ActionProgress> {
         Arc::new(ActionProgress::default())
+    }
+
+    #[test]
+    fn paste_chunks_split_on_scalar_boundaries_and_rejoin() {
+        assert_eq!(paste_chunks("hello"), vec!["hello".to_owned()]);
+        let long = "a".repeat(MAX_KEYBOARD_TRANSACTION_TEXT * 2 + 7);
+        let chunks = paste_chunks(&long);
+        assert_eq!(chunks.len(), 3);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.chars().count() <= MAX_KEYBOARD_TRANSACTION_TEXT)
+        );
+        assert_eq!(chunks.concat(), long);
+        // Multi-byte scalars straddling a chunk boundary stay intact.
+        let wide = "é".repeat(MAX_KEYBOARD_TRANSACTION_TEXT + 1);
+        let chunks = paste_chunks(&wide);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks.concat(), wide);
+        for chunk in &chunks {
+            assert!(chunk.is_char_boundary(chunk.len()));
+        }
+    }
+
+    fn resolved_paste(key_count: usize) -> ResolvedPaste {
+        let keys = (0..key_count)
+            .map(|index| ResolvedKey {
+                device_id: 7,
+                resume_generation: 2,
+                keycode: 30 + (index as u32 % 4),
+                modifiers: [None; 4],
+            })
+            .collect();
+        let mut chunk_ends = Vec::new();
+        let mut end = 0;
+        while end < key_count {
+            end = (end + MAX_KEYBOARD_TRANSACTION_TEXT).min(key_count);
+            chunk_ends.push(end);
+        }
+        ResolvedPaste { keys, chunk_ends }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn long_paste_focuses_once_and_keeps_chunk_order() {
+        let backend = FakeBackend::new();
+        let progress = progress();
+        stream_paste(
+            Arc::clone(&backend),
+            Some(KeyboardPoint { x: 10.0, y: 20.0 }),
+            resolved_paste(MAX_KEYBOARD_TRANSACTION_TEXT + 1),
+            Arc::clone(&progress),
+        )
+        .await
+        .unwrap();
+
+        let events = backend.events.lock().unwrap().clone();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, InputEvent::Absolute { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, InputEvent::Button { .. }))
+                .count(),
+            2
+        );
+        let first_key = events
+            .iter()
+            .position(|event| matches!(event, InputEvent::Keycode { pressed: true, .. }))
+            .unwrap();
+        assert!(matches!(
+            events[first_key - 1],
+            InputEvent::Button { pressed: false, .. }
+        ));
+        let key_presses = events
+            .iter()
+            .filter_map(|event| match event {
+                InputEvent::Keycode { key, pressed: true } => Some(key.keycode),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let expected_keycodes = (0..MAX_KEYBOARD_TRANSACTION_TEXT + 1)
+            .map(|index| 30 + (index as u32 % 4))
+            .collect::<Vec<_>>();
+        assert_eq!(key_presses, expected_keycodes);
+        // One barrier flushes the focus click and one separates the two
+        // bounded chunks; neither starts a new input lifecycle.
+        assert_eq!(backend.sync_calls.load(Ordering::Acquire), 2);
+        assert_eq!(progress.snapshot().dispatch_stage, DispatchStage::Completed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn focused_long_paste_streams_without_pointer_focus() {
+        let backend = FakeBackend::new();
+        let progress = progress();
+        stream_paste(
+            Arc::clone(&backend),
+            None,
+            resolved_paste(MAX_KEYBOARD_TRANSACTION_TEXT + 1),
+            Arc::clone(&progress),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            backend
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| matches!(event, InputEvent::Keycode { .. }))
+        );
+        assert_eq!(backend.sync_calls.load(Ordering::Acquire), 1);
+        assert_eq!(progress.snapshot().dispatch_stage, DispatchStage::Completed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn later_paste_chunk_failure_does_not_complete_progress() {
+        let backend = FakeBackend::new();
+        // Three focus events and two events for each key in the first chunk.
+        backend
+            .fail_at
+            .store(3 + 2 * MAX_KEYBOARD_TRANSACTION_TEXT, Ordering::Release);
+        let progress = progress();
+        let error = stream_paste(
+            Arc::clone(&backend),
+            Some(KeyboardPoint { x: 10.0, y: 20.0 }),
+            resolved_paste(MAX_KEYBOARD_TRANSACTION_TEXT + 1),
+            Arc::clone(&progress),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("paste chunk 2 failed"));
+        assert_eq!(progress.snapshot().dispatch_stage, DispatchStage::Started);
+        assert_eq!(backend.cleanup_calls.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -296,6 +675,58 @@ mod tests {
             ]
         );
         assert_eq!(backend.sync_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn focused_typing_emits_keys_without_pointer_or_click() {
+        let backend = FakeBackend::new();
+
+        let modifier = KeyboardKey {
+            device_id: 7,
+            resume_generation: 2,
+            keycode: 42,
+        };
+        let key = KeyboardKey {
+            keycode: 30,
+            ..modifier
+        };
+        type_into_focus(
+            Arc::clone(&backend),
+            vec![vec![(vec![modifier], key)]],
+            progress(),
+        )
+        .await
+        .unwrap();
+
+        // No pointer movement, no click, no focus barrier: only keystrokes.
+        assert!(
+            backend
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| matches!(event, InputEvent::Keycode { .. })),
+            "focused typing must not emit pointer events"
+        );
+        assert_eq!(
+            *backend.events.lock().unwrap(),
+            vec![
+                InputEvent::Keycode {
+                    key: modifier,
+                    pressed: true,
+                },
+                InputEvent::Keycode { key, pressed: true },
+                InputEvent::Keycode {
+                    key,
+                    pressed: false,
+                },
+                InputEvent::Keycode {
+                    key: modifier,
+                    pressed: false,
+                },
+            ]
+        );
+        assert_eq!(backend.sync_calls.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]

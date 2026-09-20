@@ -145,12 +145,13 @@ impl ActionProgress {
     }
 
     pub fn mark_started(&self) {
-        if self
+        match self
             .dispatch_stage
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
         {
-            eprintln!("computer-use-mcp: refusing to regress or repeat dispatch start");
+            // An attempt can include both semantic focus and generated input.
+            Ok(_) | Err(1) => {}
+            Err(_) => eprintln!("computer-use-mcp: refusing to regress dispatch start"),
         }
     }
 
@@ -246,6 +247,11 @@ pub fn with_action_progress_snapshot(
 
 pub trait DesktopRuntime: Send + Sync + 'static {
     fn start(&self) {}
+    /// True after approval failure or capture exhaustion requires a new owner.
+    /// This must not include a user-takeover latch or an ordinary action error.
+    fn desktop_session_exhausted(&self) -> bool {
+        false
+    }
     fn wait_for_desktop_session(&self) -> impl Future<Output = ()> + Send + '_ {
         async {}
     }
@@ -373,6 +379,55 @@ pub fn tool_error_result(error: &RuntimeError) -> CallToolResult {
     result
 }
 
+/// Reserve routing evidence before projecting the worker payload. Error and
+/// dispatch suffixes retain their existing priority within the smaller budget.
+pub(crate) fn annotate_mcp_result(
+    result: &mut CallToolResult,
+    header: &str,
+    metadata: serde_json::Map<String, serde_json::Value>,
+) {
+    let text_budget = MAX_MODEL_TEXT_BYTES
+        .checked_sub(header.len())
+        .expect("routing header exceeds text budget");
+    for (index, content) in result.content.iter_mut().enumerate() {
+        if let ContentBlock::Text(text) = content {
+            let budget = if index == 0 {
+                text_budget
+            } else {
+                MAX_MODEL_TEXT_BYTES
+            };
+            let suffix = text
+                .text
+                .rfind("\nCode:")
+                .or_else(|| text.text.rfind("\nAction progress:"));
+            text.text = if let Some(offset) = suffix {
+                bound_text_with_suffix(&text.text[..offset], &text.text[offset + 1..], budget)
+            } else {
+                bound_text(std::mem::take(&mut text.text), budget)
+            };
+            if index == 0 {
+                text.text.insert_str(0, header);
+            }
+        }
+    }
+    let overhead = json_size(&serde_json::Value::Object(metadata.clone())) - 1;
+    let budget = MAX_MODEL_STRUCTURED_BYTES
+        .checked_sub(overhead)
+        .expect("routing metadata exceeds structured budget");
+    let mut structured = bound_structured(
+        result
+            .structured_content
+            .take()
+            .unwrap_or_else(|| serde_json::json!({})),
+        budget,
+    );
+    structured
+        .as_object_mut()
+        .expect("desktop results have object structured content")
+        .extend(metadata);
+    result.structured_content = Some(structured);
+}
+
 const OUTPUT_TRUNCATION_MARKER: &str =
     "Truncated: reason=response_byte_budget value_projection=bounded\n";
 
@@ -425,6 +480,8 @@ fn bound_structured(value: serde_json::Value, maximum: usize) -> serde_json::Val
     );
 
     let keys = [
+        "desktop",
+        "session_id",
         "code",
         "message",
         "outcome",
@@ -521,4 +578,28 @@ fn json_size(value: &serde_json::Value) -> usize {
     serde_json::to_vec(value)
         .expect("structured output values must be serializable")
         .len()
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_dispatch_start_preserves_partial_and_completed_outcomes() {
+        let progress = ActionProgress::default();
+        assert_eq!(progress.snapshot().outcome(), ToolOutcome::NotStarted);
+
+        // GrabFocus and EIS share this record. Re-entering dispatch must not
+        // erase the fact that focus already changed if typing is interrupted.
+        progress.mark_started();
+        progress.mark_cleanup_completed();
+        progress.mark_started();
+        assert_eq!(progress.snapshot().outcome(), ToolOutcome::Unknown);
+        assert_eq!(progress.snapshot().cleanup, CleanupStatus::Completed);
+
+        progress.mark_completed();
+        progress.mark_started();
+        assert_eq!(progress.snapshot().outcome(), ToolOutcome::Completed);
+        assert_eq!(progress.snapshot().dispatch_stage, DispatchStage::Completed);
+    }
 }

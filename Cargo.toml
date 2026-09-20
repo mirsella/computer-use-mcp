@@ -21,9 +21,9 @@ image = { version = "=0.25.10", default-features = false, features = ["png"] }
 pipewire = { version = "=0.10.0", features = ["v1_0_0"] }
 reis = { version = "=0.7.0", default-features = false, features = ["tokio"] }
 rmcp = { version = "=2.2.0", default-features = false, features = ["server", "transport-io"] }
-rustix = { version = "=1.1.4", default-features = false, features = ["event", "fs", "time"] }
+rustix = { version = "=1.1.4", default-features = false, features = ["event", "fs", "time", "process"] }
 serde_json = "=1.0.150"
-tokio = { version = "=1.49.0", features = ["io-std", "io-util", "macros", "rt", "sync", "time"] }
+tokio = { version = "=1.49.0", features = ["io-std", "io-util", "macros", "rt", "sync", "time", "process"] }
 wayland-client = "=0.31.15"
 wayland-backend = "=0.3.16"
 wayland-protocols = { version = "=0.32.13", features = ["client", "staging"] }

@@ -80,6 +80,23 @@ fn checked_crop(image: &RgbaImage, crop: PixelRect) -> Result<RgbaImage, String>
     Ok(imageops::crop_imm(image, crop.x, crop.y, crop.width, crop.height).to_image())
 }
 
+/// Crop an already-encoded observation PNG in output-pixel space and
+/// re-encode it with the same PNG settings. Used for advisory target-window
+/// crops: the caller maps the window rect to output pixels, records the
+/// source-space rect for input remapping, and must use the returned size for
+/// coordinate mappings.
+pub fn crop_encoded_png(png: &[u8], rect: PixelRect) -> Result<EncodedPng, String> {
+    let image = image::load_from_memory(png)
+        .map_err(|error| format!("window crop cannot decode the observation PNG: {error}"))?
+        .to_rgba8();
+    let cropped = checked_crop(&image, rect)?;
+    let bytes = encode_png(&cropped)?;
+    Ok(EncodedPng {
+        bytes,
+        size: (cropped.width(), cropped.height()),
+    })
+}
+
 fn apply_transform(image: RgbaImage, transform: Transform) -> RgbaImage {
     match transform {
         Transform::Normal => image,
@@ -199,6 +216,62 @@ mod tests {
         assert_eq!(
             labels(&apply_transform(image, Transform::FlipRotate270)),
             [6, 3, 5, 2, 4, 1]
+        );
+    }
+
+    #[test]
+    fn crop_encoded_png_keeps_exact_pixels_and_reports_size() {
+        let width = 16;
+        let height = 12;
+        let mut rgba = vec![0; width * height * 4];
+        for y in 0..height {
+            for x in 0..width {
+                let offset = (y * width + x) * 4;
+                rgba[offset] = x as u8;
+                rgba[offset + 1] = y as u8;
+                rgba[offset + 3] = 255;
+            }
+        }
+        let full = encode_with_limits(
+            rgba,
+            (width as u32, height as u32),
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: width as u32,
+                height: height as u32,
+            },
+            Transform::Normal,
+            128,
+            900 * 1024,
+        )
+        .unwrap();
+        let rect = PixelRect {
+            x: 4,
+            y: 3,
+            width: 8,
+            height: 6,
+        };
+        let cropped = crop_encoded_png(&full.bytes, rect).unwrap();
+        assert_eq!(cropped.size, (8, 6));
+        assert_eq!(&cropped.bytes[..8], b"\x89PNG\r\n\x1a\n");
+        let decoded = image::load_from_memory(&cropped.bytes).unwrap().to_rgba8();
+        assert_eq!((decoded.width(), decoded.height()), (8, 6));
+        assert_eq!(decoded.get_pixel(0, 0)[0], 4);
+        assert_eq!(decoded.get_pixel(0, 0)[1], 3);
+        assert_eq!(decoded.get_pixel(7, 5)[0], 11);
+        assert_eq!(decoded.get_pixel(7, 5)[1], 8);
+        assert!(
+            crop_encoded_png(
+                &full.bytes,
+                PixelRect {
+                    x: 15,
+                    y: 11,
+                    width: 8,
+                    height: 6,
+                }
+            )
+            .is_err()
         );
     }
 }
