@@ -50,7 +50,7 @@ jobs:
           COMPUTER_USE_MCP_PACKAGE_DIR=target/npm-package-test/package npm test
           ldd target/npm-package-test/package/vendor/computer-use-mcp
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: npm-package
           path: mirsella-opencode-computer-use-mcp-*.tgz
@@ -69,7 +69,7 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: npm-package
       - name: Publish with npm trusted publishing
