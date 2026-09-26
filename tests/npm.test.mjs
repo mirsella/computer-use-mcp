@@ -23,7 +23,7 @@ test("plugin registers the bundled server and synchronized skill idempotently", 
   assert.equal(plugin.id, manifest.name);
   assert.deepEqual(config.mcp.computer_use, {
     type: "local",
-    command: [binary, "mcp"],
+    command: [binary, "mcp", "--compact-tools"],
     enabled: true,
     timeout: 90_000,
   });
@@ -55,12 +55,44 @@ test("bundled executable has the package version", async () => {
   assert.equal(execFileSync(binary, ["version"], { encoding: "utf8" }).trim(), manifest.version);
 });
 
-test("bundled MCP initializes and lists all six tools without a desktop", { timeout: 15_000 }, async (t) => {
+test("compact mode respects global and agent-specific permissions and tool switches", async (t) => {
+  const warn = t.mock.method(console, "warn", () => {});
+  const cases = [
+    [{ permission: { "*": "allow", "computer_use_*": "ask" } }, true],
+    [{ permission: "ask" }, true],
+    [{ tools: { "computer_use_*": false } }, true],
+    [{ permission: { computer_use_dispatch: "deny" } }, true],
+    [{ permission: { computer_use_act: "ask" } }, false],
+    [{ permission: { "computer_use_*": "allow", computer_use_observe: "deny" } }, false],
+    [{ permission: { "computer_use_a*": "deny" } }, false],
+    [{ permission: { "computer_use_ac?": "ask" } }, false],
+    [{ permission: { "computer_use_act.extra": "deny" } }, true],
+    [{ tools: { computer_use_launch_application: false } }, false],
+    [{ agent: { reviewer: { permission: { computer_use_act: "deny" } } } }, false],
+    [{ agent: { reviewer: { tools: { computer_use_wait_for: false } } } }, false],
+    [{ agent: { reviewer: { permission: { "computer_use_*": "ask" } } } }, true],
+  ];
+  for (const [policy, compact] of cases) {
+    const config = structuredClone(policy);
+    const hooks = await plugin.server();
+    await hooks.config(config);
+    assert.deepEqual(config.mcp.computer_use.command, compact
+      ? [binary, "mcp", "--compact-tools"] : [binary, "mcp"], JSON.stringify(policy));
+    for (const key of Object.keys(policy)) assert.deepEqual(config[key], policy[key]);
+  }
+  assert.equal(warn.mock.callCount(), cases.filter(([, compact]) => !compact).length);
+  const config = {};
+  await (await plugin.server(undefined, { compactTools: false })).config(config);
+  assert.deepEqual(config.mcp.computer_use.command, [binary, "mcp"]);
+  await assert.rejects(plugin.server(undefined, { compactTools: "false" }), /boolean/);
+});
+
+async function connect(t, compact) {
   const env = { ...process.env };
   for (const key of ["WAYLAND_DISPLAY", "DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "XDG_SESSION_TYPE"]) {
     delete env[key];
   }
-  const child = spawn(binary, ["mcp"], { env, stdio: ["pipe", "pipe", "pipe"] });
+  const child = spawn(binary, compact ? ["mcp", "--compact-tools"] : ["mcp"], { env, stdio: ["pipe", "pipe", "pipe"] });
   t.after(() => { if (child.exitCode === null) child.kill("SIGKILL"); });
   const exited = once(child, "exit");
   let stderr = "";
@@ -73,8 +105,7 @@ test("bundled MCP initializes and lists all six tools without a desktop", { time
       assert.equal(done, false, `MCP exited before response: ${stderr}`);
       const message = JSON.parse(value);
       if (message.id !== id) continue;
-      assert.equal(message.error, undefined);
-      return message.result;
+      return message;
     }
   }
   send({ id: 1, method: "initialize", params: {
@@ -82,14 +113,63 @@ test("bundled MCP initializes and lists all six tools without a desktop", { time
     capabilities: {},
     clientInfo: { name: "npm-package-test", version: "1.0.0" },
   } });
-  const initialized = await receive(1);
+  const { result: initialized } = await receive(1);
   assert.equal(initialized.serverInfo.version, manifest.version);
   send({ method: "notifications/initialized" });
-  send({ id: 2, method: "tools/list", params: {} });
-  const { tools } = await receive(2);
+  let id = 1;
+  return {
+    async request(method, params = {}) {
+      send({ id: ++id, method, params });
+      return receive(id);
+    },
+    async close() {
+      child.stdin.end();
+      assert.deepEqual(await exited, [0, null], stderr);
+      assert.doesNotMatch(stderr, /starting KDE desktop session/);
+    },
+  };
+}
+
+test("compact MCP discovers exact schemas and preserves direct validation without a desktop", { timeout: 15_000 }, async (t) => {
+  const direct = await connect(t, false);
+  const compact = await connect(t, true);
+  const { result: { tools } } = await direct.request("tools/list");
   assert.deepEqual(tools.map((tool) => tool.name), [
     "list_desktop", "launch_application", "activate_window", "observe", "act", "wait_for",
   ]);
-  child.stdin.end();
-  assert.deepEqual(await exited, [0, null], stderr);
+  const { result: compactList } = await compact.request("tools/list");
+  assert.deepEqual(compactList.tools.map((tool) => tool.name), ["help", "dispatch"]);
+  assert.equal(compactList.tools[0].annotations.readOnlyHint, true);
+  assert.equal(compactList.tools[1].annotations.readOnlyHint, false);
+  assert.equal(compactList.tools[1].annotations.destructiveHint, true);
+  const call = (client, name, args) => client.request("tools/call", { name, arguments: args });
+  const { result: catalog } = await call(compact, "help", {});
+  assert.deepEqual(JSON.parse(catalog.content[0].text), { actions: tools.map((tool) => tool.name) });
+  for (const tool of tools) {
+    const { result: help } = await call(compact, "help", { action: tool.name });
+    assert.equal(help.content.length, 1);
+    assert.equal(help.structuredContent, undefined, "help must not duplicate schemas");
+    assert.deepEqual(JSON.parse(help.content[0].text), tool);
+    const original = await call(direct, tool.name, {});
+    const wrapped = await call(compact, "dispatch", { action: tool.name, arguments: {} });
+    assert.equal(wrapped.result.isError, true);
+    assert.deepEqual(wrapped.result, original.result);
+  }
+  for (const args of [
+    {}, { action: "dispatch", arguments: {} }, { action: "unknown", arguments: {} },
+    { action: "list_desktop", arguments: [] },
+    { action: "list_desktop", arguments: { scope: "windows" }, desktop: "background" },
+    { action: "list_desktop", arguments: { scope: "windows", desktop: "invalid" } },
+  ]) {
+    const { result } = await call(compact, "dispatch", args);
+    assert.equal(result.isError, true);
+    assert.equal(result.structuredContent.outcome, "not_started");
+  }
+  for (const args of [{ action: null }, { action: "unknown" }, { extra: true }]) {
+    assert.equal((await call(compact, "help", args)).result.isError, true);
+  }
+  assert.equal((await call(compact, "act", {})).error.code, -32602);
+  assert.equal((await call(direct, "dispatch", {})).error.code, -32602);
+  await direct.close();
+  await compact.close();
 });

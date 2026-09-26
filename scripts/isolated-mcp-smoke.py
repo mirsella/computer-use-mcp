@@ -13,15 +13,25 @@ import time
 
 class Client:
     def __init__(
-        self, binary=None, command=None, env=None, desktop=None, native_runner=None
+        self,
+        binary=None,
+        command=None,
+        env=None,
+        desktop=None,
+        native_runner=None,
+        compact=False,
     ):
         self.next_id = 1
         self.desktop = desktop
+        self.compact = compact
+        self.schemas = {}
         self.native_runner = (
             command is not None if native_runner is None else native_runner
         )
         if command is None:
             command = [binary, "mcp"]
+            if compact:
+                command.append("--compact-tools")
         self.process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
@@ -32,6 +42,24 @@ class Client:
         )
 
     def request(self, method, params):
+        if (
+            self.compact
+            and method == "tools/call"
+            and params["name"] not in {"help", "dispatch"}
+        ):
+            action = params["name"]
+            if action not in self.schemas:
+                help_response = self.request(
+                    "tools/call", {"name": "help", "arguments": {"action": action}}
+                )
+                schema = json.loads(help_response["result"]["content"][0]["text"])
+                assert schema["name"] == action
+                self.schemas[action] = schema
+                print(f"schema_loaded={action}")
+            params = {
+                "name": "dispatch",
+                "arguments": {"action": action, "arguments": params["arguments"]},
+            }
         request_id = self.next_id
         self.next_id += 1
         self.process.stdin.write(
@@ -360,15 +388,18 @@ def main():
     if len(sys.argv) == 2:
         client = Client(binary=sys.argv[1])
         print("transport=direct_mcp_binary")
-    elif len(sys.argv) == 3 and sys.argv[1] == "--normal-mcp":
+    elif len(sys.argv) == 3 and sys.argv[1] in {"--normal-mcp", "--compact-mcp"}:
         binary = sys.argv[2]
         client = Client(
             binary=binary,
             env=os.environ.copy(),
             desktop="background",
             native_runner=True,
+            compact=sys.argv[1] == "--compact-mcp",
         )
-        print("transport=normal_mcp_entrypoint desktop=background wrapper=none")
+        print(
+            f"transport=normal_mcp_entrypoint desktop=background wrapper=none compact={client.compact}"
+        )
     elif len(sys.argv) == 4 and sys.argv[1] == "--normal-runner":
         runner, binary = sys.argv[2:]
         binary_directory = os.path.dirname(os.path.abspath(binary))
@@ -387,7 +418,7 @@ def main():
     else:
         raise SystemExit(
             f"usage: {sys.argv[0]} MCP_BINARY | "
-            f"{sys.argv[0]} --normal-mcp MCP_BINARY | "
+            f"{sys.argv[0]} --normal-mcp MCP_BINARY | --compact-mcp MCP_BINARY | "
             f"{sys.argv[0]} --normal-runner RUNNER MCP_BINARY"
         )
     target = None

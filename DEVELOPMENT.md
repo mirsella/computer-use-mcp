@@ -106,10 +106,13 @@ establishes startup support. Run the direct normal-MCP smoke with:
 
 ```sh
 python3 scripts/isolated-mcp-smoke.py --normal-mcp "$PWD/target/debug/computer-use-mcp"
+python3 scripts/isolated-mcp-smoke.py --compact-mcp "$PWD/target/debug/computer-use-mcp"
 ```
 
 This invokes the binary directly, without an outer isolated-session wrapper or
 injected private environment.
+The compact variant fetches each action schema once, then dispatches all calls
+through the compact transport.
 
 The confirmed run kept the foreground worker count at zero, reused the
 persistent background worker, launched on the background route, and passed
@@ -139,7 +142,8 @@ npm test
 ```
 
 The publish workflow builds on Ubuntu 24.04, tests the extracted tarball's
-plugin and MCP handshake without a desktop, and uploads the tarball as the
+plugin permission selection, direct/compact MCP discovery, and dispatch
+validation without a desktop, and uploads the tarball as the
 `npm-package` artifact. Pushes, pull requests, and manual workflow runs build
 and test only. Publishing a GitHub release with a matching `v<version>` tag
 publishes that tested artifact to npm. Prereleases use the `next` dist-tag;

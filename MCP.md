@@ -1,9 +1,20 @@
 # MCP Guide
 
 This is the caller-facing guide for `computer-use-mcp mcp`. The server exposes
-exactly six tools over stdio: `list_desktop`, `launch_application`,
-`activate_window`, `observe`, `act`, and `wait_for`. The initialize response and
-`tools/list` entries are the authoritative schemas and descriptions.
+six operations: `list_desktop`, `launch_application`, `activate_window`,
+`observe`, `act`, and `wait_for`. Plain `mcp` exposes them as direct tools.
+`mcp --compact-tools` exposes only `help` and `dispatch` over the same broker.
+
+- `help {}` lists operation names. `help {"action":"observe"}` returns that
+  operation's authoritative description, input schema, and annotations in one
+  text block, without initializing a desktop.
+- `dispatch {"action":"observe","arguments":{...}}` executes the operation
+  using normal validation, identity routing, cancellation, and result encoding.
+  Direct tool names are unavailable in compact mode; recursive dispatch and
+  unknown operations are rejected before desktop startup.
+
+Initialize carries shared evidence/recovery rules. Direct tool definitions or
+on-demand help carry operation details; the skill carries workflow guidance.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation boundaries and
 [SECURITY.md](SECURITY.md) for the trust boundary.
@@ -51,8 +62,12 @@ authority rules described below.
 
 The npm package includes the precompiled Linux x64 server. With OpenCode 1.18
 or newer, add `"@mirsella/opencode-computer-use-mcp"` to the `plugin` array and
-restart OpenCode. The plugin registers the server and bundled skill; explicit
-`mcp.computer_use` settings take precedence.
+restart OpenCode. The plugin registers compact tools and the bundled skill.
+Per-tool `permission` or `tools` rules at global or agent scope select direct
+tools automatically; broad `computer_use_*` rules apply in either mode.
+The plugin option `compactTools: false` also selects direct tools. Explicit
+`mcp.computer_use` settings take precedence over plugin defaults. Manually
+configured compact servers require dispatcher-wide permissions.
 
 Alternatively, register the package as a stdio MCP server with a `90000`
 millisecond timeout. Choose permissions for your host; this example asks before

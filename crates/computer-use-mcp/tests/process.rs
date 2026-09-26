@@ -22,14 +22,18 @@ fn cli_help_version_and_errors_are_truthful() {
     let missing_file = run(&["call"]);
     assert!(!missing_file.status.success());
     assert!(text(&missing_file.stderr).contains("requires exactly one"));
+    assert!(!run(&["mcp", "--typo"]).status.success());
+    assert!(!run(&["mcp", "--compact-tools", "extra"]).status.success());
 }
 
 #[test]
 fn idle_mcp_never_initializes_a_desktop_and_background_worker_requires_proof() {
-    let idle = run(&["mcp"]);
-    assert!(idle.status.success(), "{}", text(&idle.stderr));
-    assert!(idle.stdout.is_empty());
-    assert!(!text(&idle.stderr).contains("desktop session initialization"));
+    for arguments in [vec!["mcp"], vec!["mcp", "--compact-tools"]] {
+        let idle = run(&arguments);
+        assert!(idle.status.success(), "{}", text(&idle.stderr));
+        assert!(idle.stdout.is_empty());
+        assert!(!text(&idle.stderr).contains("desktop session initialization"));
+    }
 
     let private = Command::new(env!("CARGO_BIN_EXE_computer-use-mcp"))
         .arg("__background_worker")

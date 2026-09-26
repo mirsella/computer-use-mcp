@@ -69,9 +69,17 @@ Add the package to your OpenCode configuration, using OpenCode 1.18 or newer:
 ```
 
 The plugin registers `mcp.computer_use` with the bundled executable, a
-90-second timeout, and the computer-use skill. Explicit `mcp.computer_use`
-settings take precedence, including `enabled: false`. The plugin leaves host
-permissions to your configuration. Quit and restart OpenCode after adding it.
+90-second timeout, and the computer-use skill. By default, the model sees only
+`computer_use_help` and `computer_use_dispatch`. Help lists operation names or
+returns one operation's full schema; dispatch executes it through the same
+validation and desktop broker. The skill loads on demand.
+
+Per-tool permission or tool-enable rules, including agent-specific rules,
+automatically select the six direct tools so dispatch cannot bypass them.
+To select direct tools explicitly, use
+`["@mirsella/opencode-computer-use-mcp", {"compactTools": false}]` in `plugin`.
+Explicit `mcp.computer_use` settings take precedence, including `enabled: false`.
+Quit and restart OpenCode after adding or updating the plugin.
 
 ### Direct MCP configuration
 
@@ -99,6 +107,8 @@ This example asks for review before each tool call:
 
 For a source installation, replace the command with
 `["/absolute/path/to/computer-use-mcp", "mcp"]`.
+Append `"--compact-tools"` to either command to use help/dispatch in other MCP
+clients. In that mode, host permissions apply to the dispatcher as a whole.
 
 Check the connection with:
 

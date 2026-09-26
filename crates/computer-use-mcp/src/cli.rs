@@ -14,7 +14,7 @@ use crate::{
     server,
 };
 
-const HELP: &str = "Computer Use MCP for Linux Wayland\n\nUsage:\n  computer-use-mcp [command]\n\nCommands:\n  init          Ask KDE to approve one monitor and save its restore token.\n  mcp           Serve stdio with lazy foreground and private background desktops.\n  call FILE     Execute a call object or an array through one stateful desktop broker; use - for stdin.\n  doctor        Report Wayland, portal, PipeWire, AT-SPI, and input prerequisites without prompting.\n  help          Show this help.\n  version       Print the CLI version.\n\nCall input uses {\"name\":\"list_desktop\",\"arguments\":{\"scope\":\"windows\",\"desktop\":\"background\"}} objects and prints one standard MCP result per line. Discovery and launch accept desktop=foreground or background; returned IDs route later calls. Each CLI batch owns its sessions until exit. Run init only to approve foreground KDE access separately. KDE may ask again after revocation or display changes.\n";
+const HELP: &str = "Computer Use MCP for Linux Wayland\n\nUsage:\n  computer-use-mcp [command]\n\nCommands:\n  init          Ask KDE to approve one monitor and save its restore token.\n  mcp           Serve six tools over stdio; --compact-tools exposes help/dispatch instead.\n  call FILE     Execute a call object or an array through one stateful desktop broker; use - for stdin.\n  doctor        Report Wayland, portal, PipeWire, AT-SPI, and input prerequisites without prompting.\n  help          Show this help.\n  version       Print the CLI version.\n\nCall input uses {\"name\":\"list_desktop\",\"arguments\":{\"scope\":\"windows\",\"desktop\":\"background\"}} objects and prints one standard MCP result per line. Discovery and launch accept desktop=foreground or background; returned IDs route later calls. Each CLI batch owns its sessions until exit. Run init only to approve foreground KDE access separately. KDE may ask again after revocation or display changes.\n";
 
 pub async fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), CliError> {
     let arguments: Vec<_> = arguments.into_iter().collect();
@@ -77,8 +77,16 @@ pub async fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), CliE
             run_calls(&arguments[1]).await
         }
         "mcp" => {
-            require_no_extra_arguments(&arguments)?;
-            server::serve_stdio().await
+            let compact = match arguments.get(1).map(String::as_str) {
+                None => false,
+                Some("--compact-tools") if arguments.len() == 2 => true,
+                _ => {
+                    return Err(CliError::InvalidArguments(
+                        "mcp accepts only --compact-tools".to_owned(),
+                    ));
+                }
+            };
+            server::serve_stdio(compact).await
         }
         "__desktop_worker" => run_worker(&arguments, false).await,
         "__background_worker" => run_worker(&arguments, true).await,

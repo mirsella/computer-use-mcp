@@ -23,6 +23,37 @@ pub const DEFAULT_ACCESSIBILITY_TEXT_LIMIT: usize = 256;
 pub const DEFAULT_ACCESSIBILITY_MAX_NODES: usize = 250;
 pub const DEFAULT_ACCESSIBILITY_MAX_DEPTH: usize = 64;
 
+pub enum CompactCall {
+    Help(Option<String>),
+    Dispatch {
+        action: String,
+        arguments: JsonObject<String, Value>,
+    },
+}
+
+pub fn validate_compact_call(
+    name: &str,
+    mut arguments: JsonObject<String, Value>,
+) -> Result<CompactCall, RuntimeError> {
+    let action = match arguments.remove("action") {
+        None if name == "help" => None,
+        Some(Value::String(action)) if crate::contract::TOOL_NAMES.contains(&action.as_str()) => {
+            Some(action)
+        }
+        _ => return invalid("action must name an operation returned by help"),
+    };
+    let call = match name {
+        "help" => CompactCall::Help(action),
+        "dispatch" => CompactCall::Dispatch {
+            action: action.expect("dispatch requires an action"),
+            arguments: required_object(&mut arguments, "arguments")?,
+        },
+        _ => return invalid("unknown compact tool"),
+    };
+    reject_unknown(arguments)?;
+    Ok(call)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Desktop {
     #[default]

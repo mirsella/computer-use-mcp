@@ -1,7 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use computer_use_mcp::{
     accessibility::{MAX_MODEL_STRUCTURED_BYTES, MAX_MODEL_TEXT_BYTES},
-    contract::{TOOL_NAMES, tool_definitions},
+    contract::{SERVER_INSTRUCTIONS, TOOL_NAMES, compact_tool_definitions, tool_definitions},
     encoder::MAX_PNG_BYTES,
     input::keyboard::parse_chord,
     runtime::ToolOutput,
@@ -65,12 +65,42 @@ fn tools_list_wire_has_exact_contract_and_stays_within_budget() {
         );
         total_words += words;
     }
-    assert!(computer_use_mcp::contract::SERVER_INSTRUCTIONS.len() <= 1_200);
+    assert!(SERVER_INSTRUCTIONS.len() <= 400);
     assert!(
         total_words <= 400,
         "tool descriptions use {total_words} words"
     );
-    assert!(PACKAGED_SKILL.len() <= 3_072);
+    assert!(PACKAGED_SKILL.len() <= 1_100);
+}
+
+#[test]
+fn compact_startup_and_on_demand_workflow_have_bounded_context() {
+    let wire = ServerJsonRpcMessage::response(
+        ServerResult::ListToolsResult(ListToolsResult::with_all_items(compact_tool_definitions())),
+        NumberOrString::Number(1),
+    );
+    let compact_bytes = serde_json::to_vec(&wire).unwrap().len();
+    let direct_bytes = serde_json::to_vec(&tool_definitions()).unwrap().len();
+    assert!(
+        compact_bytes <= 1_200,
+        "compact tools/list: {compact_bytes}"
+    );
+    assert!(
+        compact_bytes * 10 < direct_bytes,
+        "compact tool definitions must save at least 90%"
+    );
+    // A representative accessibility workflow loads three schemas, each once.
+    let workflow_bytes: usize = tool_definitions()
+        .into_iter()
+        .filter(|tool| ["list_desktop", "observe", "act"].contains(&tool.name.as_ref()))
+        .map(|tool| serde_json::to_vec(&tool).unwrap().len())
+        .sum();
+    println!(
+        "compact tools/list={compact_bytes}; initialize={}; skill={}; list/observe/act schemas={workflow_bytes}; workflow total={}",
+        SERVER_INSTRUCTIONS.len(),
+        PACKAGED_SKILL.len(),
+        compact_bytes + SERVER_INSTRUCTIONS.len() + PACKAGED_SKILL.len() + workflow_bytes
+    );
 }
 
 #[test]

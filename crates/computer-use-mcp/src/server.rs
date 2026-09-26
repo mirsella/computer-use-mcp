@@ -243,8 +243,8 @@ fn cancelled_error(progress: Option<&Arc<ActionProgress>>, message: &str) -> Run
     )
 }
 
-pub async fn serve_stdio() -> Result<(), CliError> {
-    crate::broker::serve_stdio().await
+pub async fn serve_stdio(compact_tools: bool) -> Result<(), CliError> {
+    crate::broker::serve_stdio(compact_tools).await
 }
 
 pub async fn serve_worker_stdio() -> Result<(), CliError> {

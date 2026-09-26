@@ -1,6 +1,7 @@
 # Working on computer-use-mcp
 
-This Rust server exposes six desktop tools. Keep tool meanings in
+This Rust server exposes six desktop operations, directly or via help/dispatch.
+Keep tool meanings in
 `src/contract.rs` and parsing in `src/validation.rs` consistent, under
 `crates/computer-use-mcp/`. `MCP.md` is the protocol reference; `ARCHITECTURE.md`
 explains ownership and dispatch. Read the relevant sections, not every document.

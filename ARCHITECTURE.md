@@ -7,7 +7,9 @@ and the authorities used to make decisions.
 ## Boundaries
 
 - `contract` and `validation` define the ordered tool schemas and convert
-  untrusted JSON into typed calls.
+  untrusted JSON into typed calls. The optional compact transport fetches these
+  same schemas on demand and unwraps dispatch before ordinary broker validation;
+  it owns no separate execution or desktop state.
 - `broker`, `server`, `cli`, `runtime`, and `errors` own MCP transport,
   per-desktop scheduling, presentation, and outcome reporting. The broker owns
   one lazy foreground worker and one lazy background worker; their local IDs are

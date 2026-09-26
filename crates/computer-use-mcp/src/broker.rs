@@ -27,11 +27,14 @@ use tokio::{
 };
 
 use crate::{
-    contract::{TOOL_NAMES, tool_definitions},
+    contract::{TOOL_NAMES, compact_tool_definitions, tool_definitions},
     errors::{CliError, RuntimeError, ToolOutcome},
     runtime::{DesktopRuntime, tool_error_result},
     server::{ComputerUseMcpServer, for_protocol, supports_structured_content},
-    validation::{Desktop, RoutedCall, validate_call, validate_routed_call},
+    validation::{
+        CompactCall, Desktop, RoutedCall, validate_call, validate_compact_call,
+        validate_routed_call,
+    },
 };
 
 // The crate-local symlink is materialized by `cargo package`, so installed
@@ -339,6 +342,7 @@ impl Drop for PendingCall<'_> {
 
 #[derive(Debug)]
 pub struct DesktopBroker {
+    compact_tools: bool,
     foreground: tokio::sync::Mutex<Option<Worker>>,
     background: tokio::sync::Mutex<Option<Worker>>,
     identities: Mutex<Identities>,
@@ -354,6 +358,7 @@ impl DesktopBroker {
             .and_then(|mut file| file.read_exact(&mut seed))
             .map_err(|error| CliError::Mcp(format!("cannot seed desktop identities: {error}")))?;
         Ok(Self {
+            compact_tools: false,
             foreground: tokio::sync::Mutex::new(None),
             background: tokio::sync::Mutex::new(None),
             identities: Mutex::new(Identities {
@@ -605,13 +610,11 @@ impl ServerHandler for DesktopBroker {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(tool_definitions()))
+        Ok(ListToolsResult::with_all_items(self.tools()))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        tool_definitions()
-            .into_iter()
-            .find(|tool| tool.name == name)
+        self.tools().into_iter().find(|tool| tool.name == name)
     }
 
     async fn call_tool(
@@ -619,22 +622,64 @@ impl ServerHandler for DesktopBroker {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        if !TOOL_NAMES.contains(&request.name.as_ref()) {
-            return Err(McpError::invalid_params("unknown tool", None));
-        }
-        let result = self
-            .call(
-                &request.name,
+        let (name, arguments) = if self.compact_tools {
+            if !["help", "dispatch"].contains(&request.name.as_ref()) {
+                return Err(McpError::invalid_params("unknown tool", None));
+            }
+            match validate_compact_call(&request.name, request.arguments.unwrap_or_default()) {
+                Ok(CompactCall::Help(action)) => {
+                    let value = match action {
+                        Some(action) => serde_json::to_value(
+                            tool_definitions()
+                                .into_iter()
+                                .find(|tool| tool.name == action)
+                                .expect("validated action has a schema"),
+                        )
+                        .expect("tool schema serializes"),
+                        None => json!({"actions": TOOL_NAMES}),
+                    };
+                    // One text copy: hosts may also serialize structuredContent into context.
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(
+                        value.to_string(),
+                    )]));
+                }
+                Ok(CompactCall::Dispatch { action, arguments }) => (action, arguments),
+                Err(error) => {
+                    return Ok(for_protocol(
+                        tool_error_result(&error),
+                        supports_structured_content(&context),
+                    ));
+                }
+            }
+        } else {
+            if !TOOL_NAMES.contains(&request.name.as_ref()) {
+                return Err(McpError::invalid_params("unknown tool", None));
+            }
+            (
+                request.name.into_owned(),
                 request.arguments.unwrap_or_default(),
-                context.ct.cancelled(),
             )
-            .await;
+        };
+        let result = self.call(&name, arguments, context.ct.cancelled()).await;
         Ok(for_protocol(result, supports_structured_content(&context)))
     }
 }
 
-pub async fn serve_stdio() -> Result<(), CliError> {
-    let broker = Arc::new(DesktopBroker::new()?);
+impl DesktopBroker {
+    fn tools(&self) -> Vec<Tool> {
+        if self.compact_tools {
+            compact_tool_definitions()
+        } else {
+            tool_definitions()
+        }
+    }
+}
+
+pub async fn serve_stdio(compact_tools: bool) -> Result<(), CliError> {
+    let broker = Arc::new(DesktopBroker {
+        compact_tools,
+        ..DesktopBroker::new()?
+    });
     let result = match Arc::clone(&broker).serve(rmcp::transport::stdio()).await {
         Ok(service) => service
             .waiting()
