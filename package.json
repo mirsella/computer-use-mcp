@@ -1,0 +1,47 @@
+{
+  "name": "@mirsella/opencode-computer-use-mcp",
+  "version": "0.4.0-rc.0",
+  "description": "Computer use on KDE Plasma Wayland, with a bundled Rust MCP server and OpenCode plugin",
+  "type": "module",
+  "exports": {
+    ".": "./plugin/computer-use.mjs",
+    "./server": "./plugin/computer-use.mjs"
+  },
+  "bin": {
+    "computer-use-mcp": "vendor/computer-use-mcp"
+  },
+  "files": [
+    "plugin/",
+    "skills/",
+    "vendor/",
+    "README.md",
+    "MCP.md",
+    "SECURITY.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build:native": "cargo build --locked --release --target x86_64-unknown-linux-gnu",
+    "stage:native": "node scripts/stage-native.mjs",
+    "prepack": "npm run build:native && npm run stage:native",
+    "test": "node --test tests/npm.test.mjs"
+  },
+  "keywords": ["opencode", "mcp", "computer-use", "wayland", "kde"],
+  "homepage": "https://github.com/mirsella/computer-use-mcp#readme",
+  "bugs": "https://github.com/mirsella/computer-use-mcp/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mirsella/computer-use-mcp.git"
+  },
+  "license": "MIT",
+  "author": "mirsella",
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "libc": ["glibc"],
+  "engines": {
+    "node": ">=22",
+    "opencode": ">=1.18.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

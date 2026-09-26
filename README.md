@@ -19,13 +19,18 @@ See [MCP.md](MCP.md) for setup and the six-tool public contract,
 ## Requirements
 
 - KDE Plasma Wayland with `kwin_wayland` and the KDE desktop portals
-- Rust 1.97 or newer using the ambient toolchain
-- AT-SPI, PipeWire, SPA, GLib/GIO, D-Bus, and libxkbcommon development files
+- AT-SPI, PipeWire 1.0 or newer, GLib/GIO, D-Bus, and libxkbcommon runtime libraries
 - `dbus-daemon`, PipeWire, WirePlumber, `at-spi-bus-launcher`,
   `at-spi2-registryd`, and `xdg-desktop-portal` for the private-session runner
 - An XDG RemoteDesktop portal with EIS support for generated input
 
-Ubuntu 24.04 build dependencies:
+The npm package includes a Linux x64 executable built on Ubuntu 24.04 and
+requires glibc 2.39 or newer. It needs no Rust toolchain, install scripts, or
+binary downloads at installation time. Desktop services and shared libraries
+must be installed separately. Other architectures can build from source.
+
+Source builds require Rust 1.97 or newer and development files. Ubuntu 24.04
+build dependencies:
 
 ```sh
 sudo apt-get install build-essential clang libclang-dev libdbus-1-dev \
@@ -38,27 +43,44 @@ runtime prerequisites.
 
 ## Install
 
-Build and install the binary from the repository:
+Run the precompiled npm package with Node.js 22 or newer:
+
+```sh
+npx -y @mirsella/opencode-computer-use-mcp version
+npx -y @mirsella/opencode-computer-use-mcp mcp
+```
+
+Or build and install the binary from the repository:
 
 ```sh
 cargo install --locked --git https://github.com/mirsella/computer-use-mcp computer-use-mcp
 computer-use-mcp version
 ```
 
-## OpenCode Setup
+## OpenCode setup
+
+Add the package to your OpenCode configuration, using OpenCode 1.18 or newer:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["@mirsella/opencode-computer-use-mcp"]
+}
+```
+
+The plugin registers `mcp.computer_use` with the bundled executable, a
+90-second timeout, and the computer-use skill. Explicit `mcp.computer_use`
+settings take precedence, including `enabled: false`. The plugin leaves host
+permissions to your configuration. Quit and restart OpenCode after adding it.
+
+### Direct MCP configuration
 
 The transport is stdio only. Configure the host to execute
 `computer-use-mcp mcp`; stdout is reserved for JSON-RPC and diagnostics use
 stderr.
 
-Register the binary with OpenCode:
-
-```sh
-opencode mcp add computer_use -- "$(command -v computer-use-mcp)" mcp
-```
-
-Keep the absolute command path, set the host timeout to `90000`, and require
-review for the six tools. For OpenCode, use:
+For direct MCP registration without the plugin, use the npm command below.
+This example asks for review before each tool call:
 
 ```jsonc
 {
@@ -66,7 +88,7 @@ review for the six tools. For OpenCode, use:
   "mcp": {
     "computer_use": {
       "type": "local",
-      "command": ["/absolute/path/to/computer-use-mcp", "mcp"],
+      "command": ["npx", "-y", "@mirsella/opencode-computer-use-mcp", "mcp"],
       "enabled": true,
       "timeout": 90000
     }
@@ -74,6 +96,9 @@ review for the six tools. For OpenCode, use:
   "permission": { "computer_use_*": "ask" }
 }
 ```
+
+For a source installation, replace the command with
+`["/absolute/path/to/computer-use-mcp", "mcp"]`.
 
 Check the connection with:
 

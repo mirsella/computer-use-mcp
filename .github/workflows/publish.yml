@@ -1,0 +1,78 @@
+name: Publish npm package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            build-essential clang libclang-dev libdbus-1-dev libglib2.0-dev \
+            libpipewire-0.3-dev libspa-0.2-dev libxkbcommon-dev pkg-config
+
+      - name: Check release tag
+        if: github.event_name == 'release'
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: test "$RELEASE_TAG" = "v$(node -p 'require("./package.json").version')"
+
+      - name: Check guidance and Rust tests
+        run: |
+          bash scripts/check-guidance.sh
+          cargo test --locked --workspace --all-features
+
+      - name: Build npm tarball
+        run: npm pack
+
+      - name: Test the packed plugin and MCP executable
+        run: |
+          mkdir -p target/npm-package-test
+          tar -xzf mirsella-opencode-computer-use-mcp-*.tgz -C target/npm-package-test
+          COMPUTER_USE_MCP_PACKAGE_DIR=target/npm-package-test/package npm test
+          ldd target/npm-package-test/package/vendor/computer-use-mcp
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: mirsella-opencode-computer-use-mcp-*.tgz
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'release'
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+      - name: Publish with npm trusted publishing
+        env:
+          NPM_TAG: ${{ github.event.release.prerelease && 'next' || 'latest' }}
+        run: npm publish ./mirsella-opencode-computer-use-mcp-*.tgz --access public --tag "$NPM_TAG"

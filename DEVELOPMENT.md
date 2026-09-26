@@ -126,6 +126,33 @@ Linux/KDE environment, not a claim of support for every platform.
 
 ## Entry points
 
+### npm packaging and releases
+
+`@mirsella/opencode-computer-use-mcp` ships the Linux x64 GNU executable, an
+OpenCode plugin, and a copy of the canonical skill. `npm pack` builds the
+release binary and stages those files. Cargo and npm versions must match.
+The package has no JavaScript dependencies or install-time scripts.
+
+```sh
+npm pack
+npm test
+```
+
+The publish workflow builds on Ubuntu 24.04, tests the extracted tarball's
+plugin and MCP handshake without a desktop, and uploads the tarball as the
+`npm-package` artifact. Pushes, pull requests, and manual workflow runs build
+and test only. Publishing a GitHub release with a matching `v<version>` tag
+publishes that tested artifact to npm. Prereleases use the `next` dist-tag;
+stable releases use `latest`.
+
+npm trusted publishing authorizes GitHub repository
+`mirsella/computer-use-mcp`, workflow `publish.yml`, with direct publishing
+allowed and no environment name. The publishing job uses `id-token: write`;
+it needs no npm token secret. The initial package is bootstrapped with a
+manually authenticated prerelease before registering the trusted publisher.
+
+### Native CLI
+
 `computer-use-mcp mcp` is the only MCP transport. `doctor` reports diagnostics
 without portal consent, `init` requests a reusable KDE portal grant, and
 `call FILE` runs production validation and runtime against a static batch.

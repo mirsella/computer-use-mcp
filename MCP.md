@@ -49,12 +49,14 @@ authority rules described below.
 
 ### OpenCode Configuration
 
-```sh
-opencode mcp add computer_use -- "$(command -v computer-use-mcp)" mcp
-```
+The npm package includes the precompiled Linux x64 server. With OpenCode 1.18
+or newer, add `"@mirsella/opencode-computer-use-mcp"` to the `plugin` array and
+restart OpenCode. The plugin registers the server and bundled skill; explicit
+`mcp.computer_use` settings take precedence.
 
-Keep the absolute binary path and use a `90000` millisecond host timeout.
-Choose permissions for your host; this example asks before each call:
+Alternatively, register the package as a stdio MCP server with a `90000`
+millisecond timeout. Choose permissions for your host; this example asks before
+each call:
 
 ```jsonc
 {
@@ -62,7 +64,7 @@ Choose permissions for your host; this example asks before each call:
   "mcp": {
     "computer_use": {
       "type": "local",
-      "command": ["/absolute/path/to/computer-use-mcp", "mcp"],
+      "command": ["npx", "-y", "@mirsella/opencode-computer-use-mcp", "mcp"],
       "enabled": true,
       "timeout": 90000
     }
@@ -71,7 +73,8 @@ Choose permissions for your host; this example asks before each call:
 }
 ```
 
-OpenCode applies the last matching permission rule. Check registration with
+Source installations can use `["/absolute/path/to/computer-use-mcp", "mcp"]`
+instead. OpenCode applies the last matching permission rule. Check registration with
 `opencode mcp list`.
 
 ### Private Sessions
