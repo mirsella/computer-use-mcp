@@ -5683,21 +5683,31 @@ fn annotate_action_output_with_progress(
     let eis_region = eis_region.as_deref();
     let focus_grace = focus_grace.as_ref();
     let post_action = output.structured_content.take();
-    let replacement = if replacement_snapshot.is_some() {
-        post_action.clone().unwrap_or(Value::Null)
-    } else {
-        Value::Null
+    let replacement_element = match (operation, replacement_snapshot) {
+        (
+            ActOperation::Semantic { element_id, .. }
+            | ActOperation::Keyboard {
+                focus: KeyboardFocus::Semantic { element_id },
+                ..
+            }
+            | ActOperation::Paste {
+                focus: KeyboardFocus::Semantic { element_id },
+                ..
+            },
+            Some(replacement),
+        ) => replacement_element_for_source(source_snapshot, replacement, element_id),
+        _ => None,
     };
+    let replacement_element_id = replacement_element.as_ref().map(|(_, id)| id.as_str());
     let (effect_status, effect_evidence, observed_change) = match (operation, replacement_snapshot) {
         (
             ActOperation::Semantic {
                 action: ElementAction::Focus,
-                element_id,
+                ..
             },
             Some(current),
         ) => {
-            let replacement = replacement_element_for_source(source_snapshot, current, element_id);
-            let focused = replacement
+            let focused = replacement_element
                 .as_ref()
                 .map(|(element, _)| element.node.states.contains("focused"));
             let active = Some(current.window.states.contains("active"));
@@ -5710,7 +5720,7 @@ fn annotate_action_output_with_progress(
                 status,
                 format!(
                     "replacement observation focus state: element_focused={focused:?}, replacement_element_id={:?}, window_active={active:?}",
-                    replacement.as_ref().map(|(_, id)| id)
+                    replacement_element_id
                 ),
                 Some(!same_snapshot_content(source_snapshot, current)),
             )
@@ -5731,15 +5741,12 @@ fn annotate_action_output_with_progress(
             replacement_snapshot.map(|current| !same_snapshot_content(source_snapshot, current)),
         ),
     };
-    let mut focus = match operation {
+    let focus = match operation {
         ActOperation::Semantic {
             action: ElementAction::Focus,
-            element_id,
+            ..
         } => {
-            let replacement = replacement_snapshot.and_then(|snapshot| {
-                replacement_element_for_source(source_snapshot, snapshot, element_id)
-            });
-            let element_focused = replacement
+            let element_focused = replacement_element
                 .as_ref()
                 .map(|(element, _)| element.node.states.contains("focused"));
             let window_active =
@@ -5748,7 +5755,7 @@ fn annotate_action_output_with_progress(
                 "requested": true,
                 "element_focused": element_focused,
                 "window_active": window_active,
-                "replacement_element_id": replacement.map(|(_, id)| id),
+                "replacement_element_id": replacement_element_id,
                 "seat_focus": "not_observable",
                 "application_delivery": "not_observable",
                 "text_delivery": "not_observable",
@@ -5757,122 +5764,71 @@ fn annotate_action_output_with_progress(
                 "barriers": null
             })
         }
-        ActOperation::Keyboard { focus, events } => match focus {
-            KeyboardFocus::Point(point) => json!({
-                "requested": true,
-                "point": {"x": point.x, "y": point.y},
-                "element_focused": null,
-                "window_active": null,
-                "replacement_element_id": null,
-                "seat_focus": "not_observable",
-                "application_delivery": "not_observable",
-                "text_delivery": "not_observable",
-                "click": {
+        ActOperation::Keyboard { focus, .. } | ActOperation::Paste { focus, .. } => {
+            let phase_syncs = match operation {
+                ActOperation::Keyboard { events, .. } => events.len().saturating_sub(1),
+                _ => 0,
+            };
+            match focus {
+                KeyboardFocus::Point(point) => json!({
                     "requested": true,
-                    "sent": true,
-                    "flushed": true
-                },
-                "barriers": {
-                    "focus_click_completed": true,
-                    "between_events_completed": events.len().saturating_sub(1),
-                    "cleanup_barrier_completed": true,
-                    "meaning": "protocol_synchronization_only"
-                }
-            }),
-            // Focus was grabbed and verified (element focused, window
-            // active) before dispatch; no pointer moved and no click was
-            // sent, and no screenshot mapping was consulted. On the click
-            // grace path the states are unverified and reported as null.
-            KeyboardFocus::Semantic { element_id } => {
-                let mut focus = json!({
-                    "requested": true,
-                    "focus_kind": "semantic",
-                    "point": null,
-                    "element_id": element_id,
-                    "element_focused": true,
-                    "window_active": true,
+                    "point": {"x": point.x, "y": point.y},
+                    "element_focused": null,
+                    "window_active": null,
                     "replacement_element_id": null,
                     "seat_focus": "not_observable",
                     "application_delivery": "not_observable",
                     "text_delivery": "not_observable",
                     "click": {
-                        "requested": false,
-                        "sent": false,
-                        "flushed": false
+                        "requested": true,
+                        "sent": true,
+                        "flushed": true
                     },
                     "barriers": {
-                        "focus_click_completed": false,
-                        "between_events_completed": events.len().saturating_sub(1),
+                        "focus_click_completed": true,
+                        "between_events_completed": phase_syncs,
                         "cleanup_barrier_completed": true,
                         "meaning": "protocol_synchronization_only"
                     }
-                });
-                if let Some(age) = focus_grace {
-                    focus["element_focused"] = Value::Null;
-                    focus["window_active"] = Value::Null;
-                    focus["verification"] = Value::String("click_grace".into());
-                    focus["grace_age_ms"] = json!(age.as_millis());
-                }
-                focus
-            }
-        },
-        // Paste uses the same focus boundary for clipboard and simulated typing.
-        // Supplied text is not repeated in dispatch evidence.
-        ActOperation::Paste { focus, .. } => match focus {
-            KeyboardFocus::Point(point) => json!({
-                "requested": true,
-                "point": {"x": point.x, "y": point.y},
-                "element_focused": null,
-                "window_active": null,
-                "replacement_element_id": null,
-                "seat_focus": "not_observable",
-                "application_delivery": "not_observable",
-                "text_delivery": "not_observable",
-                "click": {
-                    "requested": true,
-                    "sent": true,
-                    "flushed": true
-                },
-                "barriers": {
-                    "focus_click_completed": true,
-                    "between_events_completed": 0,
-                    "cleanup_barrier_completed": true,
-                    "meaning": "protocol_synchronization_only"
-                }
-            }),
-            KeyboardFocus::Semantic { element_id } => {
-                let mut focus = json!({
-                    "requested": true,
-                    "focus_kind": "semantic",
-                    "point": null,
-                    "element_id": element_id,
-                    "element_focused": true,
-                    "window_active": true,
-                    "replacement_element_id": null,
-                    "seat_focus": "not_observable",
-                    "application_delivery": "not_observable",
-                    "text_delivery": "not_observable",
-                    "click": {
-                        "requested": false,
-                        "sent": false,
-                        "flushed": false
-                    },
-                    "barriers": {
-                        "focus_click_completed": false,
-                        "between_events_completed": 0,
-                        "cleanup_barrier_completed": true,
-                        "meaning": "protocol_synchronization_only"
+                }),
+                // Focus was grabbed and verified (element focused, window
+                // active) before dispatch; no pointer moved and no click was
+                // sent, and no screenshot mapping was consulted. On the click
+                // grace path the states are unverified and reported as null.
+                KeyboardFocus::Semantic { element_id } => {
+                    let mut focus = json!({
+                        "requested": true,
+                        "focus_kind": "semantic",
+                        "point": null,
+                        "element_id": element_id,
+                        "element_focused": true,
+                        "window_active": true,
+                        "replacement_element_id": replacement_element_id,
+                        "seat_focus": "not_observable",
+                        "application_delivery": "not_observable",
+                        "text_delivery": "not_observable",
+                        "click": {
+                            "requested": false,
+                            "sent": false,
+                            "flushed": false
+                        },
+                        "barriers": {
+                            "focus_click_completed": false,
+                            "between_events_completed": phase_syncs,
+                            "cleanup_barrier_completed": true,
+                            "meaning": "protocol_synchronization_only"
+                        }
+                    });
+                    if let Some(age) = focus_grace {
+                        focus["element_focused"] = Value::Null;
+                        focus["window_active"] = Value::Null;
+                        focus["verification"] = Value::String("click_grace".into());
+                        focus["grace_age_ms"] = json!(age.as_millis());
                     }
-                });
-                if let Some(age) = focus_grace {
-                    focus["element_focused"] = Value::Null;
-                    focus["window_active"] = Value::Null;
-                    focus["verification"] = Value::String("click_grace".into());
-                    focus["grace_age_ms"] = json!(age.as_millis());
+                    focus
                 }
-                focus
             }
-        },
+        }
         _ => json!({
             "requested": false,
             "element_focused": null,
@@ -5887,67 +5843,29 @@ fn annotate_action_output_with_progress(
         }),
     };
     let replacement_observation_id = replacement_snapshot.map(observation_id_for_snapshot);
-    let replacement_element_id = match (operation, replacement_snapshot) {
-        (
-            ActOperation::Semantic { element_id, .. }
-            | ActOperation::Keyboard {
-                focus: KeyboardFocus::Semantic { element_id },
-                ..
-            }
-            | ActOperation::Paste {
-                focus: KeyboardFocus::Semantic { element_id },
-                ..
-            },
-            Some(replacement),
-        ) => replacement_element_for_source(source_snapshot, replacement, element_id)
-            .map(|(_, id)| id),
-        _ => None,
-    };
-    if focus["requested"] == true {
-        focus["replacement_element_id"] = json!(replacement_element_id);
-    }
     let keyboard_safety = match operation {
-        ActOperation::Keyboard { focus, events } => match focus {
-            KeyboardFocus::Point(point) => format!(
-                " focus=point({},{}) focus_click=requested,sent,flushed phase_sync={}",
-                point.x,
-                point.y,
-                events.len().saturating_sub(1),
-            ),
-            KeyboardFocus::Semantic { element_id } => match focus_grace {
-                Some(age) => format!(
-                    " focus=semantic({element_id}) focus_grace(age_ms={}) phase_sync={}",
-                    age.as_millis(),
-                    events.len().saturating_sub(1),
+        ActOperation::Keyboard { focus, .. } | ActOperation::Paste { focus, .. } => {
+            let mut text = match focus {
+                KeyboardFocus::Point(point) => format!(
+                    " focus=point({},{}) focus_click=requested,sent,flushed",
+                    point.x, point.y,
                 ),
-                None => format!(
-                    " focus=semantic({element_id}) focus_verified=element_focused,window_active phase_sync={}",
-                    events.len().saturating_sub(1),
-                ),
-            },
-        },
-        ActOperation::Paste { focus, .. } => match focus {
-            KeyboardFocus::Point(point) => format!(
-                " focus=point({},{}) focus_click=requested,sent,flushed",
-                point.x, point.y,
-            ),
-            KeyboardFocus::Semantic { element_id } => match focus_grace {
-                Some(age) => format!(
-                    " focus=semantic({element_id}) focus_grace(age_ms={})",
-                    age.as_millis(),
-                ),
-                None => format!(
-                    " focus=semantic({element_id}) focus_verified=element_focused,window_active",
-                ),
-            },
-        },
+                KeyboardFocus::Semantic { element_id } => match focus_grace {
+                    Some(age) => format!(
+                        " focus=semantic({element_id}) focus_grace(age_ms={})",
+                        age.as_millis(),
+                    ),
+                    None => format!(
+                        " focus=semantic({element_id}) focus_verified=element_focused,window_active",
+                    ),
+                },
+            };
+            if let ActOperation::Keyboard { events, .. } = operation {
+                text.push_str(&format!(" phase_sync={}", events.len().saturating_sub(1)));
+            }
+            text
+        }
         _ => String::new(),
-    };
-    let (protocol_request_sent, request_flushed) = match operation {
-        ActOperation::Semantic { .. } => (true, false),
-        ActOperation::Pointer { .. }
-        | ActOperation::Keyboard { .. }
-        | ActOperation::Paste { .. } => (true, true),
     };
     let replacement_frame_id = post_action
         .as_ref()
@@ -5971,9 +5889,8 @@ fn annotate_action_output_with_progress(
         "\nAction: completed effect={effect_status} replacement_observation={} replacement_frame={} replacement_element_id={}{keyboard_safety}{mapping_fragment}{region_fragment}",
         replacement_observation_id.as_deref().unwrap_or("none"),
         replacement_frame_id.as_deref().unwrap_or("none"),
-        replacement_element_id.as_deref().unwrap_or("none"),
+        replacement_element_id.unwrap_or("none"),
     );
-    let mut output = output;
     let mut suffix = action_line;
     if matches!(operation, ActOperation::Paste { .. }) {
         suffix.push_str(&format!(
@@ -5988,10 +5905,6 @@ fn annotate_action_output_with_progress(
     let text_budget = MAX_MODEL_TEXT_BYTES.saturating_sub(suffix.len());
     let (prefix, text_truncated) = fit_text_prefix(&output.text, text_budget);
     output.text = format!("{prefix}{suffix}");
-    // Semantic-focus typing states its delivery mechanism explicitly: EIS
-    // keystrokes into a verified focused element. Point-focus delivery stays
-    // byte-identical to before. On the click grace path nothing was
-    // re-verified, so the flag reports false with the grace recorded.
     let mut delivery = match operation {
         ActOperation::Keyboard {
             focus: KeyboardFocus::Semantic { .. },
@@ -6035,9 +5948,9 @@ fn annotate_action_output_with_progress(
             "frame_id": source.frame_id
         },
         "dispatch": {
-            "request_accepted": protocol_request_sent,
-            "protocol_request_sent": protocol_request_sent,
-            "request_flushed": request_flushed,
+            "request_accepted": true,
+            "protocol_request_sent": true,
+            "request_flushed": !matches!(operation, ActOperation::Semantic { .. }),
             "synchronized": false,
             "client_delivery": "not_observable"
         },
@@ -6046,13 +5959,17 @@ fn annotate_action_output_with_progress(
             "evidence": effect_evidence,
             "observed_change": observed_change
         },
-        "focus": focus,
-        "delivery": delivery,
         "replacement_observation_id": replacement_observation_id,
         "replacement_frame_id": replacement_frame_id,
-        "replacement_element_id": replacement_element_id,
-        "replacement_observation": replacement
+        "replacement_element_id": replacement_element_id
     });
+    action_structured["focus"] = focus;
+    action_structured["delivery"] = delivery;
+    action_structured["replacement_observation"] = if replacement_snapshot.is_some() {
+        post_action.unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
     if mapping_degraded {
         action_structured["mapping"] = json!({
             "stream_health": "degraded",
@@ -8110,61 +8027,80 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn keyboard_action_evidence_reports_point_click_and_unobservable_delivery() {
+    fn generated_input_evidence_reports_point_click_and_unobservable_delivery() {
         let target = TargetRef {
             app_instance_id: "app-0000000000000001".into(),
             window_instance_id: "win-0000000000000002".into(),
         };
         let source = snapshot_for_target(1, "source");
-        let output = annotate_action_output_with_progress(
-            ToolOutput::text("done"),
-            &target,
-            &ObservationRef {
-                observation_id: "obs-0000000000000005".into(),
-                frame_id: Some("frame-0000000000000006".into()),
-            },
-            &ActOperation::Keyboard {
-                focus: KeyboardFocus::Point(KeyboardPoint { x: 12.0, y: 34.0 }),
-                events: vec![
-                    KeyboardEvent::Press("Ctrl+L".into()),
-                    KeyboardEvent::Press("Enter".into()),
-                ],
-            },
-            &source,
-            Some(&source),
-            None,
-            InputEvidence::default(),
-        );
-        let structured = output
-            .structured_content
-            .as_ref()
-            .expect("structured output");
-        assert_eq!(structured["focus"]["requested"], true);
-        assert_eq!(structured["focus"]["point"]["x"], 12.0);
-        assert_eq!(structured["focus"]["point"]["y"], 34.0);
-        assert_eq!(structured["focus"]["click"]["requested"], true);
-        assert_eq!(structured["focus"]["click"]["sent"], true);
-        assert_eq!(structured["focus"]["click"]["flushed"], true);
-        assert_eq!(
-            structured["focus"]["barriers"]["focus_click_completed"],
-            true
-        );
-        assert_eq!(
-            structured["focus"]["barriers"]["between_events_completed"],
-            1
-        );
-        assert_eq!(
-            structured["focus"]["barriers"]["cleanup_barrier_completed"],
-            true
-        );
-        assert_eq!(structured["focus"]["seat_focus"], "not_observable");
-        assert_eq!(
-            structured["delivery"]["application_delivery"],
-            "not_observable"
-        );
-        assert_eq!(structured["delivery"]["text_delivery"], "not_observable");
-        assert!(output.text.contains("focus_click=requested,sent,flushed"));
-        assert!(!output.text.contains("text_delivery="));
+        let focus = KeyboardFocus::Point(KeyboardPoint { x: 12.0, y: 34.0 });
+        for (operation, phase_syncs) in [
+            (
+                ActOperation::Keyboard {
+                    focus: focus.clone(),
+                    events: vec![
+                        KeyboardEvent::Press("Ctrl+L".into()),
+                        KeyboardEvent::Press("Enter".into()),
+                    ],
+                },
+                1,
+            ),
+            (
+                ActOperation::Paste {
+                    focus,
+                    text: "input".into(),
+                },
+                0,
+            ),
+        ] {
+            let output = annotate_action_output_with_progress(
+                ToolOutput::text("done"),
+                &target,
+                &ObservationRef {
+                    observation_id: "obs-0000000000000005".into(),
+                    frame_id: Some("frame-0000000000000006".into()),
+                },
+                &operation,
+                &source,
+                Some(&source),
+                None,
+                InputEvidence::default(),
+            );
+            let structured = output
+                .structured_content
+                .as_ref()
+                .expect("structured output");
+            assert_eq!(structured["focus"]["requested"], true);
+            assert_eq!(structured["focus"]["point"]["x"], 12.0);
+            assert_eq!(structured["focus"]["point"]["y"], 34.0);
+            assert_eq!(structured["focus"]["click"]["requested"], true);
+            assert_eq!(structured["focus"]["click"]["sent"], true);
+            assert_eq!(structured["focus"]["click"]["flushed"], true);
+            assert_eq!(
+                structured["focus"]["barriers"]["focus_click_completed"],
+                true
+            );
+            assert_eq!(
+                structured["focus"]["barriers"]["between_events_completed"],
+                phase_syncs
+            );
+            assert_eq!(
+                structured["focus"]["barriers"]["cleanup_barrier_completed"],
+                true
+            );
+            assert_eq!(structured["focus"]["seat_focus"], "not_observable");
+            assert_eq!(
+                structured["delivery"]["application_delivery"],
+                "not_observable"
+            );
+            assert_eq!(structured["delivery"]["text_delivery"], "not_observable");
+            assert!(output.text.contains("focus_click=requested,sent,flushed"));
+            assert!(!output.text.contains("text_delivery="));
+            assert_eq!(
+                output.text.contains("phase_sync="),
+                matches!(operation, ActOperation::Keyboard { .. })
+            );
+        }
     }
 
     #[test]
