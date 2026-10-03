@@ -29,6 +29,7 @@ use tokio::{
 use crate::{
     contract::{TOOL_NAMES, compact_tool_definitions, tool_definitions},
     errors::{CliError, RuntimeError, ToolOutcome},
+    history::{CallHistory, CallRecord},
     runtime::{DesktopRuntime, tool_error_result},
     server::{ComputerUseMcpServer, for_protocol, supports_structured_content},
     validation::{
@@ -352,6 +353,7 @@ pub struct DesktopBroker {
     background: tokio::sync::Mutex<Option<Worker>>,
     identities: Mutex<Identities>,
     stopping: tokio::sync::watch::Sender<bool>,
+    history: CallHistory,
     #[cfg(test)]
     spawn: Option<fn(Desktop, u64) -> io::Result<Worker>>,
 }
@@ -371,6 +373,7 @@ impl DesktopBroker {
                 local: BTreeMap::new(),
             }),
             stopping: tokio::sync::watch::channel(false).0,
+            history: CallHistory::new(u64::from_ne_bytes(seed)),
             #[cfg(test)]
             spawn: None,
         })
@@ -382,6 +385,22 @@ impl DesktopBroker {
         arguments: Map<String, Value>,
         cancelled: impl Future<Output = ()> + Send,
     ) -> CallToolResult {
+        let mut record = self.history.begin(name);
+        let result = self
+            .call_recorded(name, arguments, cancelled, &mut record)
+            .await;
+        record.finish(&result);
+        result
+    }
+
+    async fn call_recorded(
+        &self,
+        name: &str,
+        arguments: Map<String, Value>,
+        cancelled: impl Future<Output = ()> + Send,
+        record: &mut CallRecord<'_>,
+    ) -> CallToolResult {
+        record.action(name);
         let mut stopping = self.stopping.subscribe();
         let cancelled = async {
             if *stopping.borrow() {
@@ -392,7 +411,7 @@ impl DesktopBroker {
                 _ = stopping.changed() => {},
             }
         };
-        match self.call_inner(name, arguments, cancelled).await {
+        match self.call_inner(name, arguments, cancelled, record).await {
             Ok(result) => result,
             Err(error) => tool_error_result(&error),
         }
@@ -403,12 +422,14 @@ impl DesktopBroker {
         name: &str,
         arguments: Map<String, Value>,
         cancelled: impl Future<Output = ()> + Send,
+        record: &mut CallRecord<'_>,
     ) -> Result<CallToolResult, RuntimeError> {
         let RoutedCall {
             desktop: selected,
             arguments,
             call,
         } = validate_routed_call(name, arguments)?;
+        record.request(name, &call);
         let mutation = call.tracks_action();
         let mut arguments = Value::Object(arguments);
         let (desktop, expected_generation) = self
@@ -416,6 +437,7 @@ impl DesktopBroker {
             .lock()
             .expect("identity lock poisoned")
             .decode(&mut arguments, selected)?;
+        record.route(desktop);
         tokio::pin!(cancelled);
         let slot = self.worker_slot(desktop);
         let mut slot = tokio::select! {
@@ -631,13 +653,16 @@ impl ServerHandler for McpServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let tool = self
-            .tools
-            .iter()
-            .find(|tool| tool.name == request.name)
-            .ok_or_else(|| McpError::invalid_params("unknown tool", None))?;
+        let mut record = self.broker.history.begin(&request.name);
+        let Some(tool) = self.tools.iter().find(|tool| tool.name == request.name) else {
+            record.protocol_error();
+            return Err(McpError::invalid_params("unknown tool", None));
+        };
         let result = match validate_mcp_call(tool, request.arguments.unwrap_or_default()) {
             Ok(McpCall::Help(action)) => {
+                if let Some(tool) = action {
+                    record.action(&tool.name);
+                }
                 let text = match action {
                     Some(tool) => serde_json::to_string(tool).expect("tool schema serializes"),
                     None => json!({"actions": TOOL_NAMES}).to_string(),
@@ -647,11 +672,12 @@ impl ServerHandler for McpServer {
             }
             Ok(McpCall::Dispatch { action, arguments }) => {
                 self.broker
-                    .call(action, arguments, context.ct.cancelled())
+                    .call_recorded(action, arguments, context.ct.cancelled(), &mut record)
                     .await
             }
             Err(error) => tool_error_result(&error),
         };
+        record.finish(&result);
         Ok(for_protocol(result, supports_structured_content(&context)))
     }
 }

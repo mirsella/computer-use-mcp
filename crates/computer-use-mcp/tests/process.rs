@@ -50,8 +50,18 @@ fn idle_mcp_never_initializes_a_desktop_and_background_worker_requires_proof() {
 
 #[test]
 fn cli_uses_routing_validation_before_starting_workers() {
+    let state = TestState(std::env::temp_dir().join(format!(
+        "computer-use-mcp-process-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )));
+    std::fs::create_dir(&state.0).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_computer-use-mcp"))
         .args(["call", "-"])
+        .env("XDG_STATE_HOME", &state.0)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -66,6 +76,28 @@ fn cli_uses_routing_validation_before_starting_workers() {
     let result: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
     assert_eq!(result["structuredContent"]["code"], "invalid_arguments");
     assert!(!text(&output.stderr).contains("desktop session initialization"));
+
+    let history = Command::new(env!("CARGO_BIN_EXE_computer-use-mcp"))
+        .args(["history", "--errors"])
+        .env("XDG_STATE_HOME", &state.0)
+        .output()
+        .unwrap();
+    assert!(history.status.success(), "{}", text(&history.stderr));
+    let records: Vec<serde_json::Value> = text(&history.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["action"], "list_desktop");
+    assert_eq!(records[0]["result"]["outcome"], "not_started");
+}
+
+struct TestState(std::path::PathBuf);
+
+impl Drop for TestState {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).unwrap();
+    }
 }
 
 fn run(arguments: &[&str]) -> Output {

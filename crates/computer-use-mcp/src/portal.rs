@@ -1764,17 +1764,7 @@ pub struct RestoreTokenStore {
 
 impl RestoreTokenStore {
     pub fn xdg() -> Result<Self, String> {
-        let state = std::env::var_os("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .filter(|path| path.is_absolute())
-                    .map(|home| home.join(".local/state"))
-            })
-            .ok_or_else(|| "neither XDG_STATE_HOME nor HOME is an absolute path".to_owned())?;
-        Ok(Self::at(state.join("computer-use-mcp")))
+        xdg_state_directory().map(Self::at)
     }
 
     pub fn at(directory: PathBuf) -> Self {
@@ -1897,7 +1887,21 @@ impl RestoreTokenStore {
     }
 }
 
-fn open_private_directory(path: &Path, create: bool) -> Result<Option<File>, String> {
+pub(crate) fn xdg_state_directory() -> Result<PathBuf, String> {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|home| home.join(".local/state"))
+        })
+        .map(|state| state.join("computer-use-mcp"))
+        .ok_or_else(|| "neither XDG_STATE_HOME nor HOME is an absolute path".to_owned())
+}
+
+pub(crate) fn open_private_directory(path: &Path, create: bool) -> Result<Option<File>, String> {
     let missing = matches!(
         fs::symlink_metadata(path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound

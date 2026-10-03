@@ -438,6 +438,10 @@ cooperative signal exists.
 
 ```sh
 computer-use-mcp doctor
+computer-use-mcp history
+computer-use-mcp history --errors
+computer-use-mcp history --last 50 --since 2h
+computer-use-mcp history --call-id connection-0123456789abcdef-4
 computer-use-mcp init
 opencode mcp list
 ```
@@ -446,6 +450,41 @@ opencode mcp list
 state, and portal readiness without requesting consent. `init` requests portal
 approval. `call FILE` runs production validation and runtime against a static
 batch; static entries cannot feed returned opaque IDs into later entries.
+
+### Call history
+
+The public broker records every tool call, including compact `help`/`dispatch`,
+validation failures, cancellations, and protocol-level unknown-tool errors.
+The CLI `call` command uses the same history. Each call has a start record and
+a terminal record with a connection/call ID, timestamp, elapsed milliseconds,
+operation, validated request metadata, desktop route when resolved, result
+code, outcome, retryability, and action-progress fields when available.
+Successful protocol completion does not prove application effect.
+
+`history` prints retained JSONL records in append order. `history --errors`
+prints failed and abandoned calls. A dropped execution future is recorded as
+abandoned with an unknown outcome; a killed process may leave only its start
+record. Connection and call IDs distinguish simultaneous MCP instances.
+
+Filters combine in any order. `--since` selects calls by their start timestamp;
+it accepts Unix milliseconds or an integer duration ending in `s`, `m`, `h`, or
+`d`, relative to the current time. `--call-id` matches an exact ID. `--last N`
+selects the most recently appended N distinct matching calls after the other
+filters, preserving their retained records in append order. It counts calls,
+not JSONL lines, even when concurrent calls interleave. `--last 0` prints nothing.
+Combined with `--errors`, it returns only the matching terminal error records.
+
+History lives in `$XDG_STATE_HOME/computer-use-mcp/history`, or
+`~/.local/state/computer-use-mcp/history` when XDG state is unset. Two rotating
+files, `calls.jsonl` and `calls.previous.jsonl`, retain at most 1 MiB each.
+Older records are removed on rotation. A shared file lock serializes readers
+and writers across processes. The directory is private (0700), and new files
+are private (0600). History survives ordinary MCP restarts.
+
+Records contain metadata and text lengths, not typed or assigned values,
+clipboard contents, accessibility text, screenshots, raw arguments, or error
+messages. Logging failures are reported on stderr and do not change dispatch
+or retry semantics. `doctor` reports the history directory.
 
 | Symptom | Recovery |
 | --- | --- |

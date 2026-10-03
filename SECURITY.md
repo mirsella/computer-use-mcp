@@ -16,6 +16,13 @@ log typed or assigned values or portal restore tokens. The project intentionally
 does not promise generic password redaction. Replacement length accounting uses
 UTF-8 bytes and verification compares the exact returned text.
 
+The bounded call history stores operation metadata, opaque references, timing,
+error codes, and dispatch/cleanup status in private XDG state files. It excludes
+raw arguments, supplied text and values, clipboard data, observation text,
+screenshots, and error messages. Recording failures are diagnostic only and
+cannot alter the outcome or replay a call. See [MCP.md](MCP.md#call-history)
+for retention and inspection commands.
+
 Protected-surface detection is a heuristic over application and window
 metadata. Known authentication, privilege, permission, locker, and pinentry
 surfaces are refused before `act` or `activate_window` dispatch. The heuristic

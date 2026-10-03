@@ -37,6 +37,10 @@ and the authorities used to make decisions.
   supported launcher is `scripts/run-isolated-session.sh`.
 - `takeover` tracks recent physical input, held keys, and cooperative handoff
   signals. Mutations check busy state; explicit idle waits await its clearance.
+- `history` records bounded diagnostics at the public broker boundary, including
+  validation and transport errors. Workers do not create duplicate records or
+  put history in their disposable private state. Two private JSONL files rotate
+  under a cross-process lock; request and result projections exclude content.
 - `virtual_desktop` provides best-effort KWin desktop discovery and switching
   for activation evidence. It never turns an unknown desktop location into an
   authority claim.

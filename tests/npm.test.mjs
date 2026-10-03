@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { access, readFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import { constants } from "node:fs";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { createInterface } from "node:readline";
 import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -89,6 +90,9 @@ test("compact mode respects global and agent-specific permissions and tool switc
 
 async function connect(t, compact, protocolVersion = "2025-11-25") {
   const env = { ...process.env };
+  const state = await mkdtemp(join(tmpdir(), "computer-use-mcp-history-"));
+  env.XDG_STATE_HOME = state;
+  t.after(() => rm(state, { recursive: true, force: true }));
   for (const key of ["WAYLAND_DISPLAY", "DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "XDG_SESSION_TYPE"]) {
     delete env[key];
   }
@@ -125,6 +129,7 @@ async function connect(t, compact, protocolVersion = "2025-11-25") {
   send({ method: "notifications/initialized" });
   return {
     request,
+    state,
     async close() {
       child.stdin.end();
       assert.deepEqual(await closed, [0, null], stderr);
@@ -198,4 +203,49 @@ test("compact responses honor the negotiated protocol", { timeout: 15_000 }, asy
     assert.ok(result.content[0].text);
   }
   await client.close();
+});
+
+test("public call history records compact validation and protocol errors without contents", { timeout: 15_000 }, async (t) => {
+  const client = await connect(t, true, "2025-03-26");
+  const secret = "private request contents";
+  await client.request("tools/call", { name: "help", arguments: {} });
+  await client.request("tools/call", { name: "dispatch", arguments: { action: "act", arguments: { text: secret } } });
+  await client.request("tools/call", { name: secret, arguments: {} });
+  await client.close();
+  const history = execFileSync(binary, ["history"], {
+    env: { ...process.env, XDG_STATE_HOME: client.state }, encoding: "utf8",
+  });
+  const records = history.trim().split("\n").map(JSON.parse);
+  assert.equal(records.length, 6);
+  const finished = records.filter((record) => record.event === "finished");
+  assert.equal(finished[0].status, "succeeded");
+  assert.equal(finished[1].tool, "dispatch");
+  assert.equal(finished[1].action, "act");
+  assert.equal(finished[1].result.code, "invalid_arguments");
+  assert.equal(finished[1].result.outcome, "not_started");
+  assert.equal(finished[2].tool, "unknown");
+  assert.equal(finished[2].result.protocol_error, true);
+  assert.ok(finished.every((record) => Number.isFinite(record.duration_ms)));
+  assert.ok(!history.includes(secret));
+  const errors = execFileSync(binary, ["history", "--errors"], {
+    env: { ...process.env, XDG_STATE_HOME: client.state }, encoding: "utf8",
+  }).trim().split("\n").map(JSON.parse);
+  assert.equal(errors.length, 2);
+  assert.ok(errors.every((record) => record.status === "error"));
+  const query = (...arguments_) => {
+    const output = execFileSync(binary, ["history", ...arguments_], {
+      env: { ...process.env, XDG_STATE_HOME: client.state }, encoding: "utf8",
+    });
+    return output.trim() ? output.trim().split("\n").map(JSON.parse) : [];
+  };
+  const last = records.filter((record) => record.call_id === finished[2].call_id);
+  assert.deepEqual(query("--last", "1"), last);
+  assert.deepEqual(query("--call-id", finished[2].call_id), last);
+  assert.deepEqual(query("--since", "15m"), records);
+  assert.deepEqual(query("--since", "0"), records);
+  assert.deepEqual(query("--errors", "--last", "1", "--since", "1h"), [finished[2]]);
+  assert.deepEqual(query("--last", "0"), []);
+  assert.throws(() => query("--last"));
+  assert.throws(() => query("--since", "yesterday"));
+  assert.throws(() => query("--call-id"));
 });

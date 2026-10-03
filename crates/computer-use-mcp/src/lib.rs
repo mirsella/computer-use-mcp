@@ -8,6 +8,7 @@ pub mod desktop_launcher;
 pub mod encoder;
 pub mod errors;
 pub mod geometry;
+mod history;
 pub mod input;
 pub mod portal;
 pub mod runtime;

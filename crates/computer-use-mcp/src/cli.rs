@@ -14,7 +14,28 @@ use crate::{
     server,
 };
 
-const HELP: &str = "Computer Use MCP for Linux Wayland\n\nUsage:\n  computer-use-mcp [command]\n\nCommands:\n  init          Ask KDE to approve one monitor and save its restore token.\n  mcp           Serve six tools over stdio; --compact-tools exposes help/dispatch instead.\n  call FILE     Execute a call object or an array through one stateful desktop broker; use - for stdin.\n  doctor        Report Wayland, portal, PipeWire, AT-SPI, and input prerequisites without prompting.\n  help          Show this help.\n  version       Print the CLI version.\n\nCall input uses {\"name\":\"list_desktop\",\"arguments\":{\"scope\":\"windows\",\"desktop\":\"background\"}} objects and prints one standard MCP result per line. Discovery and launch accept desktop=foreground or background; returned IDs route later calls. Each CLI batch owns its sessions until exit. Run init only to approve foreground KDE access separately. KDE may ask again after revocation or display changes.\n";
+const HELP: &str = r#"Computer Use MCP for Linux Wayland
+
+Usage:
+  computer-use-mcp [command]
+
+Commands:
+  init          Ask KDE to approve one monitor and save its restore token.
+  mcp           Serve six tools over stdio; --compact-tools exposes help/dispatch instead.
+  call FILE     Execute a call object or an array through one stateful desktop broker; use - for stdin.
+  history       Print bounded call history as JSONL.
+  doctor        Report Wayland, portal, PipeWire, AT-SPI, and input prerequisites without prompting.
+  help          Show this help.
+  version       Print the CLI version.
+
+History filters combine in any order:
+  --errors       Show failed and abandoned calls.
+  --last N       Show the last N matching calls, preserving their retained records.
+  --since TIME   Filter by call start: Unix milliseconds or an integer duration such as 15m or 2h.
+  --call-id ID   Match one exact call ID.
+
+Call input uses {"name":"list_desktop","arguments":{"scope":"windows","desktop":"background"}} objects and prints one standard MCP result per line. Discovery and launch accept desktop=foreground or background; returned IDs route later calls. Each CLI batch owns its sessions until exit. Run init only to approve foreground KDE access separately. KDE may ask again after revocation or display changes.
+"#;
 
 pub async fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), CliError> {
     let arguments: Vec<_> = arguments.into_iter().collect();
@@ -33,6 +54,21 @@ pub async fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), CliE
         "doctor" => {
             require_no_extra_arguments(&arguments)?;
             doctor().await;
+            Ok(())
+        }
+        "history" => {
+            let query = crate::history::Query::parse(&arguments[1..], std::time::SystemTime::now())
+                .map_err(CliError::InvalidArguments)?;
+            let records = crate::history::read(&query).map_err(CliError::Mcp)?;
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+            for record in records {
+                serde_json::to_writer(&mut stdout, &record)
+                    .map_err(|error| CliError::Mcp(error.to_string()))?;
+                stdout
+                    .write_all(b"\n")
+                    .map_err(|error| CliError::Mcp(error.to_string()))?;
+            }
             Ok(())
         }
         "init" => {
@@ -207,6 +243,13 @@ fn parse_call(value: Value, index: usize) -> Result<(String, JsonObject<String, 
 async fn doctor() {
     println!("Computer Use MCP doctor");
     println!("This check never opens a portal session or prompts for consent.");
+    match crate::history::directory_from_env() {
+        Ok(path) => println!(
+            "Call history: {} (two files, up to 1 MiB each)",
+            path.display()
+        ),
+        Err(error) => println!("Call history: unavailable ({error})"),
+    }
 
     let session = crate::session::describe_session_from_env();
     let session_type = std::env::var("XDG_SESSION_TYPE").ok();
