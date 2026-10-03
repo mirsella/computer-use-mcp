@@ -1,6 +1,6 @@
 {
   "name": "@mirsella/opencode-computer-use-mcp",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Computer use on KDE Plasma Wayland, with a bundled Rust MCP server and OpenCode plugin",
   "type": "module",
   "exports": {
