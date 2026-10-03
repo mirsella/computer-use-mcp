@@ -7,9 +7,10 @@ use serde_json::{Map as JsonObject, Value};
 use crate::validation::{
     AccessibilityScope, DEFAULT_ACCESSIBILITY_MAX_DEPTH, DEFAULT_ACCESSIBILITY_MAX_NODES,
     DEFAULT_ACCESSIBILITY_TEXT_LIMIT, DEFAULT_DESKTOP_PAGE_SIZE, MAX_CLICK_COUNT,
-    MAX_DESKTOP_PAGE_SIZE, MAX_DRAG_POINTS, MAX_KEYBOARD_EVENTS, MAX_KEYBOARD_MODIFIERS,
-    MAX_KEYBOARD_TRANSACTION_TEXT, MAX_QUERY_LENGTH, MAX_SCROLL_STEPS, MAX_TEXT_LIMIT,
-    MAX_TREE_DEPTH, MAX_TREE_NODES, MAX_WAIT_STABLE_MS, MAX_WAIT_TIMEOUT_MS, WindowAction,
+    MAX_DESKTOP_PAGE_SIZE, MAX_DRAG_POINTS, MAX_HUMAN_IDLE_TIMEOUT_MS, MAX_KEYBOARD_EVENTS,
+    MAX_KEYBOARD_MODIFIERS, MAX_KEYBOARD_TRANSACTION_TEXT, MAX_QUERY_LENGTH, MAX_SCROLL_STEPS,
+    MAX_TEXT_LIMIT, MAX_TREE_DEPTH, MAX_TREE_NODES, MAX_WAIT_STABLE_MS, MAX_WAIT_TIMEOUT_MS,
+    WindowAction,
 };
 
 pub const TOOL_NAMES: [&str; 6] = [
@@ -21,7 +22,7 @@ pub const TOOL_NAMES: [&str; 6] = [
     "wait_for",
 ];
 
-pub const SERVER_INSTRUCTIONS: &str = "Copy returned IDs unchanged. Stale target: rediscover; stale observation or element: observe again. not_started permits recovery then retry; unknown/completed requires inspecting state first. Dispatch does not prove application effect. UserTakeoverInterrupted requires stopping, user authorization, and an MCP restart.";
+pub const SERVER_INSTRUCTIONS: &str = "Copy IDs unchanged. Stale target: rediscover; stale observation or element: observe again. not_started permits recovery then retry; unknown/completed requires inspecting state first. Dispatch does not prove application effect. HumanInputBusy: wait_for human_idle, then observe before acting. Use background only when the user requests it.";
 
 pub fn compact_tool_definitions() -> &'static [Tool] {
     &*COMPACT_TOOLS
@@ -127,7 +128,7 @@ static DIRECT_TOOLS: LazyLock<[Tool; 6]> = LazyLock::new(|| {
         ),
         tool(
             "wait_for",
-            "Wait for evidence up to timeout_ms. Frame/element conditions require target. window_opened accepts desktop (default foreground) and matches existing windows too. window_closed routes by a listed window ID. App-ID matching requires compositor metadata. Timeout does not prove unchanged state; observe before visual input.",
+            "Wait, then observe before acting. human_idle: targetless foreground, 60s quiet, timeout_ms<=120000; others<=5000. Frame/element waits need target. window_opened accepts desktop and matches existing compositor app IDs; window_closed uses a listed ID.",
             wait_input_schema(),
             true,
             false,
@@ -314,16 +315,20 @@ fn wait_input_schema() -> Value {
             "desktop": desktop_schema(),
             "target": target_schema(),
             "condition": wait_condition_schema(),
-            "timeout_ms": {"type": "integer", "minimum": 0, "maximum": MAX_WAIT_TIMEOUT_MS}
+            "timeout_ms": {"type": "integer", "minimum": 0, "maximum": MAX_HUMAN_IDLE_TIMEOUT_MS}
         }),
         &["condition", "timeout_ms"],
     ));
     schema.insert("allOf".into(), json!([{
-        "if": {"properties": {"condition": {"properties": {"type": {"enum": ["window_opened", "window_closed"]}}}}},
+        "if": {"properties": {"condition": {"properties": {"type": {"enum": ["window_opened", "window_closed", "human_idle"]}}}}},
         "else": {"required": ["target"]}
     }, {
         "if": {"required":["desktop"]},
         "then": {"not":{"required":["target"]},"properties":{"condition":{"properties":{"type":{"const":"window_opened"}}}}}
+    }, {
+        "if": {"properties":{"condition":{"properties":{"type":{"const":"human_idle"}}}}},
+        "then": {"not":{"required":["target"]}},
+        "else": {"properties":{"timeout_ms":{"maximum":MAX_WAIT_TIMEOUT_MS}}}
     }]));
     Value::Object(schema)
 }
@@ -351,7 +356,8 @@ fn wait_condition_schema() -> Value {
         }), &["desktop_id"]),
         action_object("window_closed", json!({
             "window_instance_id": {"type": "string", "pattern": "^win-[0-9a-f]{16}$"}
-        }), &["window_instance_id"])
+        }), &["window_instance_id"]),
+        action_object("human_idle", json!({}), &[])
     ]})
 }
 

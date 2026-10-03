@@ -324,8 +324,9 @@ effect, seat focus, or client delivery.
 
 ### `wait_for`
 
-`target` is optional only for window conditions. `condition` and `timeout_ms`
-are required; the timeout is bounded at 5000 milliseconds. Frame,
+`target` is optional for window conditions and forbidden for `human_idle`.
+`condition` and `timeout_ms` are required. The timeout is bounded at 5000
+milliseconds, except `human_idle`, which allows up to 120000 milliseconds. Frame,
 accessibility, and element conditions require and resolve an exact target.
 
 Window open:
@@ -371,6 +372,33 @@ Window waits do not subscribe to an event channel. They refresh and poll until
 the bounded timeout or an explicit catalog error. A timeout is not proof that
 nothing changed outside the catalog authority.
 
+Human idle:
+
+```json
+{
+  "condition":{"type":"human_idle"},
+  "timeout_ms":120000
+}
+```
+
+This targetless, foreground-only condition does not accept `desktop`. It waits
+until 60 seconds have passed since the last detected physical activity, all
+observed physical keys and buttons are released, and no cooperative handoff
+signal is asserted. New activity restarts the quiet period. Clearing a handoff
+signal starts a fresh quiet period. A newly started monitor with no detected
+activity has no pending cooldown.
+
+The result reports `satisfied`, `evidence.available`, `quiet_period_ms`,
+`remaining_ms`, and a reason: `idle`, `quiet_period`, `physical_input_held`,
+`handoff_requested`, or `physical_monitor_unavailable`. Remaining time describes
+the cooldown, not a prediction of when held input or a handoff will clear.
+Unavailable physical monitoring never establishes idle. Detection remains best
+effort for devices the process cannot read.
+
+An idle wait tolerates ongoing human activity and supports normal cancellation.
+It neither dispatches nor replays an action. After success, obtain a fresh
+observation before deciding whether to act.
+
 ## Outcomes and Takeover
 
 Known-tool argument and runtime failures are normal tool results with
@@ -385,17 +413,26 @@ Known-tool argument and runtime failures are normal tool results with
 `retryable` is advisory. The recovery text is the next-step authority.
 `ProtectedSurfaceRefused` is non-retryable.
 
-Takeover monitoring is armed only during an active mutation or wait. It uses
+Physical monitoring runs for the lifetime of the foreground worker, including
+between calls. It uses
 readable physical `/dev/input/event*` devices, the cooperative
 `COMPUTER_USE_MCP_TAKEOVER=1` flag or handoff file, and EIS refusal caused by
 physical shortcut modifiers. Agent EIS events do not appear as physical device
 events. Monitoring is skipped only for a verified isolated session.
 
-On detection, held input is released and `UserTakeoverInterrupted` is returned.
-The latch remains active for the MCP lifetime. Removing the signal does not
-resume operation. Resumption requires user authorization, clearing the signal,
-restarting MCP, and taking a fresh observation. Detection is best effort when
-no input device is readable and no cooperative signal exists.
+Foreground mutations fail immediately with `HumanInputBusy` while input is
+active or recent. Detection during a mutation interrupts further dispatch and
+attempts held-input cleanup and desktop restoration. The interrupted operation
+stays aborted. Outcomes retain actual dispatch progress; cleanup cannot retract
+delivered input. Read-only discovery, observation, and waits remain available.
+
+After the 60-second quiet period, a new mutation may proceed without restarting
+MCP. Observations from before or during the pause become stale. Use
+`wait_for human_idle`, then observe again, or hand control to the user. Background
+use requires the user's request; human activity never changes the desktop route.
+Cleanup failure is a separate session failure and cannot be repaired by an idle
+wait. Detection is best effort when no physical device is readable and no
+cooperative signal exists.
 
 ## Direct Commands and Troubleshooting
 
@@ -418,4 +455,4 @@ batch; static entries cannot feed returned opaque IDs into later entries.
 | Capability is unavailable or busy | Use a capability advertised by the exact target, or wait for the authority to recover. |
 | Coordinates are invalid | Use the returned PNG dimensions and half-open bounds from the exact source frame. |
 | Outcome is `unknown` or `completed` | Observe current state before deciding whether another action is needed. |
-| Takeover interruption | Stop. Obtain user authorization, clear the signal, restart MCP, and observe again. |
+| `HumanInputBusy` | Pause foreground actions. Wait for `human_idle`, then observe fresh state; no restart is needed. Clear an asserted handoff signal before resuming. |

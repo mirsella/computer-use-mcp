@@ -69,7 +69,7 @@ Add the package to your OpenCode configuration, using OpenCode 1.18 or newer:
 ```
 
 The plugin registers `mcp.computer_use` with the bundled executable, a
-90-second timeout, and the computer-use skill. By default, the model sees only
+150-second timeout, and the computer-use skill. By default, the model sees only
 `computer_use_help` and `computer_use_dispatch`. Help lists operation names or
 returns one operation's full schema; dispatch executes it through the same
 validation and desktop broker. The skill loads on demand.
@@ -98,7 +98,7 @@ This example asks for review before each tool call:
       "type": "local",
       "command": ["npx", "-y", "@mirsella/opencode-computer-use-mcp", "mcp"],
       "enabled": true,
-      "timeout": 90000
+      "timeout": 150000
     }
   },
   "permission": { "computer_use_*": "ask" }
@@ -121,13 +121,16 @@ known local approval failures retry within a 45-second deadline with bounded
 1/2/4/8-second backoff. Cancellation, shutdown, and worker termination stop
 the request. Approval exhaustion or revocation retires that worker, making its
 IDs stale. An explicit discovery or launch creates a replacement without an
-MCP restart. Takeover interruption is the exception: it remains latched and
-requires user authorization and an MCP restart.
+MCP restart. Human activity pauses foreground mutations until 60 seconds of
+quiet. Use `wait_for` with `condition: {"type":"human_idle"}`, then observe
+fresh state before acting; ordinary human activity does not require a restart.
 
 `list_desktop`, `launch_application`, and targetless `window_opened` accept the
 optional `desktop` value `foreground` or `background`. Omit it for foreground
 when no returned identity routes the call. Returned opaque IDs and cursors
 route later calls; callers do not provide a `session_id`.
+Choose background only when the user requests it. The foreground-only
+`human_idle` wait accepts neither `desktop` nor `target`.
 
 The direct normal-MCP smoke passed screenshot, click, focused typing, portal
 Clipboard paste, and fresh AT-SPI readback. It kept the foreground worker count

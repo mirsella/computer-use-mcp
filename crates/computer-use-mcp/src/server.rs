@@ -273,8 +273,8 @@ pub fn production_runtime() -> Arc<SemanticRuntime<AtspiAdapter, ProductionScree
     )
     .with_virtual_desktop_provider(VirtualDesktopProvider::live());
     let runtime = Arc::new(runtime);
-    // Enable action-scoped monitoring in shared physical sessions. This
-    // does not spawn a watcher until a mutation or wait owns execution.
+    // Track physical activity between calls too, so a foreground mutation
+    // cannot resume until the quiet period has passed.
     runtime.arm_hardware_watcher();
     runtime
 }

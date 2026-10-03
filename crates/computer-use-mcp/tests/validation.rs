@@ -1025,6 +1025,31 @@ fn window_open_and_close_conditions_parse_and_reject_unknown() {
     );
 }
 
+#[test]
+fn human_idle_is_targetless_and_has_a_separate_timeout_limit() {
+    for timeout_ms in [0, 60_000, 120_000] {
+        assert_eq!(
+            valid(
+                "wait_for",
+                json!({"condition":{"type":"human_idle"},"timeout_ms":timeout_ms})
+            ),
+            ToolCall::WaitFor {
+                target: None,
+                condition: WaitCondition::HumanIdle,
+                timeout_ms
+            }
+        );
+    }
+    for arguments in [
+        json!({"condition":{"type":"human_idle"},"timeout_ms":120_001}),
+        json!({"condition":{"type":"human_idle","for_ms":1},"timeout_ms":60_000}),
+        json!({"target":target(),"condition":{"type":"human_idle"},"timeout_ms":60_000}),
+        json!({"condition":{"type":"window_opened","desktop_id":"app.desktop"},"timeout_ms":60_000}),
+    ] {
+        assert!(validate_call("wait_for", arguments.as_object().unwrap().clone()).is_err());
+    }
+}
+
 fn observation_with_frame(frame_id: Option<&str>) -> Value {
     match frame_id {
         Some(frame_id) => json!({

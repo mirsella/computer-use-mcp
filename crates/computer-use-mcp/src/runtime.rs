@@ -248,7 +248,7 @@ pub fn with_action_progress_snapshot(
 pub trait DesktopRuntime: Send + Sync + 'static {
     fn start(&self) {}
     /// True after approval failure or capture exhaustion requires a new owner.
-    /// This must not include a user-takeover latch or an ordinary action error.
+    /// This must not include temporary human-input busy state or ordinary errors.
     fn desktop_session_exhausted(&self) -> bool {
         false
     }

@@ -15,6 +15,7 @@ ashpd = { version = "=0.13.13", default-features = false, features = ["remote_de
 atspi = { version = "=0.30.0", default-features = false }
 atspi-proxies = { version = "=0.14.0", default-features = false }
 base64 = "=0.22.1"
+evdev = { version = "=0.13.2", default-features = false }
 futures-util = "=0.3.32"
 gio = { version = "=0.21.5", features = ["v2_58"] }
 image = { version = "=0.25.10", default-features = false, features = ["png"] }

@@ -35,8 +35,8 @@ and the authorities used to make decisions.
 - `session` validates the active Wayland session and reports whether the
   process is actually isolated. It never starts a compositor. The only
   supported launcher is `scripts/run-isolated-session.sh`.
-- `takeover` watches physical input and cooperative handoff signals. Its latch
-  is checked by mutation and wait paths.
+- `takeover` tracks recent physical input, held keys, and cooperative handoff
+  signals. Mutations check busy state; explicit idle waits await its clearance.
 - `virtual_desktop` provides best-effort KWin desktop discovery and switching
   for activation evidence. It never turns an unknown desktop location into an
   authority claim.
@@ -126,15 +126,30 @@ This isolation separates routing and cooperative same-user processes. It is not
 a malicious same-user sandbox. A same-user process with sufficient host access
 can still inspect or interfere with the session.
 
-Takeover watching is operation-scoped: it is armed while an active mutation or
-wait is running, not for an idle MCP process. Readable physical
+The foreground runtime owns a persistent physical-input watcher, including
+between tool calls. Shutdown and drop stop and join it. Readable physical
 `/dev/input/event*` devices, the cooperative environment or handoff file, and
-EIS physical-modifier refusal are independent signals. Watching is skipped only
-after isolation is verified. On detection, the latch remains set for the MCP
-lifetime. Clearing the signal does not resume work; resumption requires user
-authorization, clearing the signal, restarting MCP, and taking a fresh
-observation. Cleanup joins the operation-owned watcher and releases held input,
-but cannot retract events already delivered.
+EIS physical-modifier refusal are independent signals. Hardware watching is
+skipped only after isolation is verified. Kernel key-state queries detect keys
+already held when devices open; dropped event history causes a reopen and
+fresh query. Device failures remain best effort and fail open for actions.
+One device registry owns held keys and establishes monitoring availability.
+Event batches update it under one lock. Watcher teardown clears the registry
+after joining, including when the watcher thread failed.
+
+Physical activity blocks mutations until observed keys are released and 60
+seconds of quiet pass. A cooperative signal blocks while asserted and starts a
+quiet period on clearance. The observation epoch combines the activity counter
+and current busy/idle phase, so expiry invalidates observations taken during a
+pause without recording synthetic input. Epoch changes invalidate observations
+and click grace at the next call. Signal configuration is resolved once; handoff
+file presence stays live.
+Read-only calls remain available; `wait_for human_idle` explicitly awaits
+clearance and reports unavailable monitoring rather than claiming idle.
+Interrupted operations stay aborted and retain dispatch progress. Cleanup
+releases generated held input and restores unfinished desktop switches, but
+cannot retract delivered events. A cleanup failure exhausts the session rather
+than becoming resumable through the idle timer.
 
 ## Capture and Mapping
 
@@ -164,8 +179,11 @@ portal stream extent; aspect ratio alone is insufficient.
 AT-SPI traversal and text reads are bounded. Selected text is range-capped
 before `GetText`, and value reads use bounded `CurrentValue`. Text replacement
 requires `Component`, `Text`, and `EditableText`, focuses the target, performs
-the replacement, and verifies a fresh full-text readback. Replacement values are
-not logged. Replacement insertion uses UTF-8 byte length and verification
+the replacement, and verifies a fresh full-text readback. One editable-target
+interface supplies the operations to the shared replacement policy. If `GrabFocus` returns
+false, replacement proceeds only after a fresh state query confirms the exact
+target is focused and non-defunct. Replacement values are not logged.
+Replacement insertion uses UTF-8 byte length and verification
 compares the exact returned text and Unicode scalar count. The project
 intentionally does not promise password redaction.
 
@@ -181,7 +199,7 @@ the same cleanup-safe transaction.
 Focus grace is a one-shot, best-effort shortcut after a successfully dispatched
 click whose mapped point is inside the current KDE geometry. It matches the same
 accessibility app and window identity, is consumed once, and is invalidated by a
-focus or geometry change, takeover, or expiry. A false `Component.GrabFocus`
-result is accepted only after a fresh exact element-focused and window-active
-readback. Unknown focus state is reported as unavailable or null, never inferred
-as focused.
+focus or geometry change, takeover, or expiry. For generated typing, a false
+`Component.GrabFocus` result is accepted only after a fresh exact element-focused
+and window-active readback. Unknown focus state is reported as unavailable or
+null, never inferred as focused.

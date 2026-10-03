@@ -94,7 +94,7 @@ not a substitute for portal consent or an MCP host permission review.
 
 ## Takeover
 
-Takeover monitoring is armed only while an active mutation or wait is in flight.
+Physical monitoring runs throughout the foreground worker's lifetime.
 It watches readable physical `/dev/input/event*` devices, cooperative
 handoff signals, and EIS refusal caused by physical Ctrl, Alt, Super, or latched
 modifiers. Agent EIS events do not appear as physical device events. A verified
@@ -105,12 +105,17 @@ signal is present, an unannounced physical handoff may be invisible. The
 feature does not invent an input path or block ordinary work when no signal is
 available.
 
-When takeover is detected, the runtime releases held input, returns
-`UserTakeoverInterrupted`, and latches the interruption for the MCP lifetime.
-Removing the signal does not resume operation. Resumption requires user
-authorization, clearing the signal, restarting MCP, and taking a fresh
-observation. Cleanup reports its own result and cannot retract events already
-delivered.
+Human activity refuses or interrupts foreground mutations with `HumanInputBusy`.
+The runtime attempts generated-input cleanup and desktop restoration, reporting
+their result separately from dispatch. Interrupted operations stay aborted;
+cleanup cannot retract delivered events. Read-only calls remain available.
+
+Mutations may resume after 60 seconds of quiet with observed physical keys
+released. Cooperative handoff signals block until cleared, then start a quiet
+period. The explicit `human_idle` wait reports unavailable physical monitoring
+rather than claiming idle. Resumption requires a fresh observation, without an
+MCP restart. Cleanup failure remains a separate session failure. Human activity
+never redirects work to background; choosing it requires the user's request.
 
 ## Residual Uncertainty
 

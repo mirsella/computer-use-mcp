@@ -374,47 +374,13 @@ impl AtspiAdapter {
                 )?;
             }
             SemanticAction::ReplaceText(value) => {
-                let component = component_proxy(connection, object).await?;
-                let editable = editable_text_proxy(connection, object).await?;
-                let text = text_proxy(connection, object).await?;
-                replace_text_with_fallback(
-                    &value,
-                    || async { component.grab_focus().await.map_err(atspi_call_error) },
-                    || async {
-                        editable
-                            .set_text_contents(&value)
-                            .await
-                            .map_err(atspi_call_error)
-                    },
-                    || read_full_text(&text),
-                    {
-                        let editable = editable.clone();
-                        move |count| {
-                            let editable = editable.clone();
-                            async move {
-                                editable
-                                    .delete_text(0, count)
-                                    .await
-                                    .map_err(atspi_call_error)
-                            }
-                        }
-                    },
-                    {
-                        let editable = editable.clone();
-                        let value = value.clone();
-                        move |length| {
-                            let editable = editable.clone();
-                            let value = value.clone();
-                            async move {
-                                editable
-                                    .insert_text(0, &value, length)
-                                    .await
-                                    .map_err(atspi_call_error)
-                            }
-                        }
-                    },
-                )
-                .await?;
+                let mut editor = AtspiTextEditor {
+                    component: component_proxy(connection, object).await?,
+                    editable: editable_text_proxy(connection, object).await?,
+                    text: text_proxy(connection, object).await?,
+                    accessible: Self::accessible(connection, object).await?,
+                };
+                replace_text(&mut editor, &value).await?;
             }
             SemanticAction::SetNumericValue(value) => {
                 value_proxy(connection, object)
@@ -653,39 +619,108 @@ pub(crate) struct TextReadback {
     pub(crate) truncated: bool,
 }
 
-pub(crate) async fn replace_text_with_fallback<G, GF, S, SF, R, RF, D, DF, I, IF>(
+impl TextReadback {
+    fn matches(&self, expected: &str) -> bool {
+        !self.truncated
+            && self.actual == expected
+            && usize::try_from(self.character_count).ok() == Some(expected.chars().count())
+    }
+}
+
+/// Operations on one exact editable object. Reads must be fresh and bounded;
+/// `read_focused` confirms keyboard focus and a non-defunct target.
+pub(crate) trait TextEditor {
+    fn grab_focus(&mut self) -> impl Future<Output = Result<bool, RuntimeError>> + Send;
+    fn read_focused(&mut self) -> impl Future<Output = Result<bool, RuntimeError>> + Send;
+    fn read_text(&mut self) -> impl Future<Output = Result<TextReadback, RuntimeError>> + Send;
+    fn set_text<'a>(
+        &'a mut self,
+        value: &'a str,
+    ) -> impl Future<Output = Result<bool, RuntimeError>> + Send + 'a;
+    fn delete_text(
+        &mut self,
+        count: i32,
+    ) -> impl Future<Output = Result<bool, RuntimeError>> + Send;
+    fn insert_text<'a>(
+        &'a mut self,
+        value: &'a str,
+        byte_length: i32,
+    ) -> impl Future<Output = Result<bool, RuntimeError>> + Send + 'a;
+}
+
+struct AtspiTextEditor<'a> {
+    component: ComponentProxy<'a>,
+    editable: EditableTextProxy<'a>,
+    text: TextProxy<'a>,
+    accessible: AccessibleProxy<'a>,
+}
+
+impl TextEditor for AtspiTextEditor<'_> {
+    async fn grab_focus(&mut self) -> Result<bool, RuntimeError> {
+        self.component.grab_focus().await.map_err(atspi_call_error)
+    }
+
+    async fn read_focused(&mut self) -> Result<bool, RuntimeError> {
+        let states = self
+            .accessible
+            .get_state()
+            .await
+            .map_err(atspi_call_error)?;
+        Ok(states.contains(atspi::State::Focused) && !states.contains(atspi::State::Defunct))
+    }
+
+    async fn read_text(&mut self) -> Result<TextReadback, RuntimeError> {
+        read_full_text(&self.text).await
+    }
+
+    async fn set_text<'a>(&'a mut self, value: &'a str) -> Result<bool, RuntimeError> {
+        self.editable
+            .set_text_contents(value)
+            .await
+            .map_err(atspi_call_error)
+    }
+
+    async fn delete_text(&mut self, count: i32) -> Result<bool, RuntimeError> {
+        self.editable
+            .delete_text(0, count)
+            .await
+            .map_err(atspi_call_error)
+    }
+
+    async fn insert_text<'a>(
+        &'a mut self,
+        value: &'a str,
+        byte_length: i32,
+    ) -> Result<bool, RuntimeError> {
+        self.editable
+            .insert_text(0, value, byte_length)
+            .await
+            .map_err(atspi_call_error)
+    }
+}
+
+pub(crate) async fn replace_text(
+    editor: &mut impl TextEditor,
     expected: &str,
-    mut grab_focus: G,
-    mut set_text: S,
-    mut read_text: R,
-    mut delete_text: D,
-    mut insert_text: I,
-) -> Result<(), RuntimeError>
-where
-    G: FnMut() -> GF,
-    GF: Future<Output = Result<bool, RuntimeError>>,
-    S: FnMut() -> SF,
-    SF: Future<Output = Result<bool, RuntimeError>>,
-    R: FnMut() -> RF,
-    RF: Future<Output = Result<TextReadback, RuntimeError>>,
-    D: FnMut(i32) -> DF,
-    DF: Future<Output = Result<bool, RuntimeError>>,
-    I: FnMut(i32) -> IF,
-    IF: Future<Output = Result<bool, RuntimeError>>,
-{
+) -> Result<(), RuntimeError> {
+    if !editor.grab_focus().await? {
+        // KWrite can refuse GrabFocus while the exact editor already has focus.
+        // Confirm its current state rather than trusting the source observation.
+        reported_ok(
+            editor.read_focused().await?,
+            "AT-SPI Component.GrabFocus reported failure before text replacement; refusing to set text on an unfocused element",
+        )?;
+        eprintln!(
+            "computer-use-mcp: AT-SPI GrabFocus refused; fresh target focus verified before text replacement"
+        );
+    }
     reported_ok(
-        grab_focus().await?,
-        "AT-SPI Component.GrabFocus reported failure before text replacement; refusing to set text on an unfocused element",
-    )?;
-    reported_ok(
-        set_text().await?,
+        editor.set_text(expected).await?,
         "AT-SPI EditableText replacement reported failure",
     )?;
 
-    let readback = read_text().await?;
-    if !readback.truncated
-        && check_text_replacement(expected, &readback.actual, readback.character_count).is_ok()
-    {
+    let readback = editor.read_text().await?;
+    if readback.matches(expected) {
         return Ok(());
     }
     if readback.truncated || readback.character_count < 0 {
@@ -695,35 +730,19 @@ where
     let insert_length = i32::try_from(expected.len())
         .map_err(|_| runtime_error("AT-SPI replacement text is too large to insert"))?;
     reported_ok(
-        delete_text(readback.character_count).await?,
+        editor.delete_text(readback.character_count).await?,
         "AT-SPI EditableText delete reported failure",
     )?;
     reported_ok(
-        insert_text(insert_length).await?,
+        editor.insert_text(expected, insert_length).await?,
         "AT-SPI EditableText insert reported failure",
     )?;
-    let readback = read_text().await?;
-    if readback.truncated {
-        return Err(text_replacement_error(readback.character_count));
+    let readback = editor.read_text().await?;
+    if readback.matches(expected) {
+        Ok(())
+    } else {
+        Err(text_replacement_error(readback.character_count))
     }
-    check_text_replacement(expected, &readback.actual, readback.character_count)
-}
-
-/// Fail closed when a text replacement cannot be proven: an ignored write
-/// still reports success, so the fresh read-back must equal the request.
-/// A negative provider count can never match, so it is unverified too.
-fn check_text_replacement(
-    expected: &str,
-    actual: &str,
-    character_count: i32,
-) -> Result<(), RuntimeError> {
-    if character_count < 0
-        || usize::try_from(character_count).ok() != Some(expected.chars().count())
-        || actual != expected
-    {
-        return Err(text_replacement_error(character_count));
-    }
-    Ok(())
 }
 
 fn text_replacement_error(character_count: i32) -> RuntimeError {
@@ -837,12 +856,11 @@ fn runtime_error(message: impl Into<String>) -> RuntimeError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::collections::VecDeque;
 
     use super::{
-        AtspiAdapter, TextReadback, bounded_selection_end, bounded_text_end,
-        check_text_replacement, has_text_editing_interfaces, limit_metadata_with_truncation,
-        optional, replace_text_with_fallback,
+        AtspiAdapter, TextEditor, TextReadback, bounded_selection_end, bounded_text_end,
+        has_text_editing_interfaces, limit_metadata_with_truncation, optional, replace_text,
     };
     use crate::accessibility::{AccessibilityAdapter, ObjectId};
 
@@ -900,10 +918,16 @@ mod tests {
 
     #[test]
     fn text_replacement_verify_passes_on_exact_read_back() {
-        assert!(
-            check_text_replacement("https://mail.proton.me", "https://mail.proton.me", 22).is_ok()
-        );
-        assert!(check_text_replacement("", "", 0).is_ok());
+        for (actual, character_count) in [("https://mail.proton.me", 22), ("", 0), ("λ🙂", 2)] {
+            assert!(
+                TextReadback {
+                    actual: actual.into(),
+                    character_count,
+                    truncated: false
+                }
+                .matches(actual)
+            );
+        }
     }
 
     #[test]
@@ -918,82 +942,12 @@ mod tests {
 
     #[tokio::test]
     async fn text_replacement_orchestration_orders_fallback_and_uses_utf8_length() {
-        let steps = Arc::new(Mutex::new(Vec::new()));
-        let actual = Arc::new(Mutex::new(String::new()));
-        let insert_lengths = Arc::new(Mutex::new(Vec::new()));
+        let mut editor = IgnoredSetEditor::default();
         let expected = "λ🙂";
-
-        replace_text_with_fallback(
-            expected,
-            {
-                let steps = Arc::clone(&steps);
-                move || {
-                    let steps = Arc::clone(&steps);
-                    async move {
-                        steps.lock().unwrap().push("focus");
-                        Ok(true)
-                    }
-                }
-            },
-            {
-                let steps = Arc::clone(&steps);
-                move || {
-                    let steps = Arc::clone(&steps);
-                    async move {
-                        steps.lock().unwrap().push("set");
-                        Ok(true)
-                    }
-                }
-            },
-            {
-                let steps = Arc::clone(&steps);
-                let actual = Arc::clone(&actual);
-                move || {
-                    let steps = Arc::clone(&steps);
-                    let actual = Arc::clone(&actual);
-                    async move {
-                        steps.lock().unwrap().push("verify");
-                        let actual = actual.lock().unwrap().clone();
-                        Ok(TextReadback {
-                            character_count: actual.chars().count() as i32,
-                            actual,
-                            truncated: false,
-                        })
-                    }
-                }
-            },
-            {
-                let steps = Arc::clone(&steps);
-                move |_count| {
-                    let steps = Arc::clone(&steps);
-                    async move {
-                        steps.lock().unwrap().push("delete_insert");
-                        Ok(true)
-                    }
-                }
-            },
-            {
-                let steps = Arc::clone(&steps);
-                let actual = Arc::clone(&actual);
-                let insert_lengths = Arc::clone(&insert_lengths);
-                move |length| {
-                    let steps = Arc::clone(&steps);
-                    let actual = Arc::clone(&actual);
-                    let insert_lengths = Arc::clone(&insert_lengths);
-                    async move {
-                        steps.lock().unwrap().push("insert");
-                        insert_lengths.lock().unwrap().push(length);
-                        *actual.lock().unwrap() = expected.to_owned();
-                        Ok(true)
-                    }
-                }
-            },
-        )
-        .await
-        .unwrap();
+        replace_text(&mut editor, expected).await.unwrap();
 
         assert_eq!(
-            *steps.lock().unwrap(),
+            editor.steps,
             [
                 "focus",
                 "set",
@@ -1003,33 +957,45 @@ mod tests {
                 "verify"
             ]
         );
-        assert_eq!(*insert_lengths.lock().unwrap(), [expected.len() as i32]);
+        assert_eq!(editor.insert_lengths, [expected.len() as i32]);
+        assert_eq!(editor.actual, expected);
+    }
+
+    #[tokio::test]
+    async fn text_replacement_refuses_when_focus_state_cannot_be_read() {
+        let mut editor = IgnoredSetEditor {
+            focus_refused: true,
+            focus_error: Some(super::runtime_error("focus state unavailable")),
+            ..Default::default()
+        };
+        let error = replace_text(&mut editor, "x")
+            .await
+            .expect_err("a failed fresh focus query must stop replacement");
+        assert_eq!(error.message, "focus state unavailable");
+        assert_eq!(editor.steps, ["focus", "focus_verify"]);
+        assert!(editor.actual.is_empty());
     }
 
     #[tokio::test]
     async fn text_replacement_rejects_truncated_final_readback() {
-        let mut reads = vec![
-            TextReadback {
-                actual: String::new(),
-                character_count: 0,
-                truncated: false,
-            },
-            TextReadback {
-                actual: "x".into(),
-                character_count: 1,
-                truncated: true,
-            },
-        ];
-        let error = replace_text_with_fallback(
-            "x",
-            || async { Ok(true) },
-            || async { Ok(true) },
-            || std::future::ready(Ok(reads.remove(0))),
-            |_count| async { Ok(true) },
-            |_length| async { Ok(true) },
-        )
-        .await
-        .expect_err("truncated readback must not prove replacement");
+        let mut editor = IgnoredSetEditor {
+            reads: VecDeque::from([
+                TextReadback {
+                    actual: String::new(),
+                    character_count: 0,
+                    truncated: false,
+                },
+                TextReadback {
+                    actual: "x".into(),
+                    character_count: 1,
+                    truncated: true,
+                },
+            ]),
+            ..Default::default()
+        };
+        let error = replace_text(&mut editor, "x")
+            .await
+            .expect_err("truncated readback must not prove replacement");
 
         assert_eq!(
             error.message,
@@ -1037,18 +1003,81 @@ mod tests {
         );
     }
 
+    #[derive(Default)]
+    struct IgnoredSetEditor {
+        steps: Vec<&'static str>,
+        actual: String,
+        reads: VecDeque<TextReadback>,
+        focus_refused: bool,
+        focus_error: Option<crate::errors::RuntimeError>,
+        insert_lengths: Vec<i32>,
+    }
+
+    impl TextEditor for IgnoredSetEditor {
+        async fn grab_focus(&mut self) -> Result<bool, crate::errors::RuntimeError> {
+            self.steps.push("focus");
+            Ok(!self.focus_refused)
+        }
+
+        async fn read_focused(&mut self) -> Result<bool, crate::errors::RuntimeError> {
+            self.steps.push("focus_verify");
+            self.focus_error.take().map_or(Ok(true), Err)
+        }
+
+        async fn set_text<'a>(
+            &'a mut self,
+            _value: &'a str,
+        ) -> Result<bool, crate::errors::RuntimeError> {
+            self.steps.push("set");
+            Ok(true)
+        }
+
+        async fn read_text(&mut self) -> Result<TextReadback, crate::errors::RuntimeError> {
+            self.steps.push("verify");
+            Ok(self.reads.pop_front().unwrap_or_else(|| TextReadback {
+                actual: self.actual.clone(),
+                character_count: self.actual.chars().count() as i32,
+                truncated: false,
+            }))
+        }
+
+        async fn delete_text(&mut self, count: i32) -> Result<bool, crate::errors::RuntimeError> {
+            assert_eq!(count as usize, self.actual.chars().count());
+            self.steps.push("delete_insert");
+            self.actual.clear();
+            Ok(true)
+        }
+
+        async fn insert_text<'a>(
+            &'a mut self,
+            value: &'a str,
+            byte_length: i32,
+        ) -> Result<bool, crate::errors::RuntimeError> {
+            assert_eq!(byte_length as usize, value.len());
+            self.steps.push("insert");
+            self.insert_lengths.push(byte_length);
+            self.actual.push_str(value);
+            Ok(true)
+        }
+    }
+
     #[test]
     fn text_replacement_verify_fails_closed_on_mismatch() {
-        // The live symptom: the write reports success but the URL bar still
-        // reads back empty. That must surface as an error, never completion.
-        let error = check_text_replacement("https://mail.proton.me", "", 0)
-            .expect_err("mismatch must fail");
-        assert_eq!(error.code, "backend_failed");
-        assert!(error.message.contains("AT-SPI text replacement unverified"));
-        assert!(!error.message.contains("https://mail.proton.me"));
-        // A negative provider count can never prove the text landed.
-        assert!(check_text_replacement("x", "x", -1).is_err());
-        assert!(check_text_replacement("x", "y", 1).is_err());
+        for (actual, character_count, truncated) in [
+            ("", 0, false),
+            ("x", -1, false),
+            ("y", 1, false),
+            ("x", 1, true),
+        ] {
+            assert!(
+                !TextReadback {
+                    actual: actual.into(),
+                    character_count,
+                    truncated
+                }
+                .matches("x")
+            );
+        }
     }
 
     #[tokio::test]

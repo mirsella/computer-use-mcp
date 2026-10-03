@@ -14,6 +14,7 @@ pub const MAX_KEYBOARD_TRANSACTION_TEXT: usize = 4_096;
 pub const MAX_KEYBOARD_MODIFIERS: usize = 4;
 pub const MAX_KEYBOARD_EXPANDED_ACTIONS: usize = 4_096;
 pub const MAX_WAIT_TIMEOUT_MS: u64 = 5_000;
+pub const MAX_HUMAN_IDLE_TIMEOUT_MS: u64 = 120_000;
 // The stable interval must fit inside the default wait deadline while still
 // leaving room to acquire at least one fresh frame and observe its metadata.
 pub const MAX_WAIT_STABLE_MS: u64 = 1_500;
@@ -370,6 +371,7 @@ pub enum ActOperation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WaitCondition {
+    HumanIdle,
     FrameAdvanced {
         after_frame_id: String,
     },
@@ -426,7 +428,8 @@ impl ToolCall {
                 | WaitCondition::ElementState { .. }
                 | WaitCondition::ElementValue { .. }
                 | WaitCondition::WindowOpened { .. }
-                | WaitCondition::WindowClosed { .. } => false,
+                | WaitCondition::WindowClosed { .. }
+                | WaitCondition::HumanIdle => false,
             },
         }
     }
@@ -553,10 +556,15 @@ pub fn validate_call(
             let condition = wait_condition(required_object(&mut arguments, "condition")?)?;
             let target = optional_target(&mut arguments, "target")?;
             validate_wait_target(target.as_ref(), &condition)?;
+            let maximum = if condition == WaitCondition::HumanIdle {
+                MAX_HUMAN_IDLE_TIMEOUT_MS
+            } else {
+                MAX_WAIT_TIMEOUT_MS
+            };
             ToolCall::WaitFor {
                 target,
                 condition,
-                timeout_ms: required_timeout(&mut arguments, "timeout_ms", MAX_WAIT_TIMEOUT_MS)?,
+                timeout_ms: required_timeout(&mut arguments, "timeout_ms", maximum)?,
             }
         }
         _ => return invalid(format!("unknown tool {name:?}")),
@@ -626,6 +634,10 @@ fn validate_wait_target(
     condition: &WaitCondition,
 ) -> Result<(), RuntimeError> {
     match condition {
+        WaitCondition::HumanIdle if target.is_some() => {
+            invalid("human_idle does not accept a target")
+        }
+        WaitCondition::HumanIdle => Ok(()),
         WaitCondition::WindowOpened { .. } => Ok(()),
         WaitCondition::WindowClosed { window_instance_id } => {
             if let Some(target) = target
@@ -1025,6 +1037,7 @@ fn keyboard_events(
 
 fn wait_condition(mut object: JsonObject<String, Value>) -> Result<WaitCondition, RuntimeError> {
     let condition = match required_string(&mut object, "type")?.as_str() {
+        "human_idle" => WaitCondition::HumanIdle,
         "frame_advanced" => WaitCondition::FrameAdvanced {
             after_frame_id: required_opaque_id(&mut object, "after_frame_id", "frame")?,
         },
@@ -1328,6 +1341,14 @@ mod routing_tests {
             (
                 "observe",
                 json!({"target":target,"view":"both","desktop":"background"}),
+            ),
+            (
+                "wait_for",
+                json!({"condition":{"type":"human_idle"},"timeout_ms":120000,"desktop":"background"}),
+            ),
+            (
+                "wait_for",
+                json!({"condition":{"type":"human_idle"},"timeout_ms":120000,"desktop":"foreground"}),
             ),
             (
                 "wait_for",

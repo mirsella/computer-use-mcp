@@ -352,10 +352,14 @@ async fn doctor() {
         );
     }
     println!("InputCapture portal monitoring: not used (pointer-barrier capture API, wrong tool);");
-    println!("EIS physical-modifier refusals still surface as UserTakeoverInterrupted.");
+    println!("EIS physical-modifier refusals surface as HumanInputBusy.");
+    println!("Foreground actions pause until 60 seconds of quiet after physical activity.");
+    println!("Use wait_for human_idle, then observe fresh state; no restart is needed.");
     if takeover_armed {
-        println!("Action: act and wait_for will refuse with UserTakeoverInterrupted until");
-        println!("the handoff signal is cleared; held input is released first.");
+        println!("Action: foreground mutations refuse with HumanInputBusy while the handoff");
+        println!(
+            "signal is set and for 60 seconds after it clears. Read-only calls remain available."
+        );
     }
 }
 

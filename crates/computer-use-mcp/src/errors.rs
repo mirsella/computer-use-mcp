@@ -47,6 +47,8 @@ pub struct RuntimeError {
 }
 
 impl RuntimeError {
+    pub(crate) const HUMAN_INPUT_BUSY: &'static str = "HumanInputBusy";
+
     pub(crate) fn invalid_arguments(message: impl Into<String>) -> Self {
         Self::new(
             "invalid_arguments",
@@ -67,17 +69,15 @@ impl RuntimeError {
         )
     }
 
-    /// Refusal when a human takes over physical input during an agent
-    /// session. Returned before any further dispatch (or mapped from an EIS
-    /// physical-modifier refusal) with outcome NotStarted so agents stop and
-    /// hand off instead of retrying against the user.
-    pub(crate) fn user_takeover() -> Self {
+    /// Temporary human-input refusal. Callers attach actual dispatch progress;
+    /// an explicit idle wait and a fresh observation permit resumption.
+    pub(crate) fn human_input_busy() -> Self {
         Self::new(
-            "UserTakeoverInterrupted",
-            "human input takeover detected; further agent dispatch was interrupted; inspect action progress for dispatch and cleanup status",
+            Self::HUMAN_INPUT_BUSY,
+            "human input is active or recent; agent dispatch was refused or interrupted; inspect action progress for dispatch and cleanup status",
             ToolOutcome::NotStarted,
             false,
-            "Stop: do not retry. Ask the user whether to resume or hand off. Resume requires the user to clear any cooperative takeover signal and restart the MCP after authorizing resume, then obtain a fresh observation. Restart does not undo dispatched input.",
+            "Pause foreground actions. Call wait_for with condition {\"type\":\"human_idle\"} and timeout_ms 120000, or hand control to the user. After satisfied=true, observe fresh state before deciding whether another action is needed. Human activity requires 60 seconds of quiet; cooperative handoff signals must be cleared. An interrupted action is never replayed automatically.",
         )
     }
 

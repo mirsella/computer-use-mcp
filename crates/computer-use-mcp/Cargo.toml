@@ -13,6 +13,7 @@ ashpd.workspace = true
 atspi.workspace = true
 atspi-proxies.workspace = true
 base64.workspace = true
+evdev.workspace = true
 futures-util.workspace = true
 gio.workspace = true
 image.workspace = true

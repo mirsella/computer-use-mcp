@@ -30,7 +30,7 @@ use crate::{
         FrameWaitCondition, NoScreenshots, SESSION_UNAVAILABLE, ScreenshotMapping,
         ScreenshotObservation, ScreenshotProvider,
     },
-    takeover::{TakeoverMonitor, is_physical_input_refusal},
+    takeover::{HumanInputGeneration, TakeoverMonitor, is_physical_input_refusal},
     validation::{
         AccessibilityRequest, AccessibilityScope, ActOperation, DEFAULT_ACCESSIBILITY_MAX_DEPTH,
         DEFAULT_ACCESSIBILITY_MAX_NODES, DEFAULT_ACCESSIBILITY_TEXT_LIMIT, DesktopScope,
@@ -445,6 +445,7 @@ struct CachedObservation {
 struct Cache {
     generation: u64,
     element_generation: u64,
+    input_generation: HumanInputGeneration,
     observations: Vec<CachedObservation>,
 }
 
@@ -957,7 +958,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         }
     }
 
-    /// Enable operation-scoped physical-input monitoring in production.
+    /// Enable runtime-owned physical-input monitoring in production.
     pub fn arm_hardware_watcher(&self) {
         self.takeover.arm_hardware_watcher();
     }
@@ -980,7 +981,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
     /// Consume the click grace for a freshly read snapshot. Returns the
     /// grace age when the snapshot names the same app/window and the grace
     /// is within `ttl`; clears it on target change or expiry. Callers must
-    /// still refuse on a latched takeover before typing.
+    /// still refuse while human input is busy before typing.
     fn click_grace_for(
         &self,
         current: &Snapshot,
@@ -1885,7 +1886,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
 
     /// Fail-fast human-takeover refusal for mutation paths. Releases any
     /// previously held EIS state through the existing cleanup path before
-    /// returning `UserTakeoverInterrupted`.
+    /// returning `HumanInputBusy`.
     async fn refuse_takeover_with_cleanup(
         &self,
         progress: &ActionProgress,
@@ -1901,7 +1902,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         } else {
             progress.mark_cleanup_failed();
         }
-        let mut error = RuntimeError::user_takeover();
+        let mut error = RuntimeError::human_input_busy();
         error.outcome = progress.snapshot().outcome();
         if !cleanup_succeeded {
             error
@@ -1913,7 +1914,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
 
     fn check_takeover(&self) -> Result<(), RuntimeError> {
         if self.takeover.is_active() {
-            Err(RuntimeError::user_takeover())
+            Err(RuntimeError::human_input_busy())
         } else {
             Ok(())
         }
@@ -2093,6 +2094,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
     ) -> Result<ToolOutput, RuntimeError> {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
         match condition.clone() {
+            WaitCondition::HumanIdle => Ok(self.wait_for_human_idle(deadline).await),
             WaitCondition::WindowOpened { desktop_id } => {
                 self.wait_for_window_opened(&desktop_id, deadline, condition)
                     .await
@@ -2221,12 +2223,40 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 })
                 .await
                     }
-                    WaitCondition::WindowOpened { .. } | WaitCondition::WindowClosed { .. } => {
-                        unreachable!("window conditions are handled before target validation")
+                    WaitCondition::WindowOpened { .. }
+                    | WaitCondition::WindowClosed { .. }
+                    | WaitCondition::HumanIdle => {
+                        unreachable!("targetless conditions are handled before target validation")
                     }
                 }
             }
         }
+    }
+
+    async fn wait_for_human_idle(&self, deadline: tokio::time::Instant) -> ToolOutput {
+        let status = self.takeover.wait_for_idle(deadline).await;
+        let satisfied = status.available && !status.busy();
+        let reason = if status.busy() || status.available {
+            status.state.as_str()
+        } else {
+            "physical_monitor_unavailable"
+        };
+        ToolOutput::text(format!(
+                    "Wait: human_idle satisfied={satisfied} reason={reason}. {}",
+                    if satisfied { "Observe fresh state before acting." } else if status.busy() { "Foreground input remains paused; wait again or hand control to the user." } else { "Physical idle could not be verified. Ask the user to confirm the desktop is available." }
+                )).with_structured_content(json!({
+                    "target": null,
+                    "condition": {"type":"human_idle"},
+                    "satisfied": satisfied,
+                    "evidence": {
+                        "kind":"physical_input",
+                        "scope":"foreground",
+                        "available":status.available,
+                        "reason":reason,
+                        "quiet_period_ms":crate::takeover::HUMAN_IDLE_INTERVAL.as_millis(),
+                        "remaining_ms":status.remaining.as_millis()
+                    }
+                }))
     }
 
     /// Wait for presence of a window with an exact compositor app identity.
@@ -2281,7 +2311,6 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             sleep(Duration::from_millis(25).min(remaining)).await;
-            self.check_takeover()?;
             if tokio::time::Instant::now() >= deadline {
                 let (reason, message) = if backends.contains(&BackendStatus::Supported) {
                     (
@@ -2385,7 +2414,6 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<Option<[BackendStatus; 2]>, RuntimeError> {
-        self.check_takeover()?;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return Ok(None);
@@ -2407,7 +2435,6 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         frame_condition: FrameWaitCondition,
         success_message: &str,
     ) -> Result<ToolOutput, RuntimeError> {
-        self.check_takeover()?;
         self.ensure_screenshot_crop_fresh(&baseline, &mapping)
             .await?;
         let result = timeout(
@@ -2435,9 +2462,6 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             Ok(Err(error)) => return Err(wait_backend_error(&error.0)),
             Ok(Ok(evidence)) => evidence,
         };
-        // A takeover during the frame wait wins over fresh evidence: the
-        // agent must stop rather than act on pixels the user may own now.
-        self.check_takeover()?;
         if evidence.mapping.app_pid != mapping.app_pid
             || evidence.mapping.app_identity != mapping.app_identity
             || evidence.mapping.window_identity != mapping.window_identity
@@ -2496,7 +2520,6 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         condition: WaitCondition,
     ) -> Result<ToolOutput, RuntimeError> {
         loop {
-            self.check_takeover()?;
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 return Ok(wait_output(
@@ -2556,7 +2579,6 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             success_message,
         } = request;
         loop {
-            self.check_takeover()?;
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 return Ok(wait_output(
@@ -2618,44 +2640,51 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         progress: Option<Arc<ActionProgress>>,
     ) -> Result<ToolOutput, RuntimeError> {
         call.validate_policy()?;
+        self.synchronize_human_input()?;
+        let monitored = call.tracks_action();
         // Direct callers also wait for initialization before owning generated
         // input. MCP has already awaited this shared initialization outside its
         // execution lock; retrieve its result here for operation-specific errors.
-        let visual_session = if call.requires_visual_session() {
-            self.desktop_session().await
-        } else {
-            Ok(())
+        let execute = async {
+            let visual_session = if call.requires_visual_session() {
+                self.desktop_session().await
+            } else {
+                Ok(())
+            };
+            self.execute_call_inner(call, progress.clone(), visual_session)
+                .await
         };
-        let monitored = call.tracks_action() || matches!(&call, ToolCall::WaitFor { .. });
         if !monitored {
-            return self
-                .execute_call_inner(call, progress, visual_session)
-                .await;
+            return execute.await;
         }
-        // The operation guard stops and joins the physical watcher on every
-        // exit, including an MCP cancellation that drops this entire future.
-        let _watch = self.takeover.begin_operation();
         let mut result = tokio::select! {
             biased;
-            () = self.takeover.interrupted() => Err(RuntimeError::user_takeover()),
-            result = self.execute_call_inner(call, progress.clone(), visual_session) => result,
+            () = self.takeover.interrupted() => Err(RuntimeError::human_input_busy()),
+            result = execute => result,
         };
         if result
             .as_ref()
-            .is_err_and(|error| error.code == "UserTakeoverInterrupted")
+            .is_err_and(|error| error.code == RuntimeError::HUMAN_INPUT_BUSY)
         {
-            self.takeover.latch();
+            // EIS can detect physical modifiers even without readable evdev
+            // nodes. A refusal starts a quiet period, but retries while already
+            // busy must not extend it themselves.
+            if !self.takeover.is_active() {
+                self.takeover.record_activity();
+            }
             self.clear_click_grace();
+            self.lock_cache()?.invalidate_all();
             // The dispatch future (and its mutation guard) has been dropped
             // before cleanup acquires the lock. Outer MCP cancellation uses
             // this same cleanup path, including desktop restoration.
             let cleanup = timeout(Duration::from_secs(8), self.cleanup(progress.clone())).await;
-            let mut error = RuntimeError::user_takeover();
+            let mut error = RuntimeError::human_input_busy();
             if !matches!(cleanup, Ok(Ok(()))) {
                 if let Some(progress) = &progress {
                     progress.mark_cleanup_failed();
                 }
                 error.message.push_str("; cleanup failed or timed out, held input release and desktop restoration are not confirmed");
+                error.recovery = "Cleanup failed or timed out. Stop and ask the user to restore the desktop before recovering the desktop session; an idle wait cannot repair cleanup failure.".into();
                 let _ = timeout(Duration::from_secs(6), self.shutdown()).await;
             }
             if let Some(progress) = &progress {
@@ -2678,12 +2707,12 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 });
             }
             if let Err(restore) = self.restore_desktop().await {
-                self.takeover.latch();
                 let mut error = result.expect_err("restoration follows an execution error");
                 error.message.push_str(&format!("; {restore}"));
                 error.retryable = false;
                 error.recovery =
                     "Stop and ask the user to restore the desktop and restart the MCP.".into();
+                let _ = timeout(Duration::from_secs(6), self.shutdown()).await;
                 return Err(error);
             }
         } else {
@@ -2782,7 +2811,6 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 timeout_ms,
             } => {
                 self.ensure_no_launch_in_progress()?;
-                self.check_takeover()?;
                 self.wait_for_new(target, condition, timeout_ms).await
             }
         }
@@ -2807,6 +2835,17 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             ))
         })??;
         Ok(node)
+    }
+
+    fn synchronize_human_input(&self) -> Result<(), RuntimeError> {
+        let generation = self.takeover.status().generation;
+        let mut cache = self.lock_cache()?;
+        if cache.input_generation != generation {
+            cache.invalidate_all();
+            cache.input_generation = generation;
+            self.clear_click_grace();
+        }
+        Ok(())
     }
 
     fn commit_snapshot(&self, snapshot: Snapshot) -> Result<Arc<Snapshot>, RuntimeError> {
@@ -4199,6 +4238,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> DesktopRuntime for Semantic
     }
 
     async fn shutdown(&self) -> Result<(), RuntimeError> {
+        self.takeover.stop();
         self.stop_desktop_session().await;
         let _mutation = self.mutation.lock().await;
         let launch_result = crate::desktop_launcher::cancel_and_join(
@@ -6271,6 +6311,7 @@ fn wait_output_with_evidence(
     }
     let kind = if satisfied {
         match &condition {
+            WaitCondition::HumanIdle => unreachable!("human_idle has a separate evidence renderer"),
             WaitCondition::FrameAdvanced { .. }
             | WaitCondition::FrameChanged { .. }
             | WaitCondition::FrameStable { .. } => "frame",
@@ -6333,6 +6374,7 @@ fn wait_output_with_evidence(
 
 fn wait_condition_json(condition: &WaitCondition) -> serde_json::Value {
     match condition {
+        WaitCondition::HumanIdle => json!({"type":"human_idle"}),
         WaitCondition::FrameAdvanced { after_frame_id } => {
             json!({"type": "frame_advanced", "after_frame_id": after_frame_id})
         }
@@ -6405,7 +6447,7 @@ fn protected_surface_error() -> RuntimeError {
 
 fn generated_input_error(message: String) -> RuntimeError {
     if is_physical_input_refusal(&message) {
-        return RuntimeError::user_takeover();
+        return RuntimeError::human_input_busy();
     }
     if message.starts_with(SESSION_UNAVAILABLE) {
         desktop_session_error("backend_failed", message)
@@ -6415,7 +6457,7 @@ fn generated_input_error(message: String) -> RuntimeError {
 }
 
 fn map_attempt_error(error: RuntimeError, progress: ActionProgressSnapshot) -> RuntimeError {
-    if error.code == "UserTakeoverInterrupted" {
+    if error.code == RuntimeError::HUMAN_INPUT_BUSY {
         let mut error = error;
         error.outcome = progress.outcome();
         return with_action_progress_snapshot(error, progress);
@@ -6465,7 +6507,7 @@ fn map_input_error(error: InputError, progress: ActionProgressSnapshot) -> Runti
     if let InputError::Dispatch(message) = &error
         && is_physical_input_refusal(message)
     {
-        return map_attempt_error(RuntimeError::user_takeover(), progress);
+        return map_attempt_error(RuntimeError::human_input_busy(), progress);
     }
     map_attempt_error(input_runtime_error(&error), progress)
 }
@@ -6474,7 +6516,7 @@ fn input_runtime_error(error: &InputError) -> RuntimeError {
     match error {
         InputError::SessionUnavailable(message) => desktop_session_error("backend_failed", message),
         InputError::Dispatch(message) if is_physical_input_refusal(message) => {
-            RuntimeError::user_takeover()
+            RuntimeError::human_input_busy()
         }
         InputError::Dispatch(message) => operational_error(message),
     }
@@ -6658,7 +6700,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::{
-        atspi_adapter::{TextReadback, replace_text_with_fallback},
+        atspi_adapter::{TextEditor, TextReadback, replace_text},
         runtime::CleanupStatus,
         screenshot::{ScreenshotError, ScreenshotObservation},
         validation::{
@@ -7094,7 +7136,7 @@ pub(crate) mod tests {
             ))
             .await
             .unwrap_err();
-        assert_eq!(error.code, "UserTakeoverInterrupted");
+        assert_eq!(error.code, "HumanInputBusy");
         assert_eq!(error.outcome, ToolOutcome::NotStarted);
         assert!(!error.retryable);
         assert!(error.recovery.contains("user"));
@@ -7107,11 +7149,11 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn human_takeover_interrupts_wait_for() {
+    async fn human_activity_does_not_interrupt_read_only_waits() {
         let runtime = fake_runtime(FakeAdapter::tree());
         runtime.execute_call(observe_call()).await.unwrap();
         runtime.takeover.trip();
-        let error = runtime
+        let output = runtime
             .execute_call(ToolCall::WaitFor {
                 target: None,
                 condition: WaitCondition::WindowOpened {
@@ -7120,10 +7162,137 @@ pub(crate) mod tests {
                 timeout_ms: 100,
             })
             .await
-            .unwrap_err();
-        assert_eq!(error.code, "UserTakeoverInterrupted");
-        assert_eq!(error.outcome, ToolOutcome::NotStarted);
-        assert!(!error.retryable);
+            .unwrap();
+        assert_eq!(output.structured_content.unwrap()["satisfied"], false);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn human_idle_wait_resumes_without_restart_and_requires_fresh_observation() {
+        let fake = FakeAdapter::tree();
+        let runtime = fake_runtime(fake.clone());
+        runtime.takeover.make_available();
+        runtime.execute_call(observe_call()).await.unwrap();
+        let before = semantic_call(
+            current_observation_id(&runtime),
+            current_snapshot(&runtime).element_ids[1].clone(),
+            ElementAction::Invoke,
+        );
+        runtime.takeover.trip();
+        assert_eq!(
+            runtime.execute_call(before).await.unwrap_err().code,
+            "HumanInputBusy"
+        );
+        // Observation remains available during the pause, but its result must
+        // not authorize an action after idle is reached.
+        runtime.execute_call(observe_call()).await.unwrap();
+        let during = semantic_call(
+            current_observation_id(&runtime),
+            current_snapshot(&runtime).element_ids[1].clone(),
+            ElementAction::Invoke,
+        );
+        let output = runtime
+            .execute_call(ToolCall::WaitFor {
+                target: None,
+                condition: WaitCondition::HumanIdle,
+                timeout_ms: 59_000,
+            })
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(output["satisfied"], false);
+        assert_eq!(output["evidence"]["remaining_ms"], 1000);
+        assert_eq!(
+            runtime.execute_call(during.clone()).await.unwrap_err().code,
+            "HumanInputBusy"
+        );
+        assert_eq!(
+            runtime.takeover.status().remaining,
+            Duration::from_secs(1),
+            "refused calls do not restart the quiet period"
+        );
+        let output = runtime
+            .execute_call(ToolCall::WaitFor {
+                target: None,
+                condition: WaitCondition::HumanIdle,
+                timeout_ms: 120_000,
+            })
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(output["satisfied"], true);
+        assert_eq!(output["evidence"]["reason"], "idle");
+        assert!(!runtime.desktop_session_exhausted());
+        let error = runtime.execute_call(during).await.unwrap_err();
+        assert_eq!(error.code, "state_required");
+        assert!(fake.state.lock().unwrap().actions.is_empty());
+        runtime
+            .execute_call(ToolCall::Observe {
+                target: test_target(),
+                view: ObserveView::Accessibility,
+                accessibility: Some(AccessibilityRequest {
+                    scope: AccessibilityScope::Full,
+                    ..AccessibilityRequest::default()
+                }),
+                crop: ObserveCrop::Monitor,
+            })
+            .await
+            .unwrap();
+        click(&runtime).await.unwrap();
+        assert_eq!(fake.state.lock().unwrap().actions.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn human_idle_wait_restarts_on_new_input_and_does_not_claim_unavailable_idle() {
+        let runtime = fake_runtime(FakeAdapter::tree());
+        let output = runtime
+            .execute_call(ToolCall::WaitFor {
+                target: None,
+                condition: WaitCondition::HumanIdle,
+                timeout_ms: 120_000,
+            })
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(output["satisfied"], false);
+        assert_eq!(output["evidence"]["reason"], "physical_monitor_unavailable");
+        runtime.takeover.trip();
+        let busy = runtime
+            .execute_call(ToolCall::WaitFor {
+                target: None,
+                condition: WaitCondition::HumanIdle,
+                timeout_ms: 0,
+            })
+            .await
+            .unwrap();
+        assert!(busy.text.contains("Foreground input remains paused"));
+        assert!(!busy.text.contains("confirm the desktop"));
+        let busy = busy.structured_content.unwrap();
+        assert_eq!(busy["satisfied"], false);
+        assert_eq!(busy["evidence"]["available"], false);
+        assert_eq!(busy["evidence"]["reason"], "quiet_period");
+        assert_eq!(busy["evidence"]["remaining_ms"], 60_000);
+        runtime.takeover.make_available();
+        runtime.takeover.trip();
+        let start = tokio::time::Instant::now();
+        let (output, ()) = tokio::join!(
+            runtime.execute_call(ToolCall::WaitFor {
+                target: None,
+                condition: WaitCondition::HumanIdle,
+                timeout_ms: 120_000,
+            }),
+            async {
+                sleep(Duration::from_secs(30)).await;
+                runtime.takeover.trip();
+            }
+        );
+        assert_eq!(
+            output.unwrap().structured_content.unwrap()["satisfied"],
+            true
+        );
+        assert_eq!(start.elapsed(), Duration::from_secs(90));
     }
 
     #[tokio::test]
@@ -7145,9 +7314,9 @@ pub(crate) mod tests {
             },
         ] {
             let error = runtime.execute_call(call).await.unwrap_err();
-            assert_eq!(error.code, "UserTakeoverInterrupted");
+            assert_eq!(error.code, "HumanInputBusy");
             assert_eq!(error.outcome, ToolOutcome::NotStarted);
-            assert!(error.recovery.contains("restart"));
+            assert!(error.recovery.contains("human_idle"));
         }
         assert!(fake.state.lock().unwrap().activation_calls.is_empty());
         assert!(!runtime.launch_in_progress.load(Ordering::Acquire));
@@ -7158,12 +7327,12 @@ pub(crate) mod tests {
         let dispatch = input_runtime_error(&InputError::Dispatch(
             "physical Ctrl, Alt, or Super is active; refusing generated keyboard input".into(),
         ));
-        assert_eq!(dispatch.code, "UserTakeoverInterrupted");
+        assert_eq!(dispatch.code, "HumanInputBusy");
         assert_eq!(dispatch.outcome, ToolOutcome::NotStarted);
         let preparation = generated_input_error(
             "a physical latched modifier is active; refusing generated keyboard input".into(),
         );
-        assert_eq!(preparation.code, "UserTakeoverInterrupted");
+        assert_eq!(preparation.code, "HumanInputBusy");
         assert!(!preparation.retryable);
     }
 
@@ -9687,6 +9856,7 @@ pub(crate) mod tests {
         assert_eq!(error.code, "backend_failed");
         assert_eq!(error.outcome, ToolOutcome::Unknown);
         assert!(error.message.contains("AT-SPI text replacement unverified"));
+        assert!(!error.message.contains("https://mail.proton.me"));
         assert_eq!(fake.state.lock().unwrap().actions.len(), 1);
     }
 
@@ -9732,6 +9902,41 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn semantic_replace_text_accepts_refused_focus_only_after_fresh_confirmation() {
+        let fake = FakeAdapter::tree();
+        fake.state.lock().unwrap().semantic_focus_succeeds = false;
+        let runtime = fake_runtime(fake.clone());
+        runtime
+            .snapshot_text("Editor".into(), None, None, None)
+            .await
+            .unwrap();
+        let observation_id = current_observation_id(&runtime);
+        let element_id = current_snapshot(&runtime).element_ids[2].clone();
+
+        runtime
+            .execute_call(semantic_call(
+                observation_id.clone(),
+                element_id,
+                ElementAction::SetValue("λ🙂".into()),
+            ))
+            .await
+            .expect("fresh focused state permits semantic replacement after refusal");
+
+        let state = fake.state.lock().unwrap();
+        assert_eq!(
+            state.replace_steps,
+            [
+                (id("edit"), "focus"),
+                (id("edit"), "focus_verify"),
+                (id("edit"), "set"),
+                (id("edit"), "verify"),
+            ]
+        );
+        assert_eq!(state.replace_texts.get(&id("edit")).unwrap(), "λ🙂");
+        assert_ne!(current_observation_id(&runtime), observation_id);
+    }
+
+    #[tokio::test]
     async fn semantic_replace_text_focus_failure_sets_nothing() {
         let fake = FakeAdapter::tree();
         fake.state.lock().unwrap().semantic_focus_succeeds = false;
@@ -9742,6 +9947,15 @@ pub(crate) mod tests {
             .unwrap();
         let observation_id = current_observation_id(&runtime);
         let element_id = current_snapshot(&runtime).element_ids[2].clone();
+        // The source observation said focused; focus is lost before dispatch.
+        fake.state
+            .lock()
+            .unwrap()
+            .nodes
+            .get_mut(&id("edit"))
+            .unwrap()
+            .states
+            .remove("focused");
 
         let error = runtime
             .execute_call(semantic_call(
@@ -9755,8 +9969,11 @@ pub(crate) mod tests {
         assert_eq!(error.outcome, ToolOutcome::Unknown);
         assert!(error.message.contains("GrabFocus"));
         let state = fake.state.lock().unwrap();
-        // Fail closed: no set or verify step ran after the focus refusal.
-        assert_eq!(state.replace_steps, [(id("edit"), "focus")]);
+        // No text write or readback ran after fresh state failed to confirm focus.
+        assert_eq!(
+            state.replace_steps,
+            [(id("edit"), "focus"), (id("edit"), "focus_verify")]
+        );
         assert!(!state.replace_texts.contains_key(&id("edit")));
     }
 
@@ -10552,7 +10769,7 @@ pub(crate) mod tests {
             .await
             .expect("takeover must interrupt blocked dispatch promptly");
             let error = result.unwrap_err();
-            assert_eq!(error.code, "UserTakeoverInterrupted");
+            assert_eq!(error.code, "HumanInputBusy");
             assert_eq!(
                 error.outcome,
                 if completed {
@@ -10569,11 +10786,17 @@ pub(crate) mod tests {
             assert!(runtime.screenshots.cleanups.load(Ordering::Acquire) >= 2);
             assert!(
                 runtime.takeover.is_active(),
-                "takeover remains latched until operator restart"
+                "physical activity starts a quiet period"
             );
             assert!(!error.message.contains("held input was released"));
             if cleanup_fails {
                 assert!(error.message.contains("not confirmed"));
+                assert!(
+                    runtime.desktop_session_exhausted(),
+                    "cleanup failure must not become resumable merely by waiting for idle"
+                );
+            } else {
+                assert!(!runtime.desktop_session_exhausted());
             }
         }
     }
@@ -11615,6 +11838,104 @@ pub(crate) mod tests {
         widget_fault: FakeWidgetFault,
     }
 
+    impl FakeState {
+        fn grab_focus(&mut self, object: &ObjectId) -> Result<bool, RuntimeError> {
+            if !self.semantic_focus_succeeds {
+                return Ok(false);
+            }
+            if !self.nodes.contains_key(object) {
+                return Err(operational_error("stale fake focus object"));
+            }
+            for node in self.nodes.values_mut() {
+                node.states.remove("focused");
+            }
+            self.nodes
+                .get_mut(object)
+                .unwrap()
+                .states
+                .insert("focused".into());
+            if self.widget_fault != FakeWidgetFault::NeverActive {
+                self.app.windows[0].states.insert("active".into());
+            }
+            Ok(true)
+        }
+    }
+
+    struct FakeTextEditor<'a> {
+        state: &'a Mutex<FakeState>,
+        object: &'a ObjectId,
+    }
+
+    impl TextEditor for FakeTextEditor<'_> {
+        async fn grab_focus(&mut self) -> Result<bool, RuntimeError> {
+            let mut state = self.state.lock().unwrap();
+            state.replace_steps.push((self.object.clone(), "focus"));
+            state.grab_focus(self.object)
+        }
+
+        async fn read_focused(&mut self) -> Result<bool, RuntimeError> {
+            let mut state = self.state.lock().unwrap();
+            state
+                .replace_steps
+                .push((self.object.clone(), "focus_verify"));
+            let node = state
+                .nodes
+                .get(self.object)
+                .ok_or_else(|| operational_error("stale fake focus object"))?;
+            Ok(node.states.contains("focused") && !node.states.contains("defunct"))
+        }
+
+        async fn set_text<'a>(&'a mut self, value: &'a str) -> Result<bool, RuntimeError> {
+            let mut state = self.state.lock().unwrap();
+            state.replace_steps.push((self.object.clone(), "set"));
+            if state.widget_fault.honors_set_text() {
+                state
+                    .replace_texts
+                    .insert(self.object.clone(), value.into());
+            }
+            Ok(true)
+        }
+
+        async fn read_text(&mut self) -> Result<TextReadback, RuntimeError> {
+            let mut state = self.state.lock().unwrap();
+            state.replace_steps.push((self.object.clone(), "verify"));
+            let actual = state
+                .replace_texts
+                .get(self.object)
+                .cloned()
+                .unwrap_or_default();
+            Ok(TextReadback {
+                character_count: actual.chars().count() as i32,
+                actual,
+                truncated: false,
+            })
+        }
+
+        async fn delete_text(&mut self, _count: i32) -> Result<bool, RuntimeError> {
+            let mut state = self.state.lock().unwrap();
+            state
+                .replace_steps
+                .push((self.object.clone(), "delete_insert"));
+            state.replace_texts.remove(self.object);
+            Ok(true)
+        }
+
+        async fn insert_text<'a>(
+            &'a mut self,
+            value: &'a str,
+            byte_length: i32,
+        ) -> Result<bool, RuntimeError> {
+            assert_eq!(byte_length as usize, value.len());
+            let mut state = self.state.lock().unwrap();
+            if state.widget_fault.honors_fallback_write() {
+                state
+                    .replace_texts
+                    .insert(self.object.clone(), value.into());
+            }
+            Ok(true)
+        }
+    }
+
     struct MutatingScreenshots {
         state: Arc<Mutex<FakeState>>,
     }
@@ -11802,146 +12123,32 @@ pub(crate) mod tests {
             action: SemanticAction,
         ) -> Result<(), RuntimeError> {
             if let SemanticAction::ReplaceText(value) = &action {
-                let value = value.clone();
                 {
                     let mut state = self.state.lock().unwrap();
-                    state.actions.push((object.clone(), action));
+                    state.actions.push((object.clone(), action.clone()));
                     if state.fail_actions {
                         return Err(operational_error("fake semantic action failure"));
                     }
                 }
-                let state = Arc::clone(&self.state);
-                let focus_object = object.clone();
-                let set_object = object.clone();
-                let read_object = object.clone();
-                let delete_object = object.clone();
-                let insert_object = object.clone();
-                let value_for_set = value.clone();
-                let value_for_insert = value.clone();
-                return replace_text_with_fallback(
-                    &value,
-                    {
-                        let state = Arc::clone(&state);
-                        move || {
-                            let state = Arc::clone(&state);
-                            let object = focus_object.clone();
-                            async move {
-                                let mut state = state.lock().unwrap();
-                                state.replace_steps.push((object.clone(), "focus"));
-                                if !state.semantic_focus_succeeds {
-                                    return Ok(false);
-                                }
-                                for node in state.nodes.values_mut() {
-                                    node.states.remove("focused");
-                                }
-                                state
-                                    .nodes
-                                    .get_mut(&object)
-                                    .ok_or_else(|| operational_error("stale fake focus object"))?
-                                    .states
-                                    .insert("focused".into());
-                                state.app.windows[0].states.insert("active".into());
-                                Ok(true)
-                            }
-                        }
+                return replace_text(
+                    &mut FakeTextEditor {
+                        state: &self.state,
+                        object,
                     },
-                    {
-                        let state = Arc::clone(&state);
-                        let value = value_for_set.clone();
-                        move || {
-                            let state = Arc::clone(&state);
-                            let object = set_object.clone();
-                            let value = value.clone();
-                            async move {
-                                let mut state = state.lock().unwrap();
-                                state.replace_steps.push((object.clone(), "set"));
-                                if state.widget_fault.honors_set_text() {
-                                    state.replace_texts.insert(object, value);
-                                }
-                                Ok(true)
-                            }
-                        }
-                    },
-                    {
-                        let state = Arc::clone(&state);
-                        move || {
-                            let state = Arc::clone(&state);
-                            let object = read_object.clone();
-                            async move {
-                                let mut state = state.lock().unwrap();
-                                state.replace_steps.push((object.clone(), "verify"));
-                                let actual = state
-                                    .replace_texts
-                                    .get(&object)
-                                    .cloned()
-                                    .unwrap_or_default();
-                                Ok(TextReadback {
-                                    character_count: actual.chars().count() as i32,
-                                    actual,
-                                    truncated: false,
-                                })
-                            }
-                        }
-                    },
-                    {
-                        let state = Arc::clone(&state);
-                        move |_count| {
-                            let state = Arc::clone(&state);
-                            let object = delete_object.clone();
-                            async move {
-                                let mut state = state.lock().unwrap();
-                                state.replace_steps.push((object.clone(), "delete_insert"));
-                                state.replace_texts.remove(&object);
-                                Ok(true)
-                            }
-                        }
-                    },
-                    {
-                        let state = Arc::clone(&state);
-                        let value = value_for_insert.clone();
-                        move |_length| {
-                            let state = Arc::clone(&state);
-                            let object = insert_object.clone();
-                            let value = value.clone();
-                            async move {
-                                let mut state = state.lock().unwrap();
-                                if state.widget_fault.honors_fallback_write() {
-                                    state.replace_texts.insert(object, value);
-                                }
-                                Ok(true)
-                            }
-                        }
-                    },
+                    value,
                 )
                 .await;
             }
             let mut state = self.state.lock().unwrap();
-            let focus_refused =
-                !state.semantic_focus_succeeds && matches!(&action, SemanticAction::GrabFocus);
+            let focus = matches!(&action, SemanticAction::GrabFocus);
             state.actions.push((object.clone(), action));
             if state.fail_actions {
                 return Err(operational_error("fake semantic action failure"));
             }
-            if focus_refused {
+            if focus && !state.grab_focus(object)? {
                 return Err(operational_error(
                     "AT-SPI GrabFocus not granted by the fake component",
                 ));
-            }
-            if state.semantic_focus_succeeds
-                && matches!(state.actions.last(), Some((_, SemanticAction::GrabFocus)))
-            {
-                for node in state.nodes.values_mut() {
-                    node.states.remove("focused");
-                }
-                state
-                    .nodes
-                    .get_mut(object)
-                    .ok_or_else(|| operational_error("stale fake focus object"))?
-                    .states
-                    .insert("focused".into());
-                if state.widget_fault != FakeWidgetFault::NeverActive {
-                    state.app.windows[0].states.insert("active".into());
-                }
             }
             Ok(())
         }

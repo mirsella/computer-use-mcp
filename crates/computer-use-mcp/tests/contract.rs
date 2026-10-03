@@ -332,11 +332,20 @@ fn inputs_use_exact_opaque_targets_and_bounded_operations() {
             "element_value",
             "window_opened",
             "window_closed",
+            "human_idle",
         ]
     );
     assert_eq!(wait["required"], json!(["condition", "timeout_ms"]));
     assert!(wait["properties"]["timeout_ms"].get("default").is_none());
-    assert_eq!(wait["properties"]["timeout_ms"]["maximum"], 5_000);
+    assert_eq!(wait["properties"]["timeout_ms"]["maximum"], 120_000);
+    assert_eq!(
+        wait["allOf"][2]["else"]["properties"]["timeout_ms"]["maximum"],
+        5_000
+    );
+    assert_eq!(
+        wait["properties"]["condition"]["oneOf"][8]["required"],
+        json!(["type"])
+    );
     let frame_stable = &wait["properties"]["condition"]["oneOf"][2];
     assert_eq!(frame_stable["properties"]["type"]["const"], "frame_stable");
     assert_eq!(frame_stable["required"], json!(["type", "for_ms"]));
@@ -437,7 +446,7 @@ fn inputs_use_exact_opaque_targets_and_bounded_operations() {
         (
             "wait timeout",
             &wait["properties"]["timeout_ms"]["maximum"],
-            5_000,
+            120_000,
         ),
         (
             "wait stability",
