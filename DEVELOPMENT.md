@@ -163,8 +163,8 @@ The single CI/publish workflow runs formatting, Clippy, and Rust tests on
 Ubuntu 24.04, then tests the extracted tarball's
 plugin permission selection, direct/compact MCP discovery, and dispatch
 validation without a desktop, and uploads the tarball as the
-`npm-package` artifact. Pushes, pull requests, and manual workflow runs build
-and test only. Publishing a GitHub release with a matching `v<version>` tag
+`npm-package` artifact. Branch pushes, pull requests, and manual workflow runs
+build and test only. Publishing a GitHub release with a matching `v<version>` tag
 publishes that tested artifact to npm. Prereleases use the `next` dist-tag;
 stable releases use `latest`.
 
