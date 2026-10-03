@@ -25,7 +25,7 @@ test("plugin registers the bundled server and synchronized skill idempotently", 
     type: "local",
     command: [binary, "mcp", "--compact-tools"],
     enabled: true,
-    timeout: 90_000,
+    timeout: 150_000,
   });
   assert.deepEqual(config.skills.paths, [
     "/existing/skills",
@@ -140,6 +140,15 @@ test("compact MCP discovers exact schemas and preserves direct validation withou
   assert.deepEqual(tools.map((tool) => tool.name), [
     "list_desktop", "launch_application", "activate_window", "observe", "act", "wait_for",
   ]);
+  const wait = tools.find((tool) => tool.name === "wait_for");
+  assert.ok(wait.inputSchema.properties.condition.oneOf.some(
+    (condition) => condition.properties.type.const === "human_idle",
+  ));
+  assert.equal(wait.inputSchema.properties.timeout_ms.maximum, 120_000);
+  const config = {};
+  await (await plugin.server()).config(config);
+  assert.ok(config.mcp.computer_use.timeout > wait.inputSchema.properties.timeout_ms.maximum,
+    "the host timeout must cover the server's longest bounded wait");
   const { result: compactList } = await compact.request("tools/list");
   assert.deepEqual(compactList.tools.map((tool) => tool.name), ["help", "dispatch"]);
   assert.equal(compactList.tools[0].annotations.readOnlyHint, true);

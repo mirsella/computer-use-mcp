@@ -27,6 +27,9 @@ fake that duplicates the implementation. Run relevant tests after the complete
 change, then workspace checks for cross-cutting changes. See `DEVELOPMENT.md`
 for commands and host toolchain notes. Keep Cargo artifacts on disk, not `/tmp`.
 
+For OpenCode testing, use the checkout's local plugin and built executable.
+Do not install test binaries into PATH. See `DEVELOPMENT.md` for local setup.
+
 Agent guidance has three jobs: initialize gives universal evidence/recovery
 rules, tool descriptions explain each operation, the skill teaches the workflow.
 Keep both skill copies byte-identical with `scripts/check-guidance.sh`. Measure

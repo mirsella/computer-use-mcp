@@ -32,6 +32,29 @@ the workspace itself requires stable Rust. Use the same environment for Clippy.
 The ambient Cranelift setup aborts intentional panic tests, so verify them with
 LLVM rather than skipping them.
 
+## Local OpenCode testing
+
+Use the checkout's plugin and a checkout-built executable. Development testing
+does not require a Cargo or npm installation into PATH.
+
+```sh
+RUSTC_BOOTSTRAP=1 RUSTFLAGS= CARGO_ENCODED_RUSTFLAGS= \
+CARGO_PROFILE_DEV_CODEGEN_BACKEND=llvm \
+cargo +1.97.0 build --locked -p computer-use-mcp
+mkdir -p vendor/bin
+ln -sfn ../../target/debug/computer-use-mcp vendor/bin/computer-use-mcp
+node --test tests/npm.test.mjs
+```
+
+The symlink is a checkout-only build artifact. The Node tests load the local
+plugin and check MCP discovery and validation without a desktop.
+
+To use that build in OpenCode, replace the published computer-use plugin entry
+with `"file:///absolute/path/to/computer-use-mcp"`. Point at the checkout
+directory, whose package exports resolve the plugin. Quit and restart OpenCode
+after changing the configuration. The plugin's 150-second request timeout
+covers the 120-second maximum `human_idle` wait.
+
 ## Invariants
 
 - Keep the six ordered tools, closed schemas, typed validation, opaque IDs,
@@ -77,7 +100,7 @@ transactions, window identity, and post-action evidence.
 
 Session and takeover tests use injected environment, filesystem, device, and
 counter fakes. They must verify actual display resolution, isolation checks,
-handoff latching, operation cleanup, and physical-modifier refusal. No unit test
+busy/idle transitions, handoff clearance, operation cleanup, and physical-modifier refusal. No unit test
 starts a compositor. The runner is checked with `bash -n` and fail-closed
 readiness assertions.
 
@@ -114,22 +137,51 @@ injected private environment.
 The compact variant fetches each action schema once, then dispatches all calls
 through the compact transport.
 
-For an optional model-driven release smoke, build the local npm payload and run:
+For optional model-driven smoke tests, use the checkout build described above:
 
 ```sh
-npm pack
-python3 -B scripts/opencode-model-smoke.py --model openai/gpt-6-sol --variant medium
+python3 -B scripts/opencode-model-smoke.py --model openai/gpt-6.1-sol --variant medium
+python3 -B scripts/opencode-model-smoke.py --model openai/gpt-6.1-sol --variant medium --task takeover
 ```
 
-This uses the existing OpenCode provider configuration and authentication and
-incurs model usage. It installs only the local plugin in a temporary config,
+The model runner requires OpenCode and Bun, uses the existing provider
+configuration and authentication, and incurs model usage. `--provider-config`
+selects a different JSON/JSONC provider
+configuration. Provider settings come from that file, since `debug config`
+redacts executable headers and credentials. It loads only the local plugin in a temporary config,
 removes physical display/bus access, and asks the model to enter a unique line
 in an unsaved background editor. It requires fresh accessibility readback and a
 PNG, checks every discovery/launch route, watches for foreground workers, and
 checks owned processes and the private runtime disappear after exit. Temporary
 config, transcripts, and screenshots are deleted. The JSON report includes
-task-wide token counters, repeated calls, tool errors, and window-wait results.
+task-wide token counters, repeated calls, tool errors, and wait results.
 Ordinary CI runs only its deterministic evidence-checker tests.
+
+The takeover task uses the foreground route inside an owned private runner. It
+asserts a cooperative handoff, clears it only after an actual `HumanInputBusy`
+mutation refusal, and requires a real one-minute `human_idle` wait before resuming.
+Complete JSONL events are read incrementally; model prose, observation text, and
+partial records cannot clear the handoff signal.
+It checks fresh observation before input, exact readback and PNG verification,
+and that the same worker remains alive. Physical monitoring is deliberately
+unavailable in verified isolation, so the wait must report that fact rather
+than claim hardware idle. Both tasks remove their temporary state and owned
+processes. The provider JSONC integration test requires Bun; the evidence
+checker tests run without OpenCode or Bun.
+
+The checkout's `gpt-6.1-sol` medium takeover run passed in 157.5 seconds and
+19 tool calls. It waited 60.0 seconds and resumed in the same worker, then
+verified exact accessibility readback and a 41,637-byte PNG. The only tool error
+was the expected `HumanInputBusy` refusal. Owned-process and private-runtime
+teardown completed. This exercises cooperative takeover inside isolation,
+not physical evdev monitoring.
+
+A private KWrite probe confirmed that `GrabFocus` can return false while the
+exact editor remains focused, and that direct text replacement succeeds. With
+fresh focus verification handling that refusal, another `gpt-6.1-sol` medium
+editor run passed in 84.7 seconds and 16 tool calls with no tool errors. Exact
+accessibility readback, a 48,163-byte PNG, and complete private teardown were
+verified.
 
 The confirmed run kept the foreground worker count at zero, reused the
 persistent background worker, launched on the background route, and passed
@@ -139,8 +191,8 @@ targeted `NewFile`, and both readback strings matched. It exited successfully
 with the target gone and no owned descendants. The window-close case was
 unavailable because the AT-SPI target had no KDE authority.
 
-The installed Rust 1.97.0 workspace verification passed 346 tests: 312 library,
-3 cancellation, 4 contract, 6 isolated, 3 process, 4 readiness, and 14
+The installed Rust 1.97.0 workspace verification passed 365 tests: 329 library,
+3 cancellation, 5 contract, 6 isolated, 3 process, 4 readiness, and 15
 validation tests, with 1 ignored. Clippy passed. This is evidence for the tested
 Linux/KDE environment, not a claim of support for every platform.
 

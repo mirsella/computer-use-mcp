@@ -40,7 +40,7 @@ export default {
             type: "local",
             command: compact ? [binary, "mcp", "--compact-tools"] : [binary, "mcp"],
             enabled: true,
-            timeout: 90_000,
+            timeout: 150_000,
           };
         }
 
