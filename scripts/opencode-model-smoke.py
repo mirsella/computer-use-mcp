@@ -179,6 +179,141 @@ def summarize(events, phrase, task="editor"):
     return report
 
 
+def verify_history(events, records, phrase, task):
+    calls = [
+        event["part"]
+        for event in events
+        if event["type"] == "tool_use"
+        and event["part"]["tool"] in {"computer_use_help", "computer_use_dispatch"}
+    ]
+    assert calls, "no public computer-use calls to verify"
+    grouped = collections.defaultdict(list)
+    for record in records:
+        grouped[record["call_id"]].append(record)
+    assert len(grouped) == len(calls), "missing calls or duplicate worker history"
+    finished = []
+    for pair in grouped.values():
+        assert [record["event"] for record in pair] == ["started", "finished"], (
+            "call is unmatched, duplicated, or abandoned"
+        )
+        start, end = pair
+        assert all(
+            end[key] == value for key, value in start.items() if key != "event"
+        ), "terminal record lost its call metadata"
+        assert end["duration_ms"] >= 0
+        finished.append(end)
+    assert len({record["connection_id"] for record in finished}) == 1, (
+        "multiple brokers or worker-level history"
+    )
+    expected = collections.Counter(
+        (
+            part["tool"].removeprefix("computer_use_"),
+            part["state"]["input"].get("action"),
+            "error" if part["state"]["status"] == "error" else "succeeded",
+        )
+        for part in calls
+    )
+    actual = collections.Counter(
+        (record["tool"], record.get("action"), record["status"]) for record in finished
+    )
+    assert actual == expected, "history operations or outcomes differ from tool results"
+    desktop = "foreground" if task == "takeover" else "background"
+    for record in finished:
+        if record["tool"] == "dispatch":
+            assert record["desktop"] == desktop, "incorrect public desktop route"
+            assert "request" in record, "validated request metadata missing"
+    serialized = json.dumps(records)
+    assert phrase not in serialized, "dummy text leaked into history"
+    forbidden = {
+        "arguments",
+        "output",
+        "text",
+        "value",
+        "message",
+        "recovery",
+        "data",
+        "attachments",
+    }
+
+    def check_keys(value):
+        if isinstance(value, dict):
+            assert not forbidden & value.keys(), "history contains raw contents"
+            for item in value.values():
+                check_keys(item)
+        elif isinstance(value, list):
+            for item in value:
+                check_keys(item)
+
+    check_keys(records)
+    for part in calls:
+        for item in part["state"].get("attachments", []):
+            if item.get("mime") == "image/png":
+                assert item["url"].split(",", 1)[1] not in serialized, (
+                    "screenshot leaked into history"
+                )
+    errors = collections.Counter(
+        record["result"].get("code", "unknown")
+        for record in finished
+        if record["status"] == "error"
+    )
+    cleanup_failures = [
+        record["call_id"]
+        for record in finished
+        if record["result"].get("action_progress", {}).get("cleanup") == "failed"
+    ]
+    longest = sorted(finished, key=lambda record: record["duration_ms"], reverse=True)[
+        :5
+    ]
+    return {
+        "calls": len(finished),
+        "records": len(records),
+        "error_codes": dict(errors),
+        "failed_cleanup": cleanup_failures,
+        "unmatched_starts": 0,
+        "longest_calls": [
+            {
+                key: record[key]
+                for key in ("call_id", "action", "duration_ms", "status")
+                if key in record
+            }
+            for record in longest
+        ],
+    }
+
+
+def capture_history(state, env):
+    destination = state / "computer-use-mcp/history/calls.jsonl"
+    destination.parent.mkdir(parents=True, mode=0o700)
+    with destination.open("xb") as stream:
+        os.fchmod(stream.fileno(), 0o600)
+        subprocess.run(
+            [str(ROOT / "vendor/bin/computer-use-mcp"), "history"],
+            env=env,
+            stdout=stream,
+            check=True,
+        )
+
+
+def verify_history_filters(state, records):
+    env = {**os.environ, "XDG_STATE_HOME": str(state)}
+
+    def query(*arguments):
+        output = subprocess.check_output(
+            [str(ROOT / "vendor/bin/computer-use-mcp"), "history", *arguments],
+            env=env,
+        )
+        return [json.loads(line) for line in output.splitlines()]
+
+    last_id = records[-1]["call_id"]
+    pair = [record for record in records if record["call_id"] == last_id]
+    assert query("--last", "1") == pair, "--last split a call or selected wrong records"
+    assert query("--call-id", last_id) == pair, "--call-id did not match exactly"
+    assert query("--since", "15m") == records, "recent calls missing from --since"
+    assert query("--errors") == [
+        record for record in records if record.get("status") == "error"
+    ]
+
+
 Process = collections.namedtuple("Process", "parent start state name")
 
 
@@ -356,7 +491,10 @@ def run(model, variant, timeout_seconds, provider_config, task="editor"):
             "mcp",
             "--compact-tools",
         ]
-        phrase = f"OpenCode {task} smoke {uuid.uuid4().hex[:12]}"
+        run_id = uuid.uuid4().hex[:12]
+        phrase = f"OpenCode {task} smoke {run_id}"
+        history_state = ROOT / "target/model-smoke" / f"{task}-{run_id}"
+        history_state.mkdir(parents=True, mode=0o700)
         prompt = (
             "Use the computer-use skill, then open a graphical text editor on the private background desktop. "
             f"Create a new unsaved document containing exactly this line: {phrase}\n"
@@ -414,11 +552,16 @@ def run(model, variant, timeout_seconds, provider_config, task="editor"):
                 sys.executable,
                 "-B",
                 "-c",
-                "import os, shutil, sys; from pathlib import Path; "
+                "import os, runpy, shutil, subprocess, sys; from pathlib import Path; "
                 "dest = Path(os.environ['XDG_DATA_HOME']) / 'opencode/auth.json'; "
                 "dest.parent.mkdir(mode=0o700); shutil.copyfile(sys.argv[1], dest); "
-                "dest.chmod(0o600); os.execvp('opencode', ['opencode'] + sys.argv[2:]);",
+                "dest.chmod(0o600); "
+                "result = subprocess.run(['opencode'] + sys.argv[4:]); "
+                "runpy.run_path(sys.argv[2])['capture_history'](Path(sys.argv[3]), os.environ.copy()); "
+                "sys.exit(result.returncode);",
                 str(auth),
+                str(Path(__file__).resolve()),
+                str(history_state),
                 *command[1:],
             ]
         start = time.monotonic()
@@ -478,6 +621,17 @@ def run(model, variant, timeout_seconds, provider_config, task="editor"):
             events = list(read_events(stream))
             assert not stream.read(), "unfinished JSON event at shutdown"
         report = summarize(events, phrase, task)
+        if not takeover:
+            capture_history(history_state, env)
+        records = [
+            json.loads(line)
+            for line in (history_state / "computer-use-mcp/history/calls.jsonl")
+            .read_bytes()
+            .splitlines()
+        ]
+        report["history"] = verify_history(events, records, phrase, task)
+        verify_history_filters(history_state, records)
+        report["history_state_dir"] = str(history_state)
         if takeover:
             assert not handoff.exists(), "cooperative handoff was not exercised"
             assert len(owned.foreground_workers) == 1, "foreground worker restarted"

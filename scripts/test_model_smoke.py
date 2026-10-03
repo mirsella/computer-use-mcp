@@ -65,6 +65,40 @@ def trace():
     ]
 
 
+def history_trace(events):
+    records = []
+    for event in events:
+        if event["type"] != "tool_use" or event["part"]["tool"] == "skill":
+            continue
+        part = event["part"]
+        start = {
+            "event": "started",
+            "call_id": f"call-{len(records)}",
+            "connection_id": "connection-1",
+            "started_at_ms": 1,
+            "tool": part["tool"].removeprefix("computer_use_"),
+        }
+        if "action" in part["state"]["input"]:
+            start.update(
+                action=part["state"]["input"]["action"],
+                desktop="background",
+                request={},
+            )
+        records.append(start)
+        records.append(
+            {
+                **start,
+                "event": "finished",
+                "duration_ms": len(records),
+                "status": "error"
+                if part["state"]["status"] == "error"
+                else "succeeded",
+                "result": {},
+            }
+        )
+    return records
+
+
 class ModelSmokeEvidence(unittest.TestCase):
     @unittest.skipUnless(
         shutil.which("bun"), "optional provider JSONC check requires Bun"
@@ -208,6 +242,54 @@ class ModelSmokeEvidence(unittest.TestCase):
         stream.write(record[split:])
         stream.seek(0)
         self.assertEqual(list(smoke.read_events(stream)), [{"value": "λ🙂"}])
+
+    def test_history_requires_public_pairs_correct_routes_and_content_exclusion(self):
+        events = trace()
+        records = history_trace(events)
+        report = smoke.verify_history(events, records, "exact smoke text", "editor")
+        self.assertEqual(report["calls"], 3)
+        self.assertEqual(report["records"], 6)
+        self.assertEqual(report["unmatched_starts"], 0)
+        with self.assertRaisesRegex(AssertionError, "unmatched"):
+            smoke.verify_history(events, records[:-1], "exact smoke text", "editor")
+        duplicated = copy.deepcopy(records)
+        for record in copy.deepcopy(records[:2]):
+            record["call_id"] = "worker-copy"
+            duplicated.append(record)
+        with self.assertRaisesRegex(AssertionError, "duplicate worker"):
+            smoke.verify_history(events, duplicated, "exact smoke text", "editor")
+        wrong_route = copy.deepcopy(records)
+        wrong_route[0]["desktop"] = wrong_route[1]["desktop"] = "foreground"
+        with self.assertRaisesRegex(AssertionError, "desktop route"):
+            smoke.verify_history(events, wrong_route, "exact smoke text", "editor")
+        for key, value, error in [
+            ("text", "exact smoke text", "dummy text"),
+            ("message", "other contents", "raw contents"),
+            (
+                "image_blob",
+                events[3]["part"]["state"]["attachments"][0]["url"].split(",", 1)[1],
+                "screenshot",
+            ),
+        ]:
+            leaked = copy.deepcopy(records)
+            leaked[-1]["result"][key] = value
+            with self.assertRaisesRegex(AssertionError, error):
+                smoke.verify_history(events, leaked, "exact smoke text", "editor")
+
+    def test_history_reports_errors_cleanup_failures_and_longest_calls(self):
+        events = trace()
+        events[2]["part"]["state"]["status"] = "error"
+        records = history_trace(events)
+        records[3]["duration_ms"] = 5000
+        records[3]["result"] = {
+            "code": "backend_failed",
+            "outcome": "unknown",
+            "action_progress": {"cleanup": "failed"},
+        }
+        report = smoke.verify_history(events, records, "exact smoke text", "editor")
+        self.assertEqual(report["error_codes"], {"backend_failed": 1})
+        self.assertEqual(report["failed_cleanup"], [records[3]["call_id"]])
+        self.assertEqual(report["longest_calls"][0]["duration_ms"], 5000)
 
     def test_tracks_owned_process_tree_and_teardown(self):
         marker = f"model-smoke-test-{os.getpid()}"

@@ -157,6 +157,16 @@ config, transcripts, and screenshots are deleted. The JSON report includes
 task-wide token counters, repeated calls, tool errors, and wait results.
 Ordinary CI runs only its deterministic evidence-checker tests.
 
+Before deleting private state, both model tasks capture the broker history in
+`target/model-smoke/<task>-<run-id>/computer-use-mcp/history/calls.jsonl`.
+They require one start/terminal pair per public call, correct operation/status
+and desktop routing, and no worker duplicates, dummy text, or screenshot data.
+The retained metadata-only snapshot supports the normal `history` command by
+setting `XDG_STATE_HOME` to the reported `history_state_dir`. The smoke checks
+`--last`, `--since`, `--call-id`, and `--errors` against that snapshot. Its report
+includes error counts, failed cleanup, unmatched starts, and the five longest
+calls. Transcripts and authentication remain disposable.
+
 The takeover task uses the foreground route inside an owned private runner. It
 asserts a cooperative handoff, clears it only after an actual `HumanInputBusy`
 mutation refusal, and requires a real one-minute `human_idle` wait before resuming.
@@ -169,12 +179,20 @@ than claim hardware idle. Both tasks remove their temporary state and owned
 processes. The provider JSONC integration test requires Bun; the evidence
 checker tests run without OpenCode or Bun.
 
-The checkout's `gpt-6.1-sol` medium takeover run passed in 157.5 seconds and
-19 tool calls. It waited 60.0 seconds and resumed in the same worker, then
-verified exact accessibility readback and a 41,637-byte PNG. The only tool error
-was the expected `HumanInputBusy` refusal. Owned-process and private-runtime
-teardown completed. This exercises cooperative takeover inside isolation,
-not physical evdev monitoring.
+The checkout's `gpt-6.1-sol` medium history verification passed both tasks.
+The editor run took 99.2 seconds and logged 14 public calls in 28 records with
+no errors. The takeover run took 163.0 seconds and logged 18 public calls in
+36 records. It waited 60.0 seconds, resumed in the same worker, and its only
+error was the expected `HumanInputBusy` refusal with `not_started` dispatch and
+completed cleanup. Both runs verified exact accessibility readback and PNGs,
+with no duplicate records, unmatched starts, content leakage, or failed cleanup.
+All owned processes and private runtimes were removed. These tests exercise
+cooperative takeover inside isolation, not physical evdev monitoring.
+
+The longest non-wait call was a 4.826-second combined screenshot/accessibility
+observation whose text used 15,999 bytes of the output budget. The retained
+history identifies it for a later observation-latency investigation; timing
+alone does not distinguish capture cost from accessibility traversal.
 
 A private KWrite probe confirmed that `GrabFocus` can return false while the
 exact editor remains focused, and that direct text replacement succeeds. With
@@ -191,7 +209,7 @@ targeted `NewFile`, and both readback strings matched. It exited successfully
 with the target gone and no owned descendants. The window-close case was
 unavailable because the AT-SPI target had no KDE authority.
 
-The installed Rust 1.97.0 workspace verification passed 365 tests: 329 library,
+The installed Rust 1.97.0 workspace verification passed 370 tests: 334 library,
 3 cancellation, 5 contract, 6 isolated, 3 process, 4 readiness, and 15
 validation tests, with 1 ignored. Clippy passed. This is evidence for the tested
 Linux/KDE environment, not a claim of support for every platform.
