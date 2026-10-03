@@ -87,44 +87,47 @@ test("compact mode respects global and agent-specific permissions and tool switc
   await assert.rejects(plugin.server(undefined, { compactTools: "false" }), /boolean/);
 });
 
-async function connect(t, compact) {
+async function connect(t, compact, protocolVersion = "2025-11-25") {
   const env = { ...process.env };
   for (const key of ["WAYLAND_DISPLAY", "DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "XDG_SESSION_TYPE"]) {
     delete env[key];
   }
   const child = spawn(binary, compact ? ["mcp", "--compact-tools"] : ["mcp"], { env, stdio: ["pipe", "pipe", "pipe"] });
-  t.after(() => { if (child.exitCode === null) child.kill("SIGKILL"); });
-  const exited = once(child, "exit");
+  await once(child, "spawn");
+  const closed = once(child, "close");
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await closed;
+  });
   let stderr = "";
   child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
   const lines = createInterface({ input: child.stdout })[Symbol.asyncIterator]();
   const send = (message) => child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`);
-  async function receive(id) {
+  let nextId = 0;
+  async function request(method, params = {}) {
+    const id = ++nextId;
+    send({ id, method, params });
     while (true) {
       const { value, done } = await lines.next();
       assert.equal(done, false, `MCP exited before response: ${stderr}`);
       const message = JSON.parse(value);
-      if (message.id !== id) continue;
+      if (message.id === undefined) continue;
+      assert.equal(message.id, id, "unexpected MCP response ID");
       return message;
     }
   }
-  send({ id: 1, method: "initialize", params: {
-    protocolVersion: "2025-11-25",
+  const { result: initialized } = await request("initialize", {
+    protocolVersion,
     capabilities: {},
     clientInfo: { name: "npm-package-test", version: "1.0.0" },
-  } });
-  const { result: initialized } = await receive(1);
+  });
   assert.equal(initialized.serverInfo.version, manifest.version);
   send({ method: "notifications/initialized" });
-  let id = 1;
   return {
-    async request(method, params = {}) {
-      send({ id: ++id, method, params });
-      return receive(id);
-    },
+    request,
     async close() {
       child.stdin.end();
-      assert.deepEqual(await exited, [0, null], stderr);
+      assert.deepEqual(await closed, [0, null], stderr);
       assert.doesNotMatch(stderr, /starting KDE desktop session/);
     },
   };
@@ -172,4 +175,18 @@ test("compact MCP discovers exact schemas and preserves direct validation withou
   assert.equal((await call(direct, "dispatch", {})).error.code, -32602);
   await direct.close();
   await compact.close();
+});
+
+test("compact responses honor the negotiated protocol", { timeout: 15_000 }, async (t) => {
+  const client = await connect(t, true, "2025-03-26");
+  for (const [name, args] of [
+    ["help", { action: "unknown" }],
+    ["dispatch", { action: "act", arguments: {} }],
+  ]) {
+    const { result } = await client.request("tools/call", { name, arguments: args });
+    assert.equal(result.isError, true);
+    assert.equal(result.structuredContent, undefined);
+    assert.ok(result.content[0].text);
+  }
+  await client.close();
 });

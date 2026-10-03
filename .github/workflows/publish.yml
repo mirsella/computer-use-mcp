@@ -1,8 +1,7 @@
-name: Publish npm package
+name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
   release:
     types: [published]
@@ -12,11 +11,13 @@ permissions:
   contents: read
 
 jobs:
-  package:
+  test:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: clippy,rustfmt
       - uses: actions/setup-node@v6
         with:
           node-version: 24
@@ -35,9 +36,11 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: test "$RELEASE_TAG" = "v$(node -p 'require("./package.json").version')"
 
-      - name: Check guidance and Rust tests
+      - name: Check Rust and guidance
         run: |
+          cargo fmt --all -- --check
           bash scripts/check-guidance.sh
+          cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
           cargo test --locked --workspace --all-features
 
       - name: Build npm tarball
@@ -48,7 +51,8 @@ jobs:
           mkdir -p target/npm-package-test
           tar -xzf mirsella-opencode-computer-use-mcp-*.tgz -C target/npm-package-test
           COMPUTER_USE_MCP_PACKAGE_DIR=target/npm-package-test/package npm test
-          ldd target/npm-package-test/package/vendor/computer-use-mcp
+          python3 -B -m unittest discover -s scripts -p 'test_model_smoke.py'
+          ldd target/npm-package-test/package/vendor/bin/computer-use-mcp
 
       - uses: actions/upload-artifact@v7
         with:
@@ -58,7 +62,7 @@ jobs:
 
   publish:
     if: github.event_name == 'release'
-    needs: package
+    needs: test
     runs-on: ubuntu-24.04
     permissions:
       contents: read

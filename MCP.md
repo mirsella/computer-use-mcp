@@ -345,6 +345,14 @@ wait, it returns that entry's opaque target. It does not prove that the entry
 arrived after the call. An AT-SPI-only entry cannot satisfy this exact identity
 condition because AT-SPI does not expose a compositor desktop ID.
 
+An unsatisfied result distinguishes `catalog_refresh_timeout`,
+`app_identity_unavailable`, and `window_not_observed` in `evidence.reason`.
+Unsupported compositor identity backends return immediately; temporary
+unavailability can recover during the wait. The first two report unavailable
+evidence rather than claiming no change. Recovery directs callers to list
+windows on the same desktop and observe an exact returned target. None of these
+results establishes that launch failed.
+
 Window close:
 
 ```json

@@ -112,7 +112,7 @@ impl ResponseTruncation {
 #[derive(Debug)]
 struct TextProjection {
     text: String,
-    truncation: ResponseTruncation,
+    element_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1280,7 +1280,9 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             .map_err(catalog_error)
     }
 
-    async fn refresh_window_catalog(&self) -> Result<Vec<AppInfo>, RuntimeError> {
+    async fn refresh_window_catalog(
+        &self,
+    ) -> Result<(Vec<AppInfo>, [BackendStatus; 2]), RuntimeError> {
         let apps = self.discover().await.map_err(|error| {
             eprintln!(
                 "computer-use-mcp: AT-SPI discovery unavailable while refreshing target catalog: {error}"
@@ -1296,7 +1298,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         self.lock_catalog()?
             .reconcile_sources(&apps, compositor.records)
             .map_err(catalog_error)?;
-        Ok(apps)
+        Ok((apps, [compositor.standard, compositor.kde]))
     }
 
     async fn requested_target_snapshot(
@@ -1309,7 +1311,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         // Target IDs are process-lifetime handles, but the backend record must
         // still be present in the current catalog before visual capture or
         // accessibility collection begins.
-        let apps = self.refresh_window_catalog().await?;
+        let (apps, _) = self.refresh_window_catalog().await?;
         let entry = self.target_entry(target)?;
         let accessibility = accessibility.unwrap_or_else(|| AccessibilityRequest {
             scope: AccessibilityScope::default(),
@@ -2238,14 +2240,13 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
     ) -> Result<ToolOutput, RuntimeError> {
         let requested_app_id = desktop_id.strip_suffix(".desktop").unwrap_or(desktop_id);
         loop {
-            if !self.refresh_window_catalog_for_wait(deadline).await? {
-                return Ok(wait_output_optional(
-                    None,
+            let Some(backends) = self.refresh_window_catalog_for_wait(deadline).await? else {
+                return Ok(window_opened_unverified(
                     condition,
-                    false,
+                    "catalog_refresh_timeout",
                     "window catalog refresh did not complete before the deadline",
                 ));
-            }
+            };
             let found = {
                 let catalog = self.lock_catalog()?;
                 catalog
@@ -2261,23 +2262,40 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                     })
             };
             if let Some(found) = found {
-                return Ok(wait_output_optional(
+                return Ok(wait_output(
                     Some(&found),
                     condition,
                     true,
                     "a catalog snapshot reported the requested window",
                 ));
             }
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Ok(wait_output_optional(
-                    None,
+            if backends
+                .iter()
+                .all(|status| matches!(status, BackendStatus::Unsupported(_)))
+            {
+                return Ok(window_opened_unverified(
                     condition,
-                    false,
-                    "no window with the exact compositor app identity before the deadline",
+                    "app_identity_unavailable",
+                    "the compositor backends do not expose app IDs; AT-SPI windows cannot satisfy window_opened",
                 ));
             }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             sleep(Duration::from_millis(25).min(remaining)).await;
+            self.check_takeover()?;
+            if tokio::time::Instant::now() >= deadline {
+                let (reason, message) = if backends.contains(&BackendStatus::Supported) {
+                    (
+                        "window_not_observed",
+                        "no window with the exact compositor app identity before the deadline",
+                    )
+                } else {
+                    (
+                        "app_identity_unavailable",
+                        "compositor app-ID discovery remained unavailable before the deadline",
+                    )
+                };
+                return Ok(window_opened_unverified(condition, reason, message));
+            }
         }
     }
 
@@ -2292,9 +2310,13 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
     ) -> Result<ToolOutput, RuntimeError> {
         let mut matched_target = None;
         loop {
-            if !self.refresh_window_catalog_for_wait(deadline).await? {
+            if self
+                .refresh_window_catalog_for_wait(deadline)
+                .await?
+                .is_none()
+            {
                 if let Some(matched_target) = matched_target.as_ref() {
-                    return Ok(wait_output_optional(
+                    return Ok(wait_output(
                         Some(matched_target),
                         condition,
                         false,
@@ -2339,7 +2361,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 };
             }
             if observed_target.is_none() {
-                return Ok(wait_output_optional(
+                return Ok(wait_output(
                     matched_target.as_ref(),
                     condition,
                     true,
@@ -2348,7 +2370,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                return Ok(wait_output_optional(
+                return Ok(wait_output(
                     matched_target.as_ref(),
                     condition,
                     false,
@@ -2362,15 +2384,15 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
     async fn refresh_window_catalog_for_wait(
         &self,
         deadline: tokio::time::Instant,
-    ) -> Result<bool, RuntimeError> {
+    ) -> Result<Option<[BackendStatus; 2]>, RuntimeError> {
         self.check_takeover()?;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Ok(false);
+            return Ok(None);
         }
         match timeout(remaining, self.refresh_window_catalog()).await {
-            Ok(result) => result.map(|_| true),
-            Err(_) => Ok(false),
+            Ok(result) => result.map(|(_, backends)| Some(backends)),
+            Err(_) => Ok(None),
         }
     }
 
@@ -2396,7 +2418,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         let evidence = match result {
             Err(_) => {
                 return Ok(wait_output(
-                    target,
+                    Some(target),
                     condition,
                     false,
                     "no matching capture frame before the deadline",
@@ -2404,7 +2426,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             }
             Ok(Err(error)) if error.0.to_lowercase().contains("timed out") => {
                 return Ok(wait_output(
-                    target,
+                    Some(target),
                     condition,
                     false,
                     "no matching capture frame before the deadline",
@@ -2436,7 +2458,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             .await?;
         self.cache_screenshot(&baseline, evidence.mapping.clone())?;
         Ok(wait_output_with_evidence(
-            target,
+            Some(target),
             condition,
             true,
             success_message,
@@ -2478,7 +2500,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 return Ok(wait_output(
-                    target,
+                    Some(target),
                     condition,
                     false,
                     "no accessibility change before the deadline",
@@ -2492,7 +2514,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             {
                 Err(_) => {
                     return Ok(wait_output(
-                        target,
+                        Some(target),
                         condition,
                         false,
                         "no accessibility change before the deadline",
@@ -2503,17 +2525,13 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             if !same_snapshot_content(&baseline, &current) {
                 let current_observation_id = observation_id_for_snapshot(&current);
                 return Ok(wait_output_with_evidence(
-                    target,
+                    Some(target),
                     condition,
                     true,
                     "a later AT-SPI observation reported changed accessibility content",
                     WaitEvidence {
-                        frame: None,
                         observation_id: Some(&current_observation_id),
-                        dimensions: None,
-                        changed: None,
-                        stable_for_ms: None,
-                        window_crop: None,
+                        ..WaitEvidence::default()
                     },
                 ));
             }
@@ -2542,7 +2560,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 return Ok(wait_output(
-                    target,
+                    Some(target),
                     condition,
                     false,
                     "element condition was not satisfied before the deadline",
@@ -2556,7 +2574,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             {
                 Err(_) => {
                     return Ok(wait_output(
-                        target,
+                        Some(target),
                         condition,
                         false,
                         "element condition was not satisfied before the deadline",
@@ -2572,17 +2590,13 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             if predicate(&element.node) {
                 let current_observation_id = observation_id_for_snapshot(&current);
                 return Ok(wait_output_with_evidence(
-                    target,
+                    Some(target),
                     condition,
                     true,
                     success_message,
                     WaitEvidence {
-                        frame: None,
                         observation_id: Some(&current_observation_id),
-                        dimensions: None,
-                        changed: None,
-                        stable_for_ms: None,
-                        window_crop: None,
+                        ..WaitEvidence::default()
                     },
                 ));
             }
@@ -3557,7 +3571,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
 
     async fn settle_and_refresh(&self, old: Arc<Snapshot>) -> Result<Arc<Snapshot>, RuntimeError> {
         sleep(self.config.settle_interval).await;
-        let apps = self.refresh_window_catalog().await?;
+        let (apps, _) = self.refresh_window_catalog().await?;
         let refreshed = if let Some(target) = old.target_ref.as_ref() {
             let entry = self
                 .target_entry(target)
@@ -3963,7 +3977,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
 
     async fn revalidate_screenshot_target(&self, snapshot: &Snapshot) -> Result<(), RuntimeError> {
         let catalog_apps = if let Some(target) = snapshot.target_ref.as_ref() {
-            let apps = self.refresh_window_catalog().await?;
+            let (apps, _) = self.refresh_window_catalog().await?;
             let _ = self.target_entry(target)?;
             Some(apps)
         } else {
@@ -4064,7 +4078,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             ObserveView::Accessibility => AccessibilityScope::Full,
             ObserveView::Both => AccessibilityScope::Full,
         };
-        let apps = self.refresh_window_catalog().await?;
+        let (apps, _) = self.refresh_window_catalog().await?;
         let [app] = apps.as_slice() else {
             return Err(operational_error(
                 "test fixture must expose exactly one AT-SPI application",
@@ -4378,9 +4392,9 @@ pub fn format_snapshot(snapshot: &Snapshot) -> String {
 }
 
 fn format_snapshot_with_budget(snapshot: &Snapshot, max_bytes: usize) -> TextProjection {
-    let presented = presented_element_indices(snapshot);
+    let mut presented = presented_element_indices(snapshot);
     let first = build_snapshot_text(snapshot, &presented, max_bytes);
-    let Some(focused) = presented.iter().copied().find(|index| {
+    let Some(position) = presented.iter().position(|index| {
         snapshot
             .elements
             .get(*index)
@@ -4388,10 +4402,10 @@ fn format_snapshot_with_budget(snapshot: &Snapshot, max_bytes: usize) -> TextPro
     }) else {
         return first;
     };
-    if !first.truncation.truncated
+    if position <= 1
         || first
-            .text
-            .contains(&element_id_for_snapshot(snapshot, focused))
+            .element_ids
+            .contains(&element_id_for_snapshot(snapshot, presented[position]))
     {
         return first;
     }
@@ -4399,18 +4413,8 @@ fn format_snapshot_with_budget(snapshot: &Snapshot, max_bytes: usize) -> TextPro
     // Preserve the root and focused element when a response budget forces a
     // choice.  The normal order remains unchanged whenever the complete
     // observation fits.
-    let mut prioritized = Vec::with_capacity(presented.len());
-    if let Some(root) = presented.first().copied() {
-        prioritized.push(root);
-    }
-    prioritized.push(focused);
-    let rest = presented
-        .iter()
-        .copied()
-        .filter(|index| !prioritized.contains(index))
-        .collect::<Vec<_>>();
-    prioritized.extend(rest);
-    build_snapshot_text(snapshot, &prioritized, max_bytes)
+    presented[1..=position].rotate_right(1);
+    build_snapshot_text(snapshot, &presented, max_bytes)
 }
 
 fn build_snapshot_text(
@@ -4438,11 +4442,18 @@ fn build_snapshot_text(
         app_instance_id,
         window_instance_id,
     );
-    let marker_reserve = ResponseTruncation::default().text_marker().len() + 1;
+    let marker_reserve = ResponseTruncation {
+        elements_included: element_indexes.len(),
+        elements_omitted: element_indexes.len(),
+        ..ResponseTruncation::default()
+    }
+    .text_marker()
+    .len()
+        + 1;
     let body_budget = max_bytes.saturating_sub(marker_reserve);
     let mut focused = None;
     let mut selected = None;
-    let mut included = 0;
+    let mut element_ids = Vec::new();
     let mut fields_truncated = false;
     for index in element_indexes {
         let Some(element) = snapshot.elements.get(*index) else {
@@ -4456,10 +4467,10 @@ fn build_snapshot_text(
             break;
         };
         output.push_str(&line);
-        included += 1;
+        element_ids.push(element_id_for_snapshot(snapshot, *index));
         fields_truncated |= line_truncated;
         if element.node.states.contains("focused") {
-            focused = Some(element_id_for_snapshot(snapshot, *index));
+            focused = element_ids.last().cloned();
         }
         if selected.is_none() {
             selected = element
@@ -4491,26 +4502,20 @@ fn build_snapshot_text(
         append_optional("Warning: accessibility tree depth limit reached.\n".into());
     }
 
-    let elements_omitted = element_indexes.len().saturating_sub(included);
+    let elements_omitted = element_indexes.len().saturating_sub(element_ids.len());
     let truncation = ResponseTruncation {
         truncated: elements_omitted > 0 || fields_truncated,
         fields_truncated,
-        elements_included: included,
+        elements_included: element_ids.len(),
         elements_omitted,
     };
     if truncation.truncated {
         let marker = format!("{}\n", truncation.text_marker());
-        while output.len().saturating_add(marker.len()) > max_bytes {
-            let Some(last_newline) = output[..output.len().saturating_sub(1)].rfind('\n') else {
-                break;
-            };
-            output.truncate(last_newline + 1);
-        }
         output.push_str(&marker);
     }
     TextProjection {
         text: output,
-        truncation,
+        element_ids,
     }
 }
 
@@ -4521,14 +4526,18 @@ fn fit_element_text_line(
     remaining: usize,
 ) -> Option<(String, bool)> {
     let upper = MAX_MODEL_FIELD_CHARS;
+    let full = element_text_line(snapshot, index, element, upper);
+    if full.0.len() <= remaining {
+        return Some(full);
+    }
     let mut low = 0;
-    let mut high = upper;
+    let mut high = upper - 1;
     let mut best = None;
     while low <= high {
         let field_limit = low + (high - low) / 2;
-        let (line, field_truncated) = element_text_line(snapshot, index, element, field_limit);
+        let (line, _) = element_text_line(snapshot, index, element, field_limit);
         if line.len() <= remaining {
-            best = Some((line, field_truncated || field_limit < upper));
+            best = Some((line, true));
             low = field_limit.saturating_add(1);
         } else if field_limit == 0 {
             break;
@@ -5149,12 +5158,16 @@ fn observation_output(
     };
     let reserved = png_text.len() + 1 + changed_text.as_ref().map_or(0, |line| line.len() + 1);
     let snapshot_budget = MAX_MODEL_TEXT_BYTES.saturating_sub(reserved);
-    let snapshot_text = format_snapshot_with_budget(snapshot, snapshot_budget).text;
+    let TextProjection {
+        text: snapshot_text,
+        element_ids,
+    } = format_snapshot_with_budget(snapshot, snapshot_budget);
     let text = match changed_text {
         Some(changed) => format!("{png_text}\n{changed}\n{snapshot_text}"),
         None => format!("{png_text}\n{snapshot_text}"),
     };
     let mut output = ToolOutput::text(text).with_structured_content(structured);
+    output.element_ids = element_ids;
     if let Some(png) = png_base64 {
         output = output.with_png_base64(png);
     }
@@ -5640,6 +5653,7 @@ fn wait_backend_error(message: &str) -> RuntimeError {
     }
 }
 
+#[derive(Default)]
 struct WaitEvidence<'a> {
     frame: Option<&'a crate::capture::FrameMetadata>,
     observation_id: Option<&'a str>,
@@ -6280,7 +6294,7 @@ fn bound_structured_element(element: &Value, field_limit: usize) -> (Value, bool
 }
 
 fn wait_output(
-    target: &TargetRef,
+    target: Option<&TargetRef>,
     condition: WaitCondition,
     satisfied: bool,
     evidence: &str,
@@ -6290,50 +6304,33 @@ fn wait_output(
         condition,
         satisfied,
         evidence,
-        WaitEvidence {
-            frame: None,
-            observation_id: None,
-            dimensions: None,
-            changed: None,
-            stable_for_ms: None,
-            window_crop: None,
-        },
+        WaitEvidence::default(),
     )
 }
 
-fn wait_output_optional(
-    target: Option<&TargetRef>,
-    condition: WaitCondition,
-    satisfied: bool,
-    evidence: &str,
-) -> ToolOutput {
-    wait_output_with_evidence_optional(
-        target,
+fn window_opened_unverified(condition: WaitCondition, reason: &str, message: &str) -> ToolOutput {
+    let recovery = "Use list_desktop with scope=windows on the same desktop, then observe a returned target. This result does not establish that launch failed.";
+    let mut output = wait_output(
+        None,
         condition,
-        satisfied,
-        evidence,
-        WaitEvidence {
-            frame: None,
-            observation_id: None,
-            dimensions: None,
-            changed: None,
-            stable_for_ms: None,
-            window_crop: None,
-        },
-    )
+        false,
+        &format!("{message}\nRecovery: {recovery}"),
+    );
+    let structured = output
+        .structured_content
+        .as_mut()
+        .expect("wait output has structured content");
+    structured["evidence"]["kind"] = json!(if reason == "window_not_observed" {
+        "no_change"
+    } else {
+        "unavailable"
+    });
+    structured["evidence"]["reason"] = json!(reason);
+    structured["recovery"] = json!(recovery);
+    output
 }
 
 fn wait_output_with_evidence(
-    target: &TargetRef,
-    condition: WaitCondition,
-    satisfied: bool,
-    evidence: &str,
-    wait_evidence: WaitEvidence<'_>,
-) -> ToolOutput {
-    wait_output_with_evidence_optional(Some(target), condition, satisfied, evidence, wait_evidence)
-}
-
-fn wait_output_with_evidence_optional(
     target: Option<&TargetRef>,
     condition: WaitCondition,
     satisfied: bool,
@@ -6344,18 +6341,17 @@ fn wait_output_with_evidence_optional(
     let changed_line = wait_evidence
         .frame
         .map(|frame| changed_rect_text(frame, wait_evidence.dimensions, wait_evidence.window_crop));
-    let text = match (frame_id.as_deref(), wait_evidence.dimensions) {
-        (Some(frame_id), Some((width, height))) => {
-            let base =
-                format!("{evidence}\nFrame ID: {frame_id} bounds=0<=x<{width},0<=y<{height}");
-            changed_line.map_or(base.clone(), |changed| format!("{base}\n{changed}"))
+    let mut text = evidence.to_owned();
+    if let Some(frame_id) = frame_id.as_deref() {
+        text.push_str(&format!("\nFrame ID: {frame_id}"));
+        if let Some((width, height)) = wait_evidence.dimensions {
+            text.push_str(&format!(" bounds=0<=x<{width},0<=y<{height}"));
         }
-        (Some(frame_id), None) => {
-            let base = format!("{evidence}\nFrame ID: {frame_id}");
-            changed_line.map_or(base.clone(), |changed| format!("{base}\n{changed}"))
-        }
-        (None, _) => evidence.to_owned(),
-    };
+    }
+    if let Some(changed_line) = changed_line {
+        text.push('\n');
+        text.push_str(&changed_line);
+    }
     let kind = if satisfied {
         match &condition {
             WaitCondition::FrameAdvanced { .. }
@@ -6736,7 +6732,7 @@ fn replacement_element_for_source<'a>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         collections::HashMap,
         future,
@@ -6975,12 +6971,19 @@ mod tests {
         let structured = output.structured_content.expect("wait evidence");
         assert_eq!(structured["satisfied"], false);
         assert_eq!(structured["target"], serde_json::Value::Null);
-        assert_eq!(structured["evidence"]["kind"], "no_change");
+        assert_eq!(structured["evidence"]["kind"], "unavailable");
+        assert_eq!(structured["evidence"]["reason"], "app_identity_unavailable");
+        assert!(
+            structured["recovery"]
+                .as_str()
+                .unwrap()
+                .contains("list_desktop")
+        );
         assert_eq!(structured["condition"]["type"], "window_opened");
     }
 
     #[tokio::test]
-    async fn window_opened_times_out_without_event_or_match() {
+    async fn window_opened_reports_unavailable_app_identity() {
         let runtime = fake_runtime(FakeAdapter::tree());
         runtime.execute_call(observe_call()).await.unwrap();
         let output = runtime
@@ -6989,13 +6992,14 @@ mod tests {
                 condition: WaitCondition::WindowOpened {
                     desktop_id: "org.example.Missing.desktop".into(),
                 },
-                timeout_ms: 1,
+                timeout_ms: 5,
             })
             .await
             .unwrap();
         let structured = output.structured_content.expect("wait evidence");
         assert_eq!(structured["satisfied"], false);
-        assert_eq!(structured["evidence"]["kind"], "no_change");
+        assert_eq!(structured["evidence"]["kind"], "unavailable");
+        assert_eq!(structured["evidence"]["reason"], "app_identity_unavailable");
     }
 
     #[tokio::test]
@@ -7101,6 +7105,8 @@ mod tests {
         let structured = output.structured_content.expect("wait evidence");
         assert_eq!(structured["satisfied"], false);
         assert!(output.text.contains("catalog refresh"));
+        assert_eq!(structured["evidence"]["reason"], "catalog_refresh_timeout");
+        assert!(output.text.contains("list_desktop"));
     }
 
     struct TakeoverScreenshots {
@@ -7547,7 +7553,7 @@ mod tests {
             window_instance_id: "win-0000000000000002".into(),
         };
         let output = wait_output_with_evidence(
-            &target,
+            Some(&target),
             WaitCondition::FrameChanged {
                 after_frame_id: "frame-0000000000000000".into(),
             },
@@ -7582,7 +7588,7 @@ mod tests {
         };
 
         let output = wait_output_with_evidence(
-            &target,
+            Some(&target),
             WaitCondition::FrameAdvanced {
                 after_frame_id: frame_id.clone(),
             },
@@ -9165,8 +9171,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn worst_case_observation_and_replacement_are_explicitly_truncated() {
+    pub(crate) fn oversized_observation_fixture() -> (Snapshot, ScreenshotMapping, ToolOutput) {
         let mut elements = Vec::new();
         for index in 0..240 {
             let mut node = node(
@@ -9232,7 +9237,29 @@ mod tests {
                 window_crop: None,
             },
         );
+        (snapshot, mapping, observation)
+    }
+
+    #[test]
+    fn worst_case_observation_and_replacement_are_explicitly_truncated() {
+        let (mut snapshot, mapping, observation) = oversized_observation_fixture();
+        let target = snapshot.target_ref.clone().unwrap();
         assert!(observation.text.len() <= MAX_MODEL_TEXT_BYTES);
+        let rendered_ids: Vec<_> = observation
+            .text
+            .lines()
+            .filter_map(|line| {
+                let (id, _) = line.trim_start().split_once(':')?;
+                id.starts_with("e-").then(|| id.to_owned())
+            })
+            .collect();
+        assert_eq!(observation.element_ids, rendered_ids);
+        assert!(rendered_ids.len() * 10 < snapshot.element_ids.len());
+        println!(
+            "worker text IDs: {} of {} snapshot IDs",
+            rendered_ids.len(),
+            snapshot.element_ids.len()
+        );
         let structured = observation
             .structured_content
             .as_ref()
@@ -9312,6 +9339,15 @@ mod tests {
         assert_eq!(structured["replacement_frame_id"], "frame-0000000000000007");
         assert_eq!(structured["replacement_element_id"], "e-00000000000000ef");
         assert!(structured["action_progress"].is_object());
+
+        // An ID in application text is not evidence that its element was rendered.
+        let focused = snapshot.element_ids.last().unwrap().clone();
+        snapshot.elements[0].node.name.insert_str(0, &focused);
+        assert!(
+            format_snapshot(&snapshot)
+                .lines()
+                .any(|line| { line.trim_start().starts_with(&format!("{focused}:")) })
+        );
     }
 
     #[tokio::test]
@@ -11999,7 +12035,7 @@ mod tests {
             (ObserveView::Accessibility, false) => AccessibilityScope::Visible,
             (ObserveView::Screenshot, _) => AccessibilityScope::Interactive,
         };
-        let apps = runtime.refresh_window_catalog().await.unwrap();
+        let (apps, _) = runtime.refresh_window_catalog().await.unwrap();
         let [app] = apps.as_slice() else {
             panic!("test fixture must expose exactly one application");
         };

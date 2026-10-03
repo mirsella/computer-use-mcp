@@ -24,7 +24,7 @@ class Client:
         self.next_id = 1
         self.desktop = desktop
         self.compact = compact
-        self.schemas = {}
+        self.known_actions = set()
         self.native_runner = (
             command is not None if native_runner is None else native_runner
         )
@@ -42,24 +42,6 @@ class Client:
         )
 
     def request(self, method, params):
-        if (
-            self.compact
-            and method == "tools/call"
-            and params["name"] not in {"help", "dispatch"}
-        ):
-            action = params["name"]
-            if action not in self.schemas:
-                help_response = self.request(
-                    "tools/call", {"name": "help", "arguments": {"action": action}}
-                )
-                schema = json.loads(help_response["result"]["content"][0]["text"])
-                assert schema["name"] == action
-                self.schemas[action] = schema
-                print(f"schema_loaded={action}")
-            params = {
-                "name": "dispatch",
-                "arguments": {"action": action, "arguments": params["arguments"]},
-            }
         request_id = self.next_id
         self.next_id += 1
         self.process.stdin.write(
@@ -103,7 +85,23 @@ def call(client, name, arguments):
         )
     if client.desktop is not None and desktop_allowed and "desktop" not in arguments:
         arguments = {**arguments, "desktop": client.desktop}
-    response = client.request("tools/call", {"name": name, "arguments": arguments})
+    params = {"name": name, "arguments": arguments}
+    if client.compact:
+        if name not in client.known_actions:
+            help_response = client.request(
+                "tools/call", {"name": "help", "arguments": {"action": name}}
+            )
+            if "error" in help_response or help_response["result"].get("isError"):
+                raise RuntimeError(f"help for {name} failed: {help_response}")
+            schema = json.loads(help_response["result"]["content"][0]["text"])
+            assert schema["name"] == name
+            client.known_actions.add(name)
+            print(f"schema_loaded={name}")
+        params = {
+            "name": "dispatch",
+            "arguments": {"action": name, "arguments": arguments},
+        }
+    response = client.request("tools/call", params)
     if "error" in response:
         raise RuntimeError(f"{name}: JSON-RPC error: {response['error']}")
     result = response["result"]

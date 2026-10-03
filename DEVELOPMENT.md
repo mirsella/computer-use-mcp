@@ -114,6 +114,23 @@ injected private environment.
 The compact variant fetches each action schema once, then dispatches all calls
 through the compact transport.
 
+For an optional model-driven release smoke, build the local npm payload and run:
+
+```sh
+npm pack
+python3 -B scripts/opencode-model-smoke.py --model openai/gpt-6-sol --variant medium
+```
+
+This uses the existing OpenCode provider configuration and authentication and
+incurs model usage. It installs only the local plugin in a temporary config,
+removes physical display/bus access, and asks the model to enter a unique line
+in an unsaved background editor. It requires fresh accessibility readback and a
+PNG, checks every discovery/launch route, watches for foreground workers, and
+checks owned processes and the private runtime disappear after exit. Temporary
+config, transcripts, and screenshots are deleted. The JSON report includes
+task-wide token counters, repeated calls, tool errors, and window-wait results.
+Ordinary CI runs only its deterministic evidence-checker tests.
+
 The confirmed run kept the foreground worker count at zero, reused the
 persistent background worker, launched on the background route, and passed
 PNG capture, pointer click, focused typing, portal Clipboard paste, and fresh
@@ -132,8 +149,9 @@ Linux/KDE environment, not a claim of support for every platform.
 ### npm packaging and releases
 
 `@mirsella/opencode-computer-use-mcp` ships the Linux x64 GNU executable, an
-OpenCode plugin, and a copy of the canonical skill. `npm pack` builds the
-release binary and stages those files. Cargo and npm versions must match.
+OpenCode plugin, and a copy of the canonical skill. `npm pack` uses
+`cargo install` to build the release executable into `vendor/bin` and copies
+the canonical skill. Cargo and npm versions must match.
 The package has no JavaScript dependencies or install-time scripts.
 
 ```sh
@@ -141,7 +159,8 @@ npm pack
 npm test
 ```
 
-The publish workflow builds on Ubuntu 24.04, tests the extracted tarball's
+The single CI/publish workflow runs formatting, Clippy, and Rust tests on
+Ubuntu 24.04, then tests the extracted tarball's
 plugin permission selection, direct/compact MCP discovery, and dispatch
 validation without a desktop, and uploads the tarball as the
 `npm-package` artifact. Pushes, pull requests, and manual workflow runs build

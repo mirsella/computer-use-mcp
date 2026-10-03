@@ -274,6 +274,8 @@ pub struct ToolOutput {
     pub text: String,
     pub png_base64: Option<String>,
     pub structured_content: Option<serde_json::Value>,
+    // IDs emitted by the text renderer, independent of the bounded JSON projection.
+    pub(crate) element_ids: Vec<String>,
 }
 
 impl ToolOutput {
@@ -282,6 +284,7 @@ impl ToolOutput {
             text: text.into(),
             png_base64: None,
             structured_content: None,
+            element_ids: Vec::new(),
         }
     }
 
@@ -352,8 +355,28 @@ impl ToolOutput {
         }
         let mut result = CallToolResult::success(content);
         result.structured_content = bounded.structured_content;
+        if !bounded.element_ids.is_empty() {
+            result.meta = Some(rmcp::model::Meta(serde_json::Map::from_iter([(
+                ELEMENT_IDS_META.into(),
+                serde_json::Value::from(bounded.element_ids),
+            )])));
+        }
         result
     }
+}
+
+const ELEMENT_IDS_META: &str = "computer-use-mcp/worker-element-ids";
+
+/// Private worker routing data, removed at either public MCP boundary.
+pub(crate) fn take_element_ids(result: &mut CallToolResult) -> Option<serde_json::Value> {
+    let ids = result
+        .meta
+        .as_mut()
+        .and_then(|meta| meta.0.remove(ELEMENT_IDS_META));
+    if result.meta.as_ref().is_some_and(|meta| meta.0.is_empty()) {
+        result.meta = None;
+    }
+    ids
 }
 
 pub fn tool_error_result(error: &RuntimeError) -> CallToolResult {

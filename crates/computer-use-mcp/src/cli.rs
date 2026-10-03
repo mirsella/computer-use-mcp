@@ -86,7 +86,7 @@ pub async fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), CliE
                     ));
                 }
             };
-            server::serve_stdio(compact).await
+            crate::broker::serve_stdio(compact).await
         }
         "__desktop_worker" => run_worker(&arguments, false).await,
         "__background_worker" => run_worker(&arguments, true).await,

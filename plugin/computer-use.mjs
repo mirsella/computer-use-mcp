@@ -1,6 +1,6 @@
 import { fileURLToPath } from "node:url";
 
-const binary = fileURLToPath(new URL("../vendor/computer-use-mcp", import.meta.url));
+const binary = fileURLToPath(new URL("../vendor/bin/computer-use-mcp", import.meta.url));
 const skills = fileURLToPath(new URL("../skills", import.meta.url));
 const directTools = [
   "list_desktop", "launch_application", "activate_window", "observe", "act", "wait_for",

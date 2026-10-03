@@ -1,6 +1,6 @@
 use serde_json::{Map as JsonObject, Value};
 
-use crate::errors::RuntimeError;
+use crate::{contract::tool_definition, errors::RuntimeError};
 
 pub const MAX_CLICK_COUNT: usize = 3;
 pub const MAX_SCROLL_STEPS: u32 = 100;
@@ -23,32 +23,42 @@ pub const DEFAULT_ACCESSIBILITY_TEXT_LIMIT: usize = 256;
 pub const DEFAULT_ACCESSIBILITY_MAX_NODES: usize = 250;
 pub const DEFAULT_ACCESSIBILITY_MAX_DEPTH: usize = 64;
 
-pub enum CompactCall {
-    Help(Option<String>),
+pub(crate) enum McpCall {
+    Help(Option<&'static rmcp::model::Tool>),
     Dispatch {
-        action: String,
+        action: &'static str,
         arguments: JsonObject<String, Value>,
     },
 }
 
-pub fn validate_compact_call(
-    name: &str,
+pub(crate) fn validate_mcp_call(
+    tool: &'static rmcp::model::Tool,
     mut arguments: JsonObject<String, Value>,
-) -> Result<CompactCall, RuntimeError> {
+) -> Result<McpCall, RuntimeError> {
+    let name = tool.name.as_ref();
+    if !matches!(name, "help" | "dispatch") {
+        return Ok(McpCall::Dispatch {
+            action: name,
+            arguments,
+        });
+    }
     let action = match arguments.remove("action") {
         None if name == "help" => None,
-        Some(Value::String(action)) if crate::contract::TOOL_NAMES.contains(&action.as_str()) => {
-            Some(action)
+        Some(Value::String(action)) => {
+            let Some(tool) = tool_definition(&action) else {
+                return invalid("action must name an operation returned by help");
+            };
+            Some(tool)
         }
         _ => return invalid("action must name an operation returned by help"),
     };
-    let call = match name {
-        "help" => CompactCall::Help(action),
-        "dispatch" => CompactCall::Dispatch {
-            action: action.expect("dispatch requires an action"),
+    let call = if name == "help" {
+        McpCall::Help(action)
+    } else {
+        McpCall::Dispatch {
+            action: action.expect("dispatch requires an action").name.as_ref(),
             arguments: required_object(&mut arguments, "arguments")?,
-        },
-        _ => return invalid("unknown compact tool"),
+        }
     };
     reject_unknown(arguments)?;
     Ok(call)

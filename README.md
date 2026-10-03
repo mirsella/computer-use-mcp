@@ -1,6 +1,6 @@
 # Computer Use MCP for Linux Wayland
 
-[![CI](https://github.com/mirsella/computer-use-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/mirsella/computer-use-mcp/actions/workflows/ci.yml)
+[![CI](https://github.com/mirsella/computer-use-mcp/actions/workflows/publish.yml/badge.svg)](https://github.com/mirsella/computer-use-mcp/actions/workflows/publish.yml)
 
 A local [Model Context Protocol](https://modelcontextprotocol.io/) server for
 computer use on KDE Plasma Wayland. It is designed for a trusted local MCP

@@ -10,6 +10,10 @@ and the authorities used to make decisions.
   untrusted JSON into typed calls. The optional compact transport fetches these
   same schemas on demand and unwraps dispatch before ordinary broker validation;
   it owns no separate execution or desktop state.
+- Observation IDs come from canonical snapshots. The private worker response
+  carries the snapshot's element IDs separately from bounded text/JSON so
+  independent truncation cannot break broker routing. The broker translates
+  both projections and removes this private metadata before MCP output.
 - `broker`, `server`, `cli`, `runtime`, and `errors` own MCP transport,
   per-desktop scheduling, presentation, and outcome reporting. The broker owns
   one lazy foreground worker and one lazy background worker; their local IDs are

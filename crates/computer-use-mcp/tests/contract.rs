@@ -15,7 +15,7 @@ const PACKAGED_SKILL: &str = include_str!("../guidance/skill.md");
 fn tools_list_wire_has_exact_contract_and_stays_within_budget() {
     let tools = tool_definitions();
     let wire = ServerJsonRpcMessage::response(
-        ServerResult::ListToolsResult(ListToolsResult::with_all_items(tools)),
+        ServerResult::ListToolsResult(ListToolsResult::with_all_items(tools.to_vec())),
         NumberOrString::Number(1),
     );
     let serialized = serde_json::to_vec(&wire).expect("serialize complete tools/list");
@@ -76,7 +76,9 @@ fn tools_list_wire_has_exact_contract_and_stays_within_budget() {
 #[test]
 fn compact_startup_and_on_demand_workflow_have_bounded_context() {
     let wire = ServerJsonRpcMessage::response(
-        ServerResult::ListToolsResult(ListToolsResult::with_all_items(compact_tool_definitions())),
+        ServerResult::ListToolsResult(ListToolsResult::with_all_items(
+            compact_tool_definitions().to_vec(),
+        )),
         NumberOrString::Number(1),
     );
     let compact_bytes = serde_json::to_vec(&wire).unwrap().len();
@@ -91,15 +93,19 @@ fn compact_startup_and_on_demand_workflow_have_bounded_context() {
     );
     // A representative accessibility workflow loads three schemas, each once.
     let workflow_bytes: usize = tool_definitions()
-        .into_iter()
+        .iter()
         .filter(|tool| ["list_desktop", "observe", "act"].contains(&tool.name.as_ref()))
         .map(|tool| serde_json::to_vec(&tool).unwrap().len())
         .sum();
+    let total = compact_bytes + SERVER_INSTRUCTIONS.len() + PACKAGED_SKILL.len() + workflow_bytes;
+    assert!(
+        total < direct_bytes,
+        "on-demand workflow {total} exceeds eager schemas {direct_bytes}"
+    );
     println!(
-        "compact tools/list={compact_bytes}; initialize={}; skill={}; list/observe/act schemas={workflow_bytes}; workflow total={}",
+        "compact tools/list={compact_bytes}; initialize={}; skill={}; list/observe/act schemas={workflow_bytes}; workflow total={total}",
         SERVER_INSTRUCTIONS.len(),
         PACKAGED_SKILL.len(),
-        compact_bytes + SERVER_INSTRUCTIONS.len() + PACKAGED_SKILL.len() + workflow_bytes
     );
 }
 
@@ -457,7 +463,7 @@ fn inputs_use_exact_opaque_targets_and_bounded_operations() {
 fn annotations_match_tool_side_effects() {
     let read_only = ["list_desktop", "observe", "wait_for"];
     for tool in tool_definitions() {
-        let annotations = serde_json::to_value(tool.annotations).expect("serialize annotations");
+        let annotations = serde_json::to_value(&tool.annotations).expect("serialize annotations");
         let expected_read_only = read_only.contains(&tool.name.as_ref());
         assert_eq!(annotations["openWorldHint"], true, "{}", tool.name);
         assert_eq!(

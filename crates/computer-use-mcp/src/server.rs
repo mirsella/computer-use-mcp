@@ -20,7 +20,7 @@ use crate::{
     VERSION,
     accessibility::{RuntimeConfig, SemanticRuntime},
     atspi_adapter::AtspiAdapter,
-    contract::{SERVER_INSTRUCTIONS, TOOL_NAMES, tool_definitions},
+    contract::{SERVER_INSTRUCTIONS, tool_definition, tool_definitions},
     errors::{CliError, RuntimeError, ToolOutcome},
     runtime::{
         ActionProgress, CleanupStatus, DesktopRuntime, tool_error_result, with_action_progress,
@@ -59,13 +59,11 @@ impl<R: DesktopRuntime> ServerHandler for ComputerUseMcpServer<R> {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(tool_definitions()))
+        Ok(ListToolsResult::with_all_items(tool_definitions().to_vec()))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        tool_definitions()
-            .into_iter()
-            .find(|tool| tool.name == name)
+        tool_definition(name).cloned()
     }
 
     async fn call_tool(
@@ -74,7 +72,7 @@ impl<R: DesktopRuntime> ServerHandler for ComputerUseMcpServer<R> {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let structured = supports_structured_content(&context);
-        if !TOOL_NAMES.contains(&request.name.as_ref()) {
+        if tool_definition(&request.name).is_none() {
             return Err(McpError::invalid_params(
                 format!("unknown tool {:?}", request.name),
                 None,
@@ -243,10 +241,6 @@ fn cancelled_error(progress: Option<&Arc<ActionProgress>>, message: &str) -> Run
     )
 }
 
-pub async fn serve_stdio(compact_tools: bool) -> Result<(), CliError> {
-    crate::broker::serve_stdio(compact_tools).await
-}
-
 pub async fn serve_worker_stdio() -> Result<(), CliError> {
     // Log the configured display for diagnostics. Environment settings alone
     // do not prove that portal, capture, input, and catalog share a compositor.
@@ -299,6 +293,7 @@ pub(crate) fn server_info() -> ServerInfo {
 }
 
 pub(crate) fn for_protocol(mut result: CallToolResult, structured: bool) -> CallToolResult {
+    crate::runtime::take_element_ids(&mut result);
     if !structured {
         result.structured_content = None;
     }
@@ -316,6 +311,17 @@ pub(crate) fn supports_structured_content(context: &RequestContext<RoleServer>) 
 #[cfg(test)]
 mod cancellation_tests {
     use super::*;
+
+    #[test]
+    fn public_protocol_never_exposes_worker_identity_metadata() {
+        let mut output = crate::runtime::ToolOutput::text("observation");
+        output.element_ids.push("e-0000000000000001".into());
+        let result = output.into_mcp_result();
+        assert!(result.meta.is_some());
+        for structured in [false, true] {
+            assert!(for_protocol(result.clone(), structured).meta.is_none());
+        }
+    }
 
     #[test]
     fn cancellation_preserves_dispatch_outcome_even_when_cleanup_fails() {

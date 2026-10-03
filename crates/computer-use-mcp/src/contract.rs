@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use rmcp::model::{Tool, ToolAnnotations};
 use serde_json::json;
@@ -23,8 +23,20 @@ pub const TOOL_NAMES: [&str; 6] = [
 
 pub const SERVER_INSTRUCTIONS: &str = "Copy returned IDs unchanged. Stale target: rediscover; stale observation or element: observe again. not_started permits recovery then retry; unknown/completed requires inspecting state first. Dispatch does not prove application effect. UserTakeoverInterrupted requires stopping, user authorization, and an MCP restart.";
 
-pub fn compact_tool_definitions() -> Vec<Tool> {
-    vec![
+pub fn compact_tool_definitions() -> &'static [Tool] {
+    &*COMPACT_TOOLS
+}
+
+pub fn tool_definitions() -> &'static [Tool] {
+    &*DIRECT_TOOLS
+}
+
+pub fn tool_definition(name: &str) -> Option<&'static Tool> {
+    tool_definitions().iter().find(|tool| tool.name == name)
+}
+
+static COMPACT_TOOLS: LazyLock<[Tool; 2]> = LazyLock::new(|| {
+    [
         tool(
             "help",
             "Discover desktop operations, or fetch one action's schema. Covers windows, app launch, screenshots, accessibility, input, and waits on foreground or private background desktops.",
@@ -46,10 +58,10 @@ pub fn compact_tool_definitions() -> Vec<Tool> {
             true,
         ),
     ]
-}
+});
 
-pub fn tool_definitions() -> Vec<Tool> {
-    vec![
+static DIRECT_TOOLS: LazyLock<[Tool; 6]> = LazyLock::new(|| {
+    [
         tool(
             "list_desktop",
             "Find windows or installed application IDs on foreground (default) or a lazily started private background desktop. Targets route subsequent calls automatically. Paginate with the returned cursor.",
@@ -121,7 +133,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             false,
         ),
     ]
-}
+});
 
 fn tool(
     name: &'static str,

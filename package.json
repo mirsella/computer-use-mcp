@@ -8,21 +8,19 @@
     "./server": "./plugin/computer-use.mjs"
   },
   "bin": {
-    "computer-use-mcp": "vendor/computer-use-mcp"
+    "computer-use-mcp": "vendor/bin/computer-use-mcp"
   },
   "files": [
-    "plugin/",
-    "skills/",
-    "vendor/",
+    "plugin/computer-use.mjs",
+    "skills/computer-use-mcp/SKILL.md",
+    "vendor/bin/computer-use-mcp",
     "README.md",
     "MCP.md",
     "SECURITY.md",
     "LICENSE"
   ],
   "scripts": {
-    "build:native": "cargo build --locked --release --target x86_64-unknown-linux-gnu",
-    "stage:native": "node scripts/stage-native.mjs",
-    "prepack": "npm run build:native && npm run stage:native",
+    "prepack": "node scripts/package-native.mjs",
     "test": "node --test tests/npm.test.mjs"
   },
   "keywords": ["opencode", "mcp", "computer-use", "wayland", "kde"],

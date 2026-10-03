@@ -32,8 +32,7 @@ use crate::{
     runtime::{DesktopRuntime, tool_error_result},
     server::{ComputerUseMcpServer, for_protocol, supports_structured_content},
     validation::{
-        CompactCall, Desktop, RoutedCall, validate_call, validate_compact_call,
-        validate_routed_call,
+        Desktop, McpCall, RoutedCall, validate_call, validate_mcp_call, validate_routed_call,
     },
 };
 
@@ -115,6 +114,13 @@ impl Identities {
 
     fn encode(&mut self, result: &mut CallToolResult, desktop: Desktop, generation: u64) {
         let mut replacements = BTreeMap::new();
+        if let Some(ids) = crate::runtime::take_element_ids(result) {
+            for id in ids.as_array().expect("worker element IDs are an array") {
+                let local = id.as_str().expect("worker element IDs are strings");
+                let public = self.publish(desktop, generation, local, "e");
+                replacements.insert(local.to_owned(), public);
+            }
+        }
         if let Some(structured) = &mut result.structured_content {
             visit_ids(structured, &mut |value, prefix| {
                 let public = self.publish(desktop, generation, value, prefix);
@@ -124,8 +130,8 @@ impl Identities {
             })
             .expect("output identity translation cannot fail");
         }
-        // Text is a projection of the structured result. Replace complete ID
-        // tokens only, never substrings (e.g. an ID followed by another digit).
+        // Independent truncation can omit text IDs from structured content.
+        // The canonical manifest covers those IDs. Replace complete tokens only.
         for content in &mut result.content {
             if let ContentBlock::Text(text) = content {
                 text.text = replace_tokens(&text.text, &replacements);
@@ -342,7 +348,6 @@ impl Drop for PendingCall<'_> {
 
 #[derive(Debug)]
 pub struct DesktopBroker {
-    compact_tools: bool,
     foreground: tokio::sync::Mutex<Option<Worker>>,
     background: tokio::sync::Mutex<Option<Worker>>,
     identities: Mutex<Identities>,
@@ -358,7 +363,6 @@ impl DesktopBroker {
             .and_then(|mut file| file.read_exact(&mut seed))
             .map_err(|error| CliError::Mcp(format!("cannot seed desktop identities: {error}")))?;
         Ok(Self {
-            compact_tools: false,
             foreground: tokio::sync::Mutex::new(None),
             background: tokio::sync::Mutex::new(None),
             identities: Mutex::new(Identities {
@@ -600,7 +604,12 @@ fn worker_failure(error: impl std::fmt::Display, mutation: bool) -> RuntimeError
     error
 }
 
-impl ServerHandler for DesktopBroker {
+struct McpServer {
+    broker: Arc<DesktopBroker>,
+    tools: &'static [Tool],
+}
+
+impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
         crate::server::server_info()
     }
@@ -610,11 +619,11 @@ impl ServerHandler for DesktopBroker {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(self.tools()))
+        Ok(ListToolsResult::with_all_items(self.tools.to_vec()))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        self.tools().into_iter().find(|tool| tool.name == name)
+        self.tools.iter().find(|tool| tool.name == name).cloned()
     }
 
     async fn call_tool(
@@ -622,65 +631,42 @@ impl ServerHandler for DesktopBroker {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let (name, arguments) = if self.compact_tools {
-            if !["help", "dispatch"].contains(&request.name.as_ref()) {
-                return Err(McpError::invalid_params("unknown tool", None));
+        let tool = self
+            .tools
+            .iter()
+            .find(|tool| tool.name == request.name)
+            .ok_or_else(|| McpError::invalid_params("unknown tool", None))?;
+        let result = match validate_mcp_call(tool, request.arguments.unwrap_or_default()) {
+            Ok(McpCall::Help(action)) => {
+                let text = match action {
+                    Some(tool) => serde_json::to_string(tool).expect("tool schema serializes"),
+                    None => json!({"actions": TOOL_NAMES}).to_string(),
+                };
+                // One text copy: hosts may also serialize structuredContent into context.
+                CallToolResult::success(vec![ContentBlock::text(text)])
             }
-            match validate_compact_call(&request.name, request.arguments.unwrap_or_default()) {
-                Ok(CompactCall::Help(action)) => {
-                    let value = match action {
-                        Some(action) => serde_json::to_value(
-                            tool_definitions()
-                                .into_iter()
-                                .find(|tool| tool.name == action)
-                                .expect("validated action has a schema"),
-                        )
-                        .expect("tool schema serializes"),
-                        None => json!({"actions": TOOL_NAMES}),
-                    };
-                    // One text copy: hosts may also serialize structuredContent into context.
-                    return Ok(CallToolResult::success(vec![ContentBlock::text(
-                        value.to_string(),
-                    )]));
-                }
-                Ok(CompactCall::Dispatch { action, arguments }) => (action, arguments),
-                Err(error) => {
-                    return Ok(for_protocol(
-                        tool_error_result(&error),
-                        supports_structured_content(&context),
-                    ));
-                }
+            Ok(McpCall::Dispatch { action, arguments }) => {
+                self.broker
+                    .call(action, arguments, context.ct.cancelled())
+                    .await
             }
-        } else {
-            if !TOOL_NAMES.contains(&request.name.as_ref()) {
-                return Err(McpError::invalid_params("unknown tool", None));
-            }
-            (
-                request.name.into_owned(),
-                request.arguments.unwrap_or_default(),
-            )
+            Err(error) => tool_error_result(&error),
         };
-        let result = self.call(&name, arguments, context.ct.cancelled()).await;
         Ok(for_protocol(result, supports_structured_content(&context)))
     }
 }
 
-impl DesktopBroker {
-    fn tools(&self) -> Vec<Tool> {
-        if self.compact_tools {
+pub async fn serve_stdio(compact_tools: bool) -> Result<(), CliError> {
+    let broker = Arc::new(DesktopBroker::new()?);
+    let server = McpServer {
+        broker: Arc::clone(&broker),
+        tools: if compact_tools {
             compact_tool_definitions()
         } else {
             tool_definitions()
-        }
-    }
-}
-
-pub async fn serve_stdio(compact_tools: bool) -> Result<(), CliError> {
-    let broker = Arc::new(DesktopBroker {
-        compact_tools,
-        ..DesktopBroker::new()?
-    });
-    let result = match Arc::clone(&broker).serve(rmcp::transport::stdio()).await {
+        },
+    };
+    let result = match server.serve(rmcp::transport::stdio()).await {
         Ok(service) => service
             .waiting()
             .await
@@ -830,7 +816,7 @@ mod tests {
 
     // A real subprocess with deliberately colliding local IDs. It echoes
     // received arguments rather than implementing any broker routing logic.
-    fn fixture_worker(desktop: Desktop, generation: u64) -> io::Result<Worker> {
+    fn fixture_command(desktop: Desktop) -> Command {
         let mut command = Command::new("python3");
         command.args(["-u", "-c", r#"
 import json, os, sys
@@ -840,6 +826,9 @@ for line in sys.stdin:
     if request.get('cancel'):
         continue
     args = request['arguments']
+    if request['name'] == 'observe' and 'OBSERVATION_FIXTURE' in os.environ:
+        print(os.environ['OBSERVATION_FIXTURE'], flush=True)
+        continue
     if request['name'] == 'launch_application':
         if args['desktop_id'] == 'retire.desktop':
             print(json.dumps({'content':[{'type':'text','text':'completed'}], 'isError':True,
@@ -861,7 +850,11 @@ for line in sys.stdin:
     print(json.dumps({'content':[{'type':'text','text':'app-0000000000000001 win-0000000000000001 obs-0000000000000001'}],
         'structuredContent':content,'isError':False}), flush=True)
 "#, desktop.as_str()]);
-        Worker::from_command(command, generation)
+        command
+    }
+
+    fn fixture_worker(desktop: Desktop, generation: u64) -> io::Result<Worker> {
+        Worker::from_command(fixture_command(desktop), generation)
     }
 
     fn broker() -> Arc<DesktopBroker> {
@@ -888,6 +881,90 @@ for line in sys.stdin:
             json!({"scope":"windows","desktop":desktop}),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn text_only_element_ids_route_after_independent_projection_truncation() {
+        fn spawn(desktop: Desktop, generation: u64) -> io::Result<Worker> {
+            let (_, _, output) = crate::accessibility::tests::oversized_observation_fixture();
+            let mut command = fixture_command(desktop);
+            command.env(
+                "OBSERVATION_FIXTURE",
+                serde_json::to_string(&output.into_mcp_result()).unwrap(),
+            );
+            Worker::from_command(command, generation)
+        }
+        let mut broker = DesktopBroker::new().unwrap();
+        broker.spawn = Some(spawn);
+        let target = list(&broker, "background").await["target"].clone();
+        let result = broker
+            .call(
+                "observe",
+                json!({"target":target,"view":"accessibility"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                std::future::pending(),
+            )
+            .await;
+        assert_ne!(result.is_error, Some(true));
+        assert!(
+            result.meta.is_none(),
+            "private IDs must not reach the model"
+        );
+        let text = &result.content[0].as_text().unwrap().text;
+        let structured = result.structured_content.as_ref().unwrap();
+        let text_ids: Vec<_> = text
+            .lines()
+            .filter_map(|line| {
+                let (id, _) = line.trim_start().split_once(':')?;
+                id.starts_with("e-").then_some(id)
+            })
+            .collect();
+        let id = text_ids
+            .into_iter()
+            .find(|id| {
+                !structured["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|element| element["element_id"] == *id)
+            })
+            .expect("fixture must retain an actionable text element absent from bounded JSON");
+        let local = broker
+            .identities
+            .lock()
+            .unwrap()
+            .public
+            .get(id)
+            .expect("text ID must be published")
+            .local
+            .clone();
+        assert_ne!(id, local);
+        let acted = call(
+            &broker,
+            "act",
+            json!({
+                "target":structured["target"],
+                "source_observation":{"observation_id":structured["observation_id"]},
+                "operation":{"type":"semantic","element_id":id,"action":{"type":"invoke"}}
+            }),
+        )
+        .await;
+        let received: Value = serde_json::from_str(
+            acted["received"]
+                .as_str()
+                .expect("action must reach its worker"),
+        )
+        .unwrap();
+        assert_eq!(received["operation"]["element_id"], local);
+        assert!(broker.foreground.lock().await.is_none());
+        assert!(text.len() <= crate::runtime::MAX_MODEL_TEXT_BYTES);
+        assert!(
+            serde_json::to_vec(structured).unwrap().len()
+                <= crate::runtime::MAX_MODEL_STRUCTURED_BYTES
+        );
+        broker.shutdown().await;
     }
 
     #[tokio::test]
