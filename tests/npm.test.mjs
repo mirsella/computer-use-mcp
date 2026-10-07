@@ -17,7 +17,7 @@ const plugin = (await import(new URL(manifest.exports["./server"], root))).defau
 const binary = fileURLToPath(new URL(manifest.bin["computer-use-mcp"], root));
 
 test("plugin registers the bundled server and synchronized skill idempotently", async () => {
-  const hooks = await plugin.server();
+  const hooks = await plugin.server(undefined, { enabled: true });
   const config = { skills: { paths: ["/existing/skills"] } };
   await hooks.config(config);
   await hooks.config(config);
@@ -38,16 +38,32 @@ test("plugin registers the bundled server and synchronized skill idempotently", 
   );
 });
 
+test("plugin is disabled by default and skips the skill", async () => {
+  const hooks = await plugin.server();
+  const config = { skills: { paths: ["/existing/skills"] } };
+  await hooks.config(config);
+  assert.deepEqual(config.mcp.computer_use, {
+    type: "local",
+    command: [binary, "mcp", "--compact-tools"],
+    enabled: false,
+    timeout: 150_000,
+  });
+  assert.deepEqual(config.skills.paths, ["/existing/skills"]);
+  await assert.rejects(plugin.server(undefined, { enabled: "true" }), /boolean/);
+});
+
 test("explicit MCP settings, disabled state, and permissions take precedence", async () => {
   const hooks = await plugin.server();
-  for (const existing of [
-    { enabled: false },
-    { type: "local", command: ["custom-server", "mcp"], timeout: 1234 },
+  const skillsPath = fileURLToPath(new URL("skills", root));
+  for (const [existing, expectSkills] of [
+    [{ enabled: false }, false],
+    [{ type: "local", command: ["custom-server", "mcp"], timeout: 1234 }, true],
   ]) {
     const config = { mcp: { computer_use: existing }, permission: { "computer_use_*": "ask" } };
     await hooks.config(config);
     assert.strictEqual(config.mcp.computer_use, existing);
     assert.deepEqual(config.permission, { "computer_use_*": "ask" });
+    assert.deepEqual(config.skills, expectSkills ? { paths: [skillsPath] } : undefined);
   }
 });
 
@@ -75,7 +91,7 @@ test("compact mode respects global and agent-specific permissions and tool switc
   ];
   for (const [policy, compact] of cases) {
     const config = structuredClone(policy);
-    const hooks = await plugin.server();
+    const hooks = await plugin.server(undefined, { enabled: true });
     await hooks.config(config);
     assert.deepEqual(config.mcp.computer_use.command, compact
       ? [binary, "mcp", "--compact-tools"] : [binary, "mcp"], JSON.stringify(policy));

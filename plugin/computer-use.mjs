@@ -26,23 +26,27 @@ function requiresDirectTools(config) {
 export default {
   id: "@mirsella/opencode-computer-use-mcp",
   server: async (_input, options) => {
-    const { compactTools = true } = options ?? {};
+    const { enabled = false, compactTools = true } = options ?? {};
+    if (typeof enabled !== "boolean") throw new Error("enabled must be a boolean");
     if (typeof compactTools !== "boolean") throw new Error("compactTools must be a boolean");
     return {
       config(config) {
         config.mcp ??= {};
         if (!config.mcp.computer_use) {
           const compact = compactTools && !requiresDirectTools(config);
-          if (compactTools && !compact) {
+          if (enabled && compactTools && !compact) {
             console.warn("@mirsella/opencode-computer-use-mcp uses direct tools to preserve per-tool permissions");
           }
           config.mcp.computer_use = {
             type: "local",
             command: compact ? [binary, "mcp", "--compact-tools"] : [binary, "mcp"],
-            enabled: true,
+            enabled,
             timeout: 150_000,
           };
         }
+
+        const effectiveEnabled = config.mcp.computer_use.enabled ?? true;
+        if (!effectiveEnabled) return;
 
         config.skills ??= {};
         config.skills.paths ??= [];

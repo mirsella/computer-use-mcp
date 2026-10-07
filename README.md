@@ -64,21 +64,31 @@ Add the package to your OpenCode configuration, using OpenCode 1.18 or newer:
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["@mirsella/opencode-computer-use-mcp"]
+  "plugin": [["@mirsella/opencode-computer-use-mcp", { "enabled": true }]]
 }
 ```
 
 The plugin registers `mcp.computer_use` with the bundled executable, a
-150-second timeout, and the computer-use skill. By default, the model sees only
-`computer_use_help` and `computer_use_dispatch`. Help lists operation names or
-returns one operation's full schema; dispatch executes it through the same
-validation and desktop broker. The skill loads on demand.
+150-second timeout, and the computer-use skill. Without `enabled`, the entry
+shows up in `opencode mcp list` as disabled and the skill stays unloaded.
 
-Per-tool permission or tool-enable rules, including agent-specific rules,
-automatically select the six direct tools so dispatch cannot bypass them.
-To select direct tools explicitly, use
-`["@mirsella/opencode-computer-use-mcp", {"compactTools": false}]` in `plugin`.
-Explicit `mcp.computer_use` settings take precedence, including `enabled: false`.
+When enabled, the model sees `computer_use_help` and
+`computer_use_dispatch`. Help lists operation names or returns one
+operation's full schema; dispatch executes it through the same validation
+and desktop broker. The skill loads on demand.
+
+Settings:
+
+- `enabled` (default `false`): start the server and load the skill. An
+  explicit `mcp.computer_use` entry takes precedence, so
+  `"mcp": { "computer_use": { "enabled": true } }` opts in without plugin
+  options.
+- `compactTools` (default `true`): keep the two compact tools instead of the
+  six direct tools. The plugin switches to direct tools on its own when
+  permission or tool rules, including agent-specific rules, name single
+  `computer_use_*` tools, so those policies keep working. Set it to `false`
+  to always use direct tools.
+
 Quit and restart OpenCode after adding or updating the plugin.
 
 ### Direct MCP configuration
