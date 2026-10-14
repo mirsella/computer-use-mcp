@@ -1,16 +1,16 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import { access, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { constants } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createInterface } from "node:readline";
 import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = process.env.COMPUTER_USE_MCP_PACKAGE_DIR
-  ? pathToFileURL(`${resolve(process.env.COMPUTER_USE_MCP_PACKAGE_DIR)}/`)
+  ? pathToFileURL(`${await realpath(process.env.COMPUTER_USE_MCP_PACKAGE_DIR)}/`)
   : new URL("../", import.meta.url);
 const manifest = JSON.parse(await readFile(new URL("package.json", root), "utf8"));
 const plugin = (await import(new URL(manifest.exports["./server"], root))).default;
@@ -33,55 +33,43 @@ test("Codex packages the same standalone server and canonical skill", async () =
     assert.ok(manifest.files.includes(file), `${file} must ship in the tarball`);
 });
 
-test("plugin enables the bundled server and synchronized skill by default", async () => {
-  const hooks = await plugin.server();
-  const config = { skills: { paths: ["/existing/skills"] } };
-  await hooks.config(config);
-  await hooks.config(config);
-  assert.equal(plugin.id, manifest.name);
-  assert.deepEqual(config.mcp.computer_use, {
-    type: "local",
-    command: [binary, "mcp", "--compact-tools"],
-    enabled: true,
-    timeout: 150_000,
+async function configure(options = {}, permissions = [], existing, listAgents = async () => ({data:[{permissions}]})) {
+  let server = existing;
+  const skills = [];
+  let transform;
+  let prompt;
+  const editor = {get: () => existing, set: (_name, value) => {server = value;}};
+  await plugin.setup({ options,
+    agent: {list: listAgents},
+    mcp: {transform: async fn => {transform=fn; fn(editor);}, reload: async () => transform(editor)},
+    session: {hook: async (_name, fn) => {prompt=fn;}},
+    skill: {transform: async fn => fn({add: skill => skills.push(skill)})},
   });
-  assert.deepEqual(config.skills.paths, [
-    "/existing/skills",
-    fileURLToPath(new URL("skills", root)),
-  ]);
-  assert.equal(
-    await readFile(new URL("skills/computer-use-mcp/SKILL.md", root), "utf8"),
-    await readFile(new URL("../crates/computer-use-mcp/guidance/skill.md", import.meta.url), "utf8"),
-  );
+  await prompt?.();
+  return {server, skills};
+}
+test("native adapter registers its server and skill", async () => {
+  const {server, skills} = await configure();
+  assert.deepEqual(server.command, [binary,"mcp","--compact-tools"]);
+  assert.equal(server.timeout.execution,150000);
+  assert.equal(server.codemode,false);
+  assert.equal(skills.length,1);
+  assert.equal(await readFile(new URL("skills/computer-use-mcp/SKILL.md",root),"utf8"),await readFile(new URL("../crates/computer-use-mcp/guidance/skill.md",import.meta.url),"utf8"));
 });
-
-test("plugin allows explicit disablement and skips the skill", async () => {
-  const hooks = await plugin.server(undefined, { enabled: false });
-  const config = { skills: { paths: ["/existing/skills"] } };
-  await hooks.config(config);
-  assert.deepEqual(config.mcp.computer_use, {
-    type: "local",
-    command: [binary, "mcp", "--compact-tools"],
-    enabled: false,
-    timeout: 150_000,
-  });
-  assert.deepEqual(config.skills.paths, ["/existing/skills"]);
-  await assert.rejects(plugin.server(undefined, { enabled: "true" }), /boolean/);
+test("disablement, custom MCPs and invalid options", async () => {
+  assert.deepEqual((await configure({enabled:false})).skills,[]);
+  await assert.rejects(configure({enabled:"yes"}),/boolean/);
+  const existing={type:"local",command:["custom","mcp"],disabled:false};
+  assert.strictEqual((await configure({},[],existing)).server,existing);
 });
-
-test("explicit MCP settings, disabled state, and permissions take precedence", async () => {
-  const hooks = await plugin.server();
-  const skillsPath = fileURLToPath(new URL("skills", root));
-  for (const [existing, expectSkills] of [
-    [{ enabled: false }, false],
-    [{ type: "local", command: ["custom-server", "mcp"], timeout: 1234 }, true],
-  ]) {
-    const config = { mcp: { computer_use: existing }, permission: { "computer_use_*": "ask" } };
-    await hooks.config(config);
-    assert.strictEqual(config.mcp.computer_use, existing);
-    assert.deepEqual(config.permission, { "computer_use_*": "ask" });
-    assert.deepEqual(config.skills, expectSkills ? { paths: [skillsPath] } : undefined);
-  }
+test("direct tools and custom registrations do not wait on agent catalogs", async () => {
+  const catalog = () => { throw new Error("agent catalog must not be read"); };
+  const direct = await configure({compactTools:false}, [], undefined, catalog);
+  assert.deepEqual(direct.server.command, [binary, "mcp"]);
+  const custom = {type:"local", command:["custom","mcp"], disabled:false};
+  const existing = await configure({}, [], custom, catalog);
+  assert.strictEqual(existing.server, custom);
+  assert.equal(existing.skills.length, 1);
 });
 
 test("bundled executable has the package version", async () => {
@@ -89,36 +77,13 @@ test("bundled executable has the package version", async () => {
   assert.equal(execFileSync(binary, ["version"], { encoding: "utf8" }).trim(), manifest.version);
 });
 
-test("compact mode respects global and agent-specific permissions and tool switches", async (t) => {
-  const warn = t.mock.method(console, "warn", () => {});
-  const cases = [
-    [{ permission: { "*": "allow", "computer_use_*": "ask" } }, true],
-    [{ permission: "ask" }, true],
-    [{ tools: { "computer_use_*": false } }, true],
-    [{ permission: { computer_use_dispatch: "deny" } }, true],
-    [{ permission: { computer_use_act: "ask" } }, false],
-    [{ permission: { "computer_use_*": "allow", computer_use_observe: "deny" } }, false],
-    [{ permission: { "computer_use_a*": "deny" } }, false],
-    [{ permission: { "computer_use_ac?": "ask" } }, false],
-    [{ permission: { "computer_use_act.extra": "deny" } }, true],
-    [{ tools: { computer_use_launch_application: false } }, false],
-    [{ agent: { reviewer: { permission: { computer_use_act: "deny" } } } }, false],
-    [{ agent: { reviewer: { tools: { computer_use_wait_for: false } } } }, false],
-    [{ agent: { reviewer: { permission: { "computer_use_*": "ask" } } } }, true],
-  ];
-  for (const [policy, compact] of cases) {
-    const config = structuredClone(policy);
-    const hooks = await plugin.server(undefined, { enabled: true });
-    await hooks.config(config);
-    assert.deepEqual(config.mcp.computer_use.command, compact
-      ? [binary, "mcp", "--compact-tools"] : [binary, "mcp"], JSON.stringify(policy));
-    for (const key of Object.keys(policy)) assert.deepEqual(config[key], policy[key]);
+test("native per-tool rules select direct tools", async () => {
+  for (const action of ["computer_use_act","computer_use_observe","computer_use_a*"]) {
+    const {server}=await configure({},[{action,resource:"*",effect:"ask"}]);
+    assert.deepEqual(server.command,[binary,"mcp"]);
   }
-  assert.equal(warn.mock.callCount(), cases.filter(([, compact]) => !compact).length);
-  const config = {};
-  await (await plugin.server(undefined, { compactTools: false })).config(config);
-  assert.deepEqual(config.mcp.computer_use.command, [binary, "mcp"]);
-  await assert.rejects(plugin.server(undefined, { compactTools: "false" }), /boolean/);
+  const {server}=await configure({},[{action:"computer_use_*",resource:"*",effect:"ask"}]);
+  assert.equal(server.command.at(-1),"--compact-tools");
 });
 
 async function connect(t, compact, protocolVersion = "2025-11-25") {
@@ -183,9 +148,8 @@ test("compact MCP discovers exact schemas and preserves direct validation withou
     (condition) => condition.properties.type.const === "human_idle",
   ));
   assert.equal(wait.inputSchema.properties.timeout_ms.maximum, 120_000);
-  const config = {};
-  await (await plugin.server()).config(config);
-  assert.ok(config.mcp.computer_use.timeout > wait.inputSchema.properties.timeout_ms.maximum,
+  const { server } = await configure();
+  assert.ok(server.timeout.execution > wait.inputSchema.properties.timeout_ms.maximum,
     "the host timeout must cover the server's longest bounded wait");
   const { result: compactList } = await compact.request("tools/list");
   assert.deepEqual(compactList.tools.map((tool) => tool.name), ["help", "dispatch"]);

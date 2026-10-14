@@ -16,6 +16,16 @@ See [MCP.md](MCP.md) for setup and the six-tool public contract,
 [SECURITY.md](SECURITY.md) for trust boundaries, and
 [ARCHITECTURE.md](ARCHITECTURE.md) for implementation authorities.
 
+
+Package 2.x targets OpenCode v2 (2.0.27 or newer). Package 1.x retains the
+OpenCode v1 adapter (1.18 or newer, below 2). Codex uses the same Rust MCP
+server and manifests in both releases. The native v2 adapter uses
+`@opencode/plugin`; local directories also expose a physical `server` entrypoint.
+
+Until these releases are published, use the v2 worktree through a `file://`
+plugin reference and its packaged Codex marketplace. The v1 and v2 preparation
+worktrees are independent; neither requires changing an installed package.
+
 ## Requirements
 
 - KDE Plasma Wayland with `kwin_wayland` and the KDE desktop portals
@@ -80,7 +90,7 @@ codex plugin add computer-use@computer-use-mcp
 Both integrations enable Computer Use by default. To disable it in Codex,
 set `enabled = false` in `[plugins."computer-use@computer-use-mcp"]` in
 `~/.codex/config.toml`. In OpenCode, set the plugin option `enabled` to `false`
-or disable `mcp.computer_use`.
+or disable `mcp.servers.computer_use`.
 
 For direct Codex MCP registration, use the installed executable:
 
@@ -97,16 +107,16 @@ migration. To use a GitHub release in OpenCode, set the plugin entry to
 
 ## OpenCode setup
 
-Add the package to your OpenCode configuration, using OpenCode 1.18 or newer:
+Add the package to your OpenCode configuration, using OpenCode 2.0.27 or newer:
 
 ```jsonc
 {
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": ["@mirsella/opencode-computer-use-mcp"]
+  "$schema": "https://opencode.ai/v2/config.json",
+  "plugins": ["@mirsella/opencode-computer-use-mcp"]
 }
 ```
 
-The plugin registers `mcp.computer_use` with the bundled executable, a
+The native v2 plugin registers `mcp.servers.computer_use` with the bundled executable, a
 150-second timeout, and the computer-use skill. It is enabled by default.
 
 When enabled, the model sees `computer_use_help` and
@@ -117,7 +127,7 @@ and desktop broker. The skill loads on demand.
 Settings:
 
 - `enabled` (default `true`): start the server and load the skill. Set it to
-  `false` to disable both. An explicit `mcp.computer_use` entry takes precedence.
+  `false` to disable both. An explicit `mcp.servers.computer_use` entry takes precedence.
 - `compactTools` (default `true`): keep the two compact tools instead of the
   six direct tools. The plugin switches to direct tools on its own when
   permission or tool rules, including agent-specific rules, name single
@@ -137,16 +147,19 @@ This example asks for review before each tool call:
 
 ```jsonc
 {
-  "$schema": "https://opencode.ai/config.json",
+  "$schema": "https://opencode.ai/v2/config.json",
   "mcp": {
-    "computer_use": {
-      "type": "local",
-      "command": ["npx", "-y", "@mirsella/opencode-computer-use-mcp", "mcp"],
-      "enabled": true,
-      "timeout": 150000
+    "servers": {
+      "computer_use": {
+        "type": "local",
+        "command": ["pnpm", "dlx", "@mirsella/opencode-computer-use-mcp", "mcp"],
+        "disabled": false,
+        "codemode": false,
+        "timeout": { "execution": 150000 }
+      }
     }
   },
-  "permission": { "computer_use_*": "ask" }
+  "permissions": [{ "action": "computer_use_*", "resource": "*", "effect": "ask" }]
 }
 ```
 

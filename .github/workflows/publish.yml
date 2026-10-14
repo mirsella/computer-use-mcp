@@ -26,6 +26,11 @@ jobs:
         with:
           node-version: 24
           package-manager-cache: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - name: Install JavaScript dependencies
+        run: pnpm install --frozen-lockfile
 
       - name: Install native dependencies
         run: |
@@ -42,15 +47,17 @@ jobs:
           cargo test --locked --workspace --all-features
 
       - name: Build npm tarball
-        run: npm pack
+        run: pnpm pack
 
       - name: Test the packed plugin and MCP executable
         run: |
-          mkdir -p target/npm-package-test
-          tar -xzf mirsella-opencode-computer-use-mcp-*.tgz -C target/npm-package-test
-          COMPUTER_USE_MCP_PACKAGE_DIR=target/npm-package-test/package npm test
+          consumer=$(mktemp -d "$RUNNER_TEMP/computer-use-consumer.XXXXXX")
+          printf '{"name":"package-consumer","private":true}\n' > "$consumer/package.json"
+          pnpm --dir "$consumer" add "$GITHUB_WORKSPACE"/mirsella-opencode-computer-use-mcp-*.tgz @opencode/plugin@2.0.28
+          package="$consumer/node_modules/@mirsella/opencode-computer-use-mcp"
+          COMPUTER_USE_MCP_PACKAGE_DIR="$package" pnpm test
           python3 -B -m unittest discover -s scripts -p 'test_model_smoke.py'
-          ldd target/npm-package-test/package/vendor/bin/computer-use-mcp
+          ldd "$package/vendor/bin/computer-use-mcp"
 
       - name: Checksum release package
         run: sha256sum mirsella-opencode-computer-use-mcp-*.tgz > SHA256SUMS
