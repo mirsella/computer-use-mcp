@@ -10,18 +10,22 @@ const path = fileURLToPath(new URL("../skills/computer-use-mcp/SKILL.md", import
 const tools = ["list_desktop", "launch_application", "activate_window", "observe", "act", "wait_for"].map(name => `computer_use_${name}`);
 
 const exec = promisify(execFile);
+const desktopEnvironmentKeys = ["XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "DISPLAY", "XAUTHORITY", "XDG_SESSION_TYPE", "DBUS_SESSION_BUS_ADDRESS"];
 
 // The MCP reaches the compositor, portal, and session bus through the graphical
 // session environment. A harness started by a service manager (e.g. `opencode serve`
-// under T3) can lack it, so fill absent or empty values from the systemd user manager.
+// under T3) can lack it, so fill the missing values from the systemd user manager
+// rather than duplicating the whole process environment into the MCP configuration.
 async function sessionEnvironment() {
-  const environment = { ...process.env };
-  if (environment.WAYLAND_DISPLAY && environment.XDG_SESSION_TYPE) return environment;
+  if (process.env.WAYLAND_DISPLAY && process.env.XDG_SESSION_TYPE) return {};
   const { stdout = "" } = await exec("systemctl", ["--user", "show-environment"], { timeout: 5_000 })
     .catch(error => { console.warn(`Computer Use MCP could not read the desktop session environment: ${error.message}`); return {}; });
+  const environment = {};
   for (const line of stdout.split("\n")) {
     const separator = line.indexOf("=");
-    if (separator > 0) environment[line.slice(0, separator)] ||= line.slice(separator + 1);
+    if (separator <= 0) continue;
+    const key = line.slice(0, separator);
+    if (desktopEnvironmentKeys.includes(key) && !process.env[key]) environment[key] = line.slice(separator + 1);
   }
   return environment;
 }

@@ -71,16 +71,18 @@ async function withSystemctl(stub, run) {
 }
 
 test("a harness outside the session falls back to the systemd user environment", async () => {
-  const stub = ["WAYLAND_DISPLAY=wayland-stub", "XDG_SESSION_TYPE=wayland", "DISPLAY=:9", "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/stub/bus", "PATH=/stub/bin"];
+  const stub = ["WAYLAND_DISPLAY=wayland-stub", "XDG_SESSION_TYPE=wayland", "DISPLAY=:9", "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/stub/bus", "XDG_RUNTIME_DIR=/stub/run", "PATH=/stub/bin"];
   await withSystemctl(stub, async () => {
     for (const key of ["WAYLAND_DISPLAY", "XDG_SESSION_TYPE", "DBUS_SESSION_BUS_ADDRESS"]) delete process.env[key];
     process.env.DISPLAY = "";
+    process.env.XDG_RUNTIME_DIR = "/run/user/test";
     const { server } = await configure();
     assert.equal(server.environment.WAYLAND_DISPLAY, "wayland-stub");
     assert.equal(server.environment.XDG_SESSION_TYPE, "wayland");
     assert.equal(server.environment.DISPLAY, ":9", "an empty variable must not shadow the session value");
     assert.equal(server.environment.DBUS_SESSION_BUS_ADDRESS, "unix:path=/run/stub/bus");
-    assert.equal(server.environment.PATH, process.env.PATH, "the process environment wins over the session manager");
+    assert.equal(server.environment.XDG_RUNTIME_DIR, undefined, "present variables are not copied from the session manager");
+    assert.equal(server.environment.PATH, undefined, "the process environment is not duplicated into the configuration");
   });
 });
 
