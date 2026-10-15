@@ -74,6 +74,16 @@ fn tools_list_wire_has_exact_contract_and_stays_within_budget() {
 }
 
 #[test]
+fn compact_tools_advertise_only_real_desktop_actions() {
+    for tool in compact_tool_definitions() {
+        assert_eq!(
+            tool.input_schema.get("properties").unwrap()["action"]["enum"],
+            json!(TOOL_NAMES)
+        );
+    }
+}
+
+#[test]
 fn compact_startup_and_on_demand_workflow_have_bounded_context() {
     let wire = ServerJsonRpcMessage::response(
         ServerResult::ListToolsResult(ListToolsResult::with_all_items(

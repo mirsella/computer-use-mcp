@@ -279,6 +279,10 @@ export COMPUTER_USE_MCP_VIRTUAL_SESSION=1
 export COMPUTER_USE_MCP_DISPLAY="$WAYLAND_DISPLAY"
 export COMPUTER_USE_MCP_ISOLATION_MARKER="$ISOLATION_MARKER"
 
+# This compositor is privately owned, so rich geometry/control authority is safe
+# to enable by default. Preserve an explicit opt-out, including an empty value.
+export COMPUTER_USE_MCP_KDE_WINDOW_MANAGEMENT="${COMPUTER_USE_MCP_KDE_WINDOW_MANAGEMENT-1}"
+
 # Do not let clients discover the physical X11 display, accessibility bus, or
 # session bus.  The private AT-SPI value is exported after these are removed.
 unset DISPLAY XAUTHORITY AT_SPI_BUS_ADDRESS DBUS_STARTER_ADDRESS DBUS_STARTER_BUS_TYPE \
@@ -310,6 +314,14 @@ process_alive() {
     [ -n "$state" ] && [[ "$state" != Z* ]]
 }
 
+# Preserve diagnostics before cleanup removes them; compositor logs can expose titles.
+report_service_log() {
+    local label="$1" log="$RUNTIME_DIR/$1.log"
+    [[ "$label" != compositor && -f "$log" && -s "$log" ]] || return 0
+    printf 'run-isolated-session.sh: %s log follows\n' "$label" >&2
+    tail -n 10 -- "$log" >&2 || true
+}
+
 wait_for_socket() {
     local label="$1"
     local socket="$2"
@@ -320,10 +332,12 @@ wait_for_socket() {
         fi
         if ! process_alive "${SERVICE_PID_BY_LABEL[$label]}"; then
             printf 'run-isolated-session.sh: %s exited before creating socket %s\n' "$label" "$socket" >&2
+            report_service_log "$label"
             return 1
         fi
         if [ "$SECONDS" -ge "$deadline" ]; then
             printf 'run-isolated-session.sh: %s socket was not created: %s\n' "$label" "$socket" >&2
+            report_service_log "$label"
             return 1
         fi
         sleep 0.05
@@ -335,6 +349,7 @@ wait_for_process() {
     while :; do
         if ! process_alive "${SERVICE_PID_BY_LABEL[$label]}"; then
             printf 'run-isolated-session.sh: %s exited during startup\n' "$label" >&2
+            report_service_log "$label"
             return 1
         fi
         # A successful exec that remains alive is sufficient for services with
@@ -344,6 +359,7 @@ wait_for_process() {
             return 0
         fi
         printf 'run-isolated-session.sh: %s exited during startup\n' "$label" >&2
+        report_service_log "$label"
         return 1
     done
 }
@@ -357,6 +373,7 @@ wait_for_bus_name() {
     while :; do
         if ! process_alive "${SERVICE_PID_BY_LABEL[$label]}"; then
             printf 'run-isolated-session.sh: %s exited before owning D-Bus name %s\n' "$label" "$name" >&2
+            report_service_log "$label"
             return 1
         fi
         if reply="$("$DBUS_SEND_BIN" --bus="$address" --print-reply=literal \
@@ -372,12 +389,14 @@ wait_for_bus_name() {
                         return 0
                     fi
                     printf 'run-isolated-session.sh: %s exited during startup\n' "$label" >&2
+                    report_service_log "$label"
                     return 1
                     ;;
             esac
         fi
         if [ "$SECONDS" -ge "$deadline" ]; then
             printf 'run-isolated-session.sh: %s did not own D-Bus name %s\n' "$label" "$name" >&2
+            report_service_log "$label"
             return 1
         fi
         sleep 0.05
@@ -443,7 +462,13 @@ install_private_portal_authorization
 # KWin makes its own /proc environment unreadable after startup.  Keep a
 # launcher-owned supervisor in the process group so the marker can still prove
 # the private launch environment without weakening checks for other services.
-start_owned compositor "$BASH" -c 'set +e; "$@" & child="$!"; trap "kill -TERM $child 2>/dev/null || true; wait $child 2>/dev/null || true; exit 143" TERM INT; wait "$child"; status="$?"; trap - TERM INT; exit "$status"' isolated-compositor "$COMPOSITOR_BIN" \
+# The owned compositor has no installed desktop-file grants for this executable.
+# Expose its privileged interfaces only in this disposable private session.
+private_kwin_permissions=0
+case "$COMPUTER_USE_MCP_KDE_WINDOW_MANAGEMENT" in
+    1|true|yes) private_kwin_permissions=1 ;;
+esac
+KWIN_WAYLAND_NO_PERMISSION_CHECKS="$private_kwin_permissions" start_owned compositor "$BASH" -c 'set +e; "$@" & child="$!"; trap "kill -TERM $child 2>/dev/null || true; wait $child 2>/dev/null || true; exit 143" TERM INT; wait "$child"; status="$?"; trap - TERM INT; exit "$status"' isolated-compositor "$COMPOSITOR_BIN" \
     --virtual --socket "$WAYLAND_DISPLAY" \
     --width "$WIDTH" --height "$HEIGHT" --scale "$SCALE" \
     --output-count 1 --no-lockscreen --no-global-shortcuts --no-kactivities
@@ -459,11 +484,31 @@ wait_for_process wireplumber
 # XDG_RUNTIME_DIR/at-spi; the explicit address keeps clients out of the
 # physical accessibility bus and lets the registry be owned by this process
 # group rather than by ambient D-Bus activation.
-start_owned atspi_bus "$ATSPI_BUS_BIN" --launch-immediately --a11y=1
+#
+# These launcher builds reject --a11y=1 despite advertising it in usage.
+# Enable accessibility through the private bus's status interface instead.
+start_owned atspi_bus "$ATSPI_BUS_BIN" --launch-immediately
 wait_for_socket atspi_bus "$RUNTIME_DIR/at-spi/bus"
 start_owned atspi_registry "$ATSPI_REGISTRY_BIN" --dbus-name org.a11y.atspi.Registry
 wait_for_bus_name atspi_registry "$AT_SPI_BUS_ADDRESS" org.a11y.atspi.Registry
 wait_for_bus_name atspi_bus "$DBUS_SESSION_BUS_ADDRESS" org.a11y.Bus
+
+if ! "$DBUS_SEND_BIN" --bus="$DBUS_SESSION_BUS_ADDRESS" --print-reply \
+    --dest=org.a11y.Bus /org/a11y/bus org.freedesktop.DBus.Properties.Set \
+    string:org.a11y.Status string:IsEnabled variant:boolean:true >/dev/null; then
+    printf 'run-isolated-session.sh: cannot enable private AT-SPI status\n' >&2
+    exit 1
+fi
+atspi_status="$("$DBUS_SEND_BIN" --bus="$DBUS_SESSION_BUS_ADDRESS" --print-reply \
+    --dest=org.a11y.Bus /org/a11y/bus org.freedesktop.DBus.Properties.Get \
+    string:org.a11y.Status string:IsEnabled)"
+case "$atspi_status" in
+    *'boolean true'*) ;;
+    *)
+        printf 'run-isolated-session.sh: private AT-SPI status remained disabled\n' >&2
+        exit 1
+        ;;
+esac
 
 # Start both sides explicitly.  The private bus is not launched with
 # systemd activation, so the SystemdService field in portal service files

@@ -22,7 +22,7 @@ use rmcp::{
 };
 use serde_json::{Map, Value, json};
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
 };
 
@@ -43,6 +43,7 @@ const RUNNER: &str = include_str!("../run-isolated-session.sh");
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_PIPE_FRAME: usize = 64 * 1024 * 1024;
+const MAX_STARTUP_DIAGNOSTIC_BYTES: usize = 4096;
 const RETIRED_RECOVERY: &str = "Session retired; its IDs are invalid. Call list_desktop on the intended desktop, then observe a fresh target. Inspect state before repeating any action whose outcome is unknown or completed.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,6 +243,8 @@ struct Worker {
     output: PipeReader<BufReader<ChildStdout>>,
     generation: u64,
     abandoned: bool,
+    startup_diagnostics: Arc<Mutex<Vec<u8>>>,
+    stderr_task: tokio::task::JoinHandle<()>,
 }
 
 impl Worker {
@@ -274,9 +277,35 @@ impl Worker {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .process_group(0);
         let mut child = command.spawn()?;
+        let mut stderr = child.stderr.take().expect("piped worker stderr");
+        let startup_diagnostics = Arc::new(Mutex::new(Vec::new()));
+        let diagnostics = Arc::clone(&startup_diagnostics);
+        let stderr_task = tokio::spawn(async move {
+            let mut chunk = [0; 1024];
+            loop {
+                match stderr.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        eprint!("{}", String::from_utf8_lossy(&chunk[..count]));
+                        let mut tail = diagnostics
+                            .lock()
+                            .expect("startup diagnostic lock poisoned");
+                        tail.extend_from_slice(&chunk[..count]);
+                        if tail.len() > MAX_STARTUP_DIAGNOSTIC_BYTES {
+                            let excess = tail.len() - MAX_STARTUP_DIAGNOSTIC_BYTES;
+                            tail.drain(..excess);
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("computer-use-mcp: cannot read worker diagnostics: {error}");
+                        break;
+                    }
+                }
+            }
+        });
         Ok(Self {
             input: Some(child.stdin.take().expect("piped worker stdin")),
             output: PipeReader::new(BufReader::new(
@@ -285,7 +314,28 @@ impl Worker {
             child,
             generation,
             abandoned: false,
+            startup_diagnostics,
+            stderr_task,
         })
+    }
+
+    async fn startup_failure(&mut self, mut error: RuntimeError) -> RuntimeError {
+        // EOF can reach stdout before the stderr reader has drained the final
+        // startup failure. Bound that drain even if a child keeps stderr open.
+        let _ = tokio::time::timeout(Duration::from_millis(100), &mut self.stderr_task).await;
+        let diagnostics = self
+            .startup_diagnostics
+            .lock()
+            .expect("startup diagnostic lock poisoned");
+        if !diagnostics.is_empty() {
+            error.message.push_str("\nStartup diagnostics:\n");
+            error
+                .message
+                .push_str(String::from_utf8_lossy(&diagnostics).trim());
+        }
+        error.retryable = false;
+        error.recovery = "Desktop startup failed before dispatch. Inspect the startup diagnostics and repair the prerequisite or configuration before trying discovery again. Do not blindly repeat unchanged startup. No application input was dispatched.".into();
+        error
     }
 
     async fn send(&mut self, value: &Value) -> io::Result<()> {
@@ -328,6 +378,7 @@ impl Drop for Worker {
         // Covers transport-task abortion as well as normal shutdown. TERM lets
         // the runner's EXIT trap reap its separately owned service groups.
         self.signal(rustix::process::Signal::TERM);
+        self.stderr_task.abort();
     }
 }
 
@@ -477,6 +528,14 @@ impl DesktopBroker {
                 result
             };
             if let Err(error) = startup {
+                let error = if error.code == "desktop_worker_failed" {
+                    slot.as_mut()
+                        .expect("failed startup worker")
+                        .startup_failure(error)
+                        .await
+                } else {
+                    error
+                };
                 stop_slot(&mut slot).await;
                 return Err(error);
             }
@@ -907,6 +966,40 @@ for line in sys.stdin:
             json!({"scope":"windows","desktop":desktop}),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn startup_failure_returns_bounded_diagnostics_without_blind_retry() {
+        fn spawn(_: Desktop, generation: u64) -> io::Result<Worker> {
+            let mut command = Command::new("python3");
+            command.args([
+                "-c",
+                "import sys; sys.stderr.write('x' * 8192 + '\\natspi_bus: unsupported option --a11y=1\\n'); sys.exit(17)",
+            ]);
+            Worker::from_command(command, generation)
+        }
+        let mut broker = DesktopBroker::new().unwrap();
+        broker.spawn = Some(spawn);
+        let result = broker
+            .call(
+                "list_desktop",
+                json!({"scope":"windows","desktop":"background"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                std::future::pending(),
+            )
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        let error = result.structured_content.unwrap();
+        assert_eq!(error["code"], "desktop_worker_failed");
+        assert_eq!(error["outcome"], "not_started");
+        assert_eq!(error["retryable"], false);
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains("atspi_bus: unsupported option --a11y=1"));
+        assert!(message.len() <= MAX_STARTUP_DIAGNOSTIC_BYTES + 100);
+        assert!(error["recovery"].as_str().unwrap().contains("repair"));
+        assert!(broker.background.lock().await.is_none());
     }
 
     #[tokio::test]

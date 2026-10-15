@@ -43,7 +43,7 @@ use crate::{
     wayland_catalog::WaylandCatalog,
     window_backend::{
         AtspiBinding, BackendError, BackendKind, BackendStatus, CapabilityState, CatalogError,
-        WindowCatalog, WindowEntry, WindowGeometry, WindowTarget,
+        WindowCatalog, WindowEntry, WindowGeometry,
     },
 };
 
@@ -447,6 +447,7 @@ struct Cache {
     element_generation: u64,
     input_generation: HumanInputGeneration,
     observations: Vec<CachedObservation>,
+    human_input_invalidated: bool,
 }
 
 const MAX_CACHED_OBSERVATIONS: usize = 8;
@@ -475,6 +476,7 @@ impl Cache {
         }
         snapshot.element_ids = element_ids;
         let snapshot = Arc::new(snapshot);
+        self.human_input_invalidated = false;
         self.observations
             .retain(|cached| !same_target(&cached.snapshot, &snapshot));
         self.observations.push(CachedObservation {
@@ -499,7 +501,9 @@ impl Cache {
             .iter()
             .find(|cached| observation_id_for_snapshot(&cached.snapshot) == observation_id)
             .ok_or_else(|| {
-                if self.observations.is_empty() {
+                if self.human_input_invalidated {
+                    human_input_invalidated_error()
+                } else if self.observations.is_empty() {
                     state_required_error("no observation is available; call observe first")
                 } else {
                     stale_observation_error(format!("observation_id {observation_id:?} is stale"))
@@ -513,7 +517,11 @@ impl Cache {
             .iter()
             .position(|cached| cached.snapshot.generation == expected.generation)
             .ok_or_else(|| {
-                state_required_error("state cache lost the observation before action dispatch")
+                if self.human_input_invalidated {
+                    human_input_invalidated_error()
+                } else {
+                    state_required_error("state cache lost the observation before action dispatch")
+                }
             })?;
         if !same_target(&self.observations[position].snapshot, expected) {
             return Err(stale_observation_error(
@@ -538,6 +546,12 @@ impl Cache {
 
     fn invalidate_all(&mut self) {
         self.observations.clear();
+        self.human_input_invalidated = false;
+    }
+
+    fn invalidate_for_human_input(&mut self) {
+        self.invalidate_all();
+        self.human_input_invalidated = true;
     }
 
     fn frame_for_target(
@@ -557,7 +571,9 @@ impl Cache {
                 })
             })
             .ok_or_else(|| {
-                if frame_id.is_some() {
+                if self.human_input_invalidated {
+                    human_input_invalidated_error()
+                } else if frame_id.is_some() {
                     stale_observation_error(
                         "frame_id is unknown, stale, or belongs to another target",
                     )
@@ -1206,10 +1222,11 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                     );
                     operational_error(format!("Wayland catalog snapshot failed: {error}"))
                 })?;
+                let compositor_source = compositor.enumerated_backend();
                 let (entries, membership_generation) = {
                     let mut catalog = self.lock_catalog()?;
                     let entries = catalog
-                        .reconcile_sources(&apps, compositor.records)
+                        .reconcile_sources(&apps, compositor.records, compositor_source)
                         .map_err(catalog_error)?;
                     (entries, catalog.membership_generation())
                 };
@@ -1274,10 +1291,8 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
 
     fn target_entry(&self, target: &TargetRef) -> Result<WindowEntry, RuntimeError> {
         self.lock_catalog()?
-            .get(&WindowTarget {
-                app_instance_id: target.app_instance_id.clone(),
-                window_instance_id: target.window_instance_id.clone(),
-            })
+            .get(target)
+            .cloned()
             .map_err(catalog_error)
     }
 
@@ -1296,8 +1311,9 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             );
             operational_error(format!("Wayland catalog snapshot failed: {error}"))
         })?;
+        let compositor_source = compositor.enumerated_backend();
         self.lock_catalog()?
-            .reconcile_sources(&apps, compositor.records)
+            .reconcile_sources(&apps, compositor.records, compositor_source)
             .map_err(catalog_error)?;
         Ok((apps, [compositor.standard, compositor.kde]))
     }
@@ -1516,7 +1532,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                     "kde-plasma",
                     "protocol_state_verified",
                     true,
-                    "active_transition_observed",
+                    "active_state_verified",
                     false,
                     true,
                     true,
@@ -2217,7 +2233,11 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                     element_id: &element_id,
                     deadline,
                     condition: condition_for_output,
-                    predicate: move |node: &NodeInfo| node.value.as_deref() == Some(value.as_str()),
+                    predicate: move |node: &NodeInfo| {
+                        node.value.as_deref().or_else(|| {
+                            node.text.as_deref().filter(|_| node.text_truncated != Some(true))
+                        }) == Some(value.as_str())
+                    },
                     success_message:
                         "the later accessibility observation reported the requested element value",
                 })
@@ -2286,10 +2306,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                             app_id.strip_suffix(".desktop").unwrap_or(app_id) == requested_app_id
                         })
                     })
-                    .map(|entry| TargetRef {
-                        app_instance_id: entry.target.app_instance_id.clone(),
-                        window_instance_id: entry.target.window_instance_id.clone(),
-                    })
+                    .map(|entry| entry.target.clone())
             };
             if let Some(found) = found {
                 return Ok(wait_output(
@@ -2337,14 +2354,15 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         deadline: tokio::time::Instant,
         condition: WaitCondition,
     ) -> Result<ToolOutput, RuntimeError> {
-        let mut matched_target = None;
+        if target.is_some_and(|target| target.window_instance_id != window_instance_id) {
+            return Err(RuntimeError::invalid_arguments(
+                "window_closed target.window_instance_id must match condition.window_instance_id",
+            ));
+        }
+        let mut matched: Option<(TargetRef, BackendKind)> = None;
         loop {
-            if self
-                .refresh_window_catalog_for_wait(deadline)
-                .await?
-                .is_none()
-            {
-                if let Some(matched_target) = matched_target.as_ref() {
+            let Some(backends) = self.refresh_window_catalog_for_wait(deadline).await? else {
+                if let Some((matched_target, _)) = &matched {
                     return Ok(wait_output(
                         Some(matched_target),
                         condition,
@@ -2359,39 +2377,52 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                     true,
                     "Retry after the window catalog becomes available; absence from an unavailable catalog is not closure evidence.",
                 ));
-            }
-            let observed_target = {
-                let catalog = self.lock_catalog()?;
-                catalog
-                    .entries()
-                    .find(|entry| entry.target.window_instance_id == window_instance_id)
-                    .map(|entry| TargetRef {
-                        app_instance_id: entry.target.app_instance_id.clone(),
-                        window_instance_id: entry.target.window_instance_id.clone(),
-                    })
             };
-            if matched_target.is_none() {
-                matched_target = match target {
-                    Some(target) => {
-                        if target.window_instance_id != window_instance_id {
-                            return Err(RuntimeError::invalid_arguments(
-                                "window_closed target.window_instance_id must match condition.window_instance_id",
-                            ));
-                        }
-                        self.target_entry(target)?;
-                        Some(target.clone())
-                    }
-                    None => Some(observed_target.clone().ok_or_else(|| {
-                        RuntimeError::stale(
+            let (present, matched_target, source) = {
+                let catalog = self.lock_catalog()?;
+                if matched.is_none() {
+                    let (known, source) = catalog.known_window(window_instance_id)
+                        .ok_or_else(|| RuntimeError::stale(
                             StaleAuthority::Catalog,
-                            "window_closed requires the exact window to be present in the initial authoritative catalog snapshot",
-                        )
-                    })?),
+                            "window_closed requires a current or authoritatively retired identity; unknown, evicted, or interrupted identities cannot prove closure",
+                        ))?;
+                    if target.is_some_and(|target| target.app_instance_id != known.app_instance_id)
+                    {
+                        return Err(RuntimeError::stale(
+                            StaleAuthority::Catalog,
+                            "window_closed target does not match the observed application identity",
+                        ));
+                    }
+                    matched = Some((known, source));
+                }
+                let (matched_target, source) =
+                    matched.as_ref().expect("catalog identity established");
+                let present = catalog.get(matched_target).is_ok();
+                if !present && catalog.known_window(window_instance_id).is_none() {
+                    return Err(RuntimeError::stale(
+                        StaleAuthority::Catalog,
+                        "window catalog continuity was lost without authoritative closure evidence; rediscover the target",
+                    ));
+                }
+                (present, matched_target, source)
+            };
+            if !present {
+                let available = match source {
+                    BackendKind::Atspi => true, // Discovery succeeded above.
+                    BackendKind::ForeignToplevel => matches!(backends[0], BackendStatus::Supported),
+                    BackendKind::KdePlasma => matches!(backends[1], BackendStatus::Supported),
                 };
-            }
-            if observed_target.is_none() {
+                if !available {
+                    return Err(RuntimeError::new(
+                        "backend_unavailable",
+                        "window closure cannot be verified while its catalog authority is unavailable",
+                        ToolOutcome::NotStarted,
+                        true,
+                        "Retry the same window_closed wait when its backend is available; missing backend evidence is not closure.",
+                    ));
+                }
                 return Ok(wait_output(
-                    matched_target.as_ref(),
+                    Some(matched_target),
                     condition,
                     true,
                     "a later catalog snapshot no longer reports the window",
@@ -2400,7 +2431,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 return Ok(wait_output(
-                    matched_target.as_ref(),
+                    Some(matched_target),
                     condition,
                     false,
                     "the window was still present at the deadline",
@@ -2469,7 +2500,9 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             || evidence.mapping.portal_session_identity != mapping.portal_session_identity
             || evidence.mapping.portal_session_generation != mapping.portal_session_generation
             || evidence.mapping.stream != mapping.stream
-            || evidence.mapping.source.generation <= mapping.source.generation
+            || evidence.mapping.source.generation < mapping.source.generation
+            || (evidence.mapping.source.generation == mapping.source.generation
+                && !matches!(condition, WaitCondition::FrameStable { .. }))
             || evidence.mapping.output_size.0 == 0
             || evidence.mapping.output_size.1 == 0
         {
@@ -2673,7 +2706,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 self.takeover.record_activity();
             }
             self.clear_click_grace();
-            self.lock_cache()?.invalidate_all();
+            self.lock_cache()?.invalidate_for_human_input();
             // The dispatch future (and its mutation guard) has been dropped
             // before cleanup acquires the lock. Outer MCP cancellation uses
             // this same cleanup path, including desktop restoration.
@@ -2841,7 +2874,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         let generation = self.takeover.status().generation;
         let mut cache = self.lock_cache()?;
         if cache.input_generation != generation {
-            cache.invalidate_all();
+            cache.invalidate_for_human_input();
             cache.input_generation = generation;
             self.clear_click_grace();
         }
@@ -6571,6 +6604,15 @@ fn stale_observation_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::stale(StaleAuthority::Observation, message)
 }
 
+fn human_input_invalidated_error() -> RuntimeError {
+    stale_observation_error("human input changed after the observation; its accessibility and frame evidence were invalidated")
+        .with_execution_status(
+            ToolOutcome::NotStarted,
+            true,
+            "For foreground actions, wait_for human_idle, then observe fresh state. Read-only observations remain available while the user works, but further human input can invalidate them. Use the private background desktop when the user requests independent background work.",
+        )
+}
+
 fn capability_error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::not_started("capability_unavailable", message)
 }
@@ -6992,6 +7034,159 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn accessibility_change_wait_reports_external_text_and_new_evidence() {
+        let fake = FakeAdapter::tree();
+        let runtime = fake_runtime(fake.clone());
+        runtime.execute_call(observe_call()).await.unwrap();
+        let baseline = current_observation_id(&runtime);
+        fake.state
+            .lock()
+            .unwrap()
+            .nodes
+            .get_mut(&id("edit"))
+            .unwrap()
+            .text = Some("external update".into());
+        let output = runtime
+            .execute_call(ToolCall::WaitFor {
+                target: Some(test_target()),
+                condition: WaitCondition::AccessibilityAdvanced {
+                    after_observation_id: baseline.clone(),
+                },
+                timeout_ms: 100,
+            })
+            .await
+            .unwrap();
+        let result = output.structured_content.unwrap();
+        assert_eq!(result["satisfied"], true);
+        assert_ne!(result["evidence"]["observation_id"], baseline);
+        assert!(
+            current_snapshot(&runtime)
+                .elements
+                .iter()
+                .any(|element| element.node.text.as_deref() == Some("external update"))
+        );
+    }
+
+    #[tokio::test]
+    async fn element_value_wait_matches_complete_text_and_preserves_value_precedence() {
+        for (numeric, text, truncated, expected, satisfied) in [
+            (None, Some("complete"), false, "complete", true),
+            (None, Some("prefix"), true, "prefix", false),
+            (Some("123"), Some("complete"), false, "123", true),
+            (Some("123"), Some("complete"), false, "complete", false),
+        ] {
+            let fake = FakeAdapter::tree();
+            {
+                let mut state = fake.state.lock().unwrap();
+                let node = state.nodes.get_mut(&id("edit")).unwrap();
+                node.value = numeric.map(str::to_owned);
+                node.text = text.map(str::to_owned);
+                node.text_truncated = Some(truncated);
+            }
+            let runtime = fake_runtime(fake);
+            runtime.execute_call(observe_call()).await.unwrap();
+            let snapshot = current_snapshot(&runtime);
+            let index = snapshot
+                .elements
+                .iter()
+                .position(|element| element.node.object == id("edit"))
+                .unwrap();
+            let output = runtime
+                .execute_call(ToolCall::WaitFor {
+                    target: Some(test_target()),
+                    condition: WaitCondition::ElementValue {
+                        observation_id: current_observation_id(&runtime),
+                        element_id: snapshot.element_ids[index].clone(),
+                        value: expected.into(),
+                    },
+                    timeout_ms: 20,
+                })
+                .await
+                .unwrap();
+            assert_eq!(output.structured_content.unwrap()["satisfied"], satisfied);
+        }
+    }
+
+    #[tokio::test]
+    async fn window_closed_accepts_recent_catalog_identity_after_fast_close() {
+        for include_target in [false, true] {
+            let fake = FakeAdapter::tree();
+            let runtime = fake_runtime(fake.clone());
+            runtime.execute_call(observe_call()).await.unwrap();
+            fake.state.lock().unwrap().app.windows.clear();
+            runtime.refresh_window_catalog().await.unwrap();
+            let output = runtime
+                .execute_call(ToolCall::WaitFor {
+                    target: include_target.then(test_target),
+                    condition: WaitCondition::WindowClosed {
+                        window_instance_id: test_target().window_instance_id,
+                    },
+                    timeout_ms: 100,
+                })
+                .await
+                .unwrap();
+            assert_eq!(output.structured_content.unwrap()["satisfied"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn window_closed_rejects_wrong_application_for_retired_identity() {
+        let fake = FakeAdapter::tree();
+        let runtime = fake_runtime(fake.clone());
+        runtime.execute_call(observe_call()).await.unwrap();
+        fake.state.lock().unwrap().app.windows.clear();
+        let mut target = test_target();
+        target.app_instance_id = "app-ffffffffffffffff".into();
+        let error = runtime
+            .execute_call(ToolCall::WaitFor {
+                target: Some(target),
+                condition: WaitCondition::WindowClosed {
+                    window_instance_id: test_target().window_instance_id,
+                },
+                timeout_ms: 100,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "stale_state");
+    }
+
+    #[tokio::test]
+    async fn window_closed_does_not_treat_unavailable_authority_as_disappearance() {
+        let runtime = fake_runtime(FakeAdapter::tree());
+        let entries = runtime
+            .lock_catalog()
+            .unwrap()
+            .reconcile([crate::window_backend::BackendWindow {
+                backend_identity: "kde-window".into(),
+                application_identity: "kde-app".into(),
+                title: "Editor".into(),
+                app_id: None,
+                pid: Some(42),
+                states: BTreeSet::new(),
+                outputs: Vec::new(),
+                virtual_desktops: Vec::new(),
+                resource_name: None,
+                geometry: None,
+                source: BackendKind::KdePlasma,
+                capabilities: crate::window_backend::WindowCapabilities::kde_rich(),
+                atspi: None,
+                is_protected_surface: false,
+            }])
+            .unwrap();
+        let error = runtime
+            .execute_call(ToolCall::WaitFor {
+                target: None,
+                condition: WaitCondition::WindowClosed {
+                    window_instance_id: entries[0].target.window_instance_id.clone(),
+                },
+                timeout_ms: 100,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "stale_state");
+    }
+
+    #[tokio::test]
     async fn window_closed_rejects_an_id_not_present_in_the_initial_catalog() {
         let runtime = fake_runtime(FakeAdapter::tree());
         runtime.execute_call(observe_call()).await.unwrap();
@@ -7166,6 +7361,62 @@ pub(crate) mod tests {
         assert_eq!(output.structured_content.unwrap()["satisfied"], false);
     }
 
+    #[tokio::test]
+    async fn human_activity_explains_invalidated_wait_evidence_and_fresh_observation_recovers() {
+        let runtime = fake_runtime(FakeAdapter::tree());
+        runtime.execute_call(observe_call()).await.unwrap();
+        let observation_id = current_observation_id(&runtime);
+        let snapshot = runtime
+            .lock_cache()
+            .unwrap()
+            .required(&observation_id)
+            .unwrap()
+            .snapshot
+            .clone();
+        runtime.takeover.trip();
+        let error = runtime
+            .execute_call(ToolCall::WaitFor {
+                target: Some(test_target()),
+                condition: WaitCondition::AccessibilityAdvanced {
+                    after_observation_id: observation_id,
+                },
+                timeout_ms: 1,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "stale_state");
+        assert!(error.message.contains("human input changed"));
+        assert!(error.recovery.contains("human_idle"));
+        let frame_error = runtime
+            .lock_cache()
+            .unwrap()
+            .frame_for_target(&test_target(), None)
+            .unwrap_err();
+        assert_eq!(frame_error.code, "stale_state");
+        assert!(frame_error.message.contains("human input changed"));
+        let action_error = runtime
+            .lock_cache()
+            .unwrap()
+            .invalidate_for_mutation(&snapshot)
+            .unwrap_err();
+        assert_eq!(action_error.code, "stale_state");
+        assert!(action_error.message.contains("human input changed"));
+
+        // Read-only observation and waits still work during the same pause.
+        runtime.execute_call(observe_call()).await.unwrap();
+        let output = runtime
+            .execute_call(ToolCall::WaitFor {
+                target: Some(test_target()),
+                condition: WaitCondition::AccessibilityAdvanced {
+                    after_observation_id: current_observation_id(&runtime),
+                },
+                timeout_ms: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.structured_content.unwrap()["satisfied"], false);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn human_idle_wait_resumes_without_restart_and_requires_fresh_observation() {
         let fake = FakeAdapter::tree();
@@ -7225,7 +7476,8 @@ pub(crate) mod tests {
         assert_eq!(output["evidence"]["reason"], "idle");
         assert!(!runtime.desktop_session_exhausted());
         let error = runtime.execute_call(during).await.unwrap_err();
-        assert_eq!(error.code, "state_required");
+        assert_eq!(error.code, "stale_state");
+        assert!(error.message.contains("human input changed"));
         assert!(fake.state.lock().unwrap().actions.is_empty());
         runtime
             .execute_call(ToolCall::Observe {
@@ -8814,7 +9066,7 @@ pub(crate) mod tests {
 
     fn kde_entry(desktops: &[&str], states: &[&str]) -> WindowEntry {
         WindowEntry {
-            target: WindowTarget {
+            target: TargetRef {
                 app_instance_id: "app-1".into(),
                 window_instance_id: "win-1".into(),
             },

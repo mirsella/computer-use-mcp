@@ -37,20 +37,24 @@ pub fn tool_definition(name: &str) -> Option<&'static Tool> {
 }
 
 static COMPACT_TOOLS: LazyLock<[Tool; 2]> = LazyLock::new(|| {
+    let action = json!({
+        "type": "string",
+        "enum": TOOL_NAMES
+    });
     [
         tool(
             "help",
-            "Discover desktop operations, or fetch one action's schema. Covers windows, app launch, screenshots, accessibility, input, and waits on foreground or private background desktops.",
-            object(json!({"action": {"type": "string", "minLength": 1}}), &[]),
+            "List the six desktop actions when action is omitted, or fetch one action's schema. Use only advertised names for app launch, screenshots, accessibility, input, and waits.",
+            object(json!({"action": action}), &[]),
             true,
             false,
         ),
         tool(
             "dispatch",
-            "Execute a desktop action. Use help when its schema is not in context; put action-specific fields inside arguments.",
+            "Execute a desktop action; help is a separate tool. Fetch its schema with help first, then put action-specific fields inside arguments.",
             object(
                 json!({
-                    "action": {"type": "string", "minLength": 1},
+                    "action": action,
                     "arguments": {"type": "object", "additionalProperties": true}
                 }),
                 &["action", "arguments"],
@@ -106,7 +110,7 @@ static DIRECT_TOOLS: LazyLock<[Tool; 6]> = LazyLock::new(|| {
         ),
         tool(
             "observe",
-            "Inspect a target. target_window crops with verified KDE geometry, otherwise returns the monitor image with a reason. Coordinates are pixels in the returned PNG, within its dimensions, never AT-SPI bounds.",
+            "Inspect a target; point input needs a screenshot frame_id. target_window uses verified KDE geometry or returns monitor pixels with a reason. Coordinates use the returned PNG, never AT-SPI bounds.",
             object(
                 json!({
                     "target": target_schema(),
@@ -121,7 +125,7 @@ static DIRECT_TOOLS: LazyLock<[Tool; 6]> = LazyLock::new(|| {
         ),
         tool(
             "act",
-            "Apply one action to a source observation. Point focus clicks again on every keyboard/paste call; semantic focus grabs the element without pointer motion and requires verified focus. Paste uses the session clipboard when granted, otherwise simulated typing; it clears its clipboard transfer without restoring prior contents.",
+            "Apply one action. Point input needs source_observation.frame_id from a screenshot. Point focus clicks on every keyboard/paste call; semantic focus requires verified element focus without pointer motion. Paste uses the granted clipboard or simulated typing, then clears its transfer without restoring prior clipboard contents.",
             act_input_schema(),
             false,
             true,

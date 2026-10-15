@@ -113,6 +113,19 @@ a malicious same-user sandbox. A same-user process with host access may still
 inspect or interfere with the session. Normal MCP calls that select
 `desktop: "background"` start the embedded private worker automatically; no
 host wrapper or private-session configuration is required for that route.
+`frame_stable` measures unchanged pixels on a healthy capture stream, including
+quiet periods on damage-driven compositors. It retains the existing frame ID
+when no new image arrives; it does not claim that a fresh frame was captured.
+A failed, missing, or renegotiated stream cannot establish stability. A complete
+frame with a prior sequence gap can establish a new quiet interval; its degraded
+continuity metadata is retained.
+
+The private runner enables KDE window-management metadata by default so its
+owned windows can expose geometry and window controls. The owned compositor
+runs with `KWIN_WAYLAND_NO_PERMISSION_CHECKS=1` to expose these interfaces without
+installed desktop-file grants; this setting is scoped to that compositor.
+An explicit
+`COMPUTER_USE_MCP_KDE_WINDOW_MANAGEMENT=0` still disables that backend.
 
 Check the session without requesting portal consent:
 
@@ -182,7 +195,8 @@ The windows result includes process-lifetime `app_instance_id` and
 `window_instance_id` values, descriptive metadata, backend authority, and
 capability states. Standard foreign-toplevel inventory supplies title and app
 ID but not PID, geometry, accessibility, or activation. The optional KDE-rich
-authority requires `COMPUTER_USE_MCP_KDE_WINDOW_MANAGEMENT=1` and a Plasma
+authority requires `COMPUTER_USE_MCP_KDE_WINDOW_MANAGEMENT=1` (the private
+runner's default) and a Plasma
 window-management global version 17 or newer. It can be unavailable or busy
 because it is a single-client protocol; that does not weaken other authorities.
 
@@ -226,8 +240,9 @@ request; it does not prove that a window has mapped. List windows again or use
 
 The optional `action` is `activate`, `minimize`, `maximize`, `restore`, or
 `close`; the default is `activate`. Activation evidence is authority-specific:
-AT-SPI can report a fresh active-state observation, and KDE can report a
-matching protocol state transition. Neither proves seat focus or application
+AT-SPI can report a fresh active-state observation. KDE verifies an active
+state event or the exact window's active state after a request-ordered compositor
+sync, which also covers an app that activates itself just before the request. Neither proves seat focus or application
 delivery. `dispatch.synchronized` reports server synchronization only.
 
 KDE activation may switch one verified KWin desktop before dispatch. An
@@ -354,6 +369,9 @@ evidence rather than claiming no change. Recovery directs callers to list
 windows on the same desktop and observe an exact returned target. None of these
 results establishes that launch failed.
 
+`element_value` matches the complete accessibility value, or complete text when
+no value interface is present. Truncated text cannot establish an exact match.
+
 Window close:
 
 ```json
@@ -363,10 +381,15 @@ Window close:
 }
 ```
 
-The wait first refreshes an authoritative catalog and requires the exact opaque
-ID to be present. A supplied `target`, if any, must contain the same window ID.
-Targetless waits return the target observed in the catalog. An ID that was not
-observed, or a catalog that is unavailable, is not treated as closure.
+The wait refreshes the authoritative catalog and requires an exact opaque ID
+observed in that catalog. The most recent 128 retired identities are retained
+so a window that closes before the wait begins can still be verified. These
+identities are retained only when the source backend actually enumerated the
+window's disappearance. A backend outage or a switch to another catalog source
+invalidates continuity without proving closure. These identities cannot authorize
+input. A supplied `target` must match both the
+application and window identity. An unknown or evicted ID, or an unavailable
+source backend, is not treated as closure.
 
 Window waits do not subscribe to an event channel. They refresh and poll until
 the bounded timeout or an explicit catalog error. A timeout is not proof that
@@ -430,6 +453,12 @@ After the 60-second quiet period, a new mutation may proceed without restarting
 MCP. Observations from before or during the pause become stale. Use
 `wait_for human_idle`, then observe again, or hand control to the user. Background
 use requires the user's request; human activity never changes the desktop route.
+
+Human activity also invalidates retained accessibility and frame evidence.
+An observation-dependent wait can therefore return `stale_state` immediately
+after an observation if the user continues interacting. The error identifies
+human input as the cause. Read-only observation remains available; foreground
+actions must wait for `human_idle` and then observe again.
 Cleanup failure is a separate session failure and cannot be repaired by an idle
 wait. Detection is best effort when no physical device is readable and no
 cooperative signal exists.

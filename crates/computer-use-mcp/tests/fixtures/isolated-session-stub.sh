@@ -4,6 +4,13 @@ set -u
 role="$(basename "$0")"
 
 if [ "$role" = "dbus-send" ]; then
+    printf '%s\n' "$*" >>"$STUB_ENV_DIR/dbus-send.calls"
+    case " $* " in
+        *' org.freedesktop.DBus.Properties.Get '*)
+            printf '   variant boolean %s\n' "${STUB_ATSPI_ENABLED:-true}"
+            exit 0
+            ;;
+    esac
     printf '   boolean true\n'
     exit 0
 fi
@@ -18,16 +25,26 @@ fi
 
 if [ -n "${STUB_ENV_DIR-}" ]; then
     {
+        for argument in "$@"; do
+            printf 'argv=%s\n' "$argument"
+        done
+    } >"$STUB_ENV_DIR/$role.argv"
+fi
+
+if [ -n "${STUB_ENV_DIR-}" ]; then
+    {
         printf 'role=%s\n' "$role"
         for variable in \
             AT_SPI_BUS_ADDRESS \
             COMPUTER_USE_MCP_DISPLAY \
             COMPUTER_USE_MCP_ISOLATED \
-             COMPUTER_USE_MCP_ISOLATION_MARKER \
-             COMPUTER_USE_MCP_VIRTUAL_SESSION \
-             DBUS_STARTER_ADDRESS \
-             DBUS_STARTER_BUS_TYPE \
-             DBUS_SESSION_BUS_ADDRESS \
+            COMPUTER_USE_MCP_ISOLATION_MARKER \
+            COMPUTER_USE_MCP_KDE_WINDOW_MANAGEMENT \
+    KWIN_WAYLAND_NO_PERMISSION_CHECKS \
+            COMPUTER_USE_MCP_VIRTUAL_SESSION \
+            DBUS_STARTER_ADDRESS \
+            DBUS_STARTER_BUS_TYPE \
+            DBUS_SESSION_BUS_ADDRESS \
             DBUS_SESSION_BUS_PID \
             DBUS_SESSION_BUS_WINDOWID \
             DBUS_SYSTEM_BUS_ADDRESS \

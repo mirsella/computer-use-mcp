@@ -7,11 +7,13 @@
 //! key.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
 };
 
 use crate::accessibility::{AppInfo, WindowInfo};
+
+const MAX_RETIRED_WINDOWS: usize = 128;
 
 pub const KDE_RICH_ENV: &str = "COMPUTER_USE_MCP_KDE_WINDOW_MANAGEMENT";
 
@@ -224,6 +226,15 @@ pub struct WindowTarget {
     pub window_instance_id: String,
 }
 
+impl WindowTarget {
+    pub fn as_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "app_instance_id": self.app_instance_id,
+            "window_instance_id": self.window_instance_id,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowEntry {
     pub target: WindowTarget,
@@ -320,6 +331,7 @@ pub struct WindowCatalog {
     active_apps: BTreeMap<BackendKey, ActiveApp>,
     active_windows: BTreeMap<BackendKey, ActiveWindow>,
     entries: BTreeMap<WindowTarget, WindowEntry>,
+    retired_windows: VecDeque<(WindowTarget, BackendKind)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -336,13 +348,38 @@ struct ActiveWindow {
 }
 
 impl WindowCatalog {
+    /// Recent exact identities remain evidence for a close-then-wait race.
+    /// They never authorize input or resolve to a replacement backend record.
+    pub fn known_window(&self, window_id: &str) -> Option<(WindowTarget, BackendKind)> {
+        self.entries
+            .values()
+            .find(|entry| entry.target.window_instance_id == window_id)
+            .map(|entry| (entry.target.clone(), entry.source))
+            .or_else(|| {
+                self.retired_windows
+                    .iter()
+                    .rev()
+                    .find(|(target, _)| target.window_instance_id == window_id)
+                    .cloned()
+            })
+    }
+
     pub fn membership_generation(&self) -> u64 {
         self.membership_generation
     }
 
+    #[cfg(test)]
     pub fn reconcile(
         &mut self,
         records: impl IntoIterator<Item = BackendWindow>,
+    ) -> Result<Vec<WindowEntry>, CatalogError> {
+        self.reconcile_observed(records, |_| true)
+    }
+
+    fn reconcile_observed(
+        &mut self,
+        records: impl IntoIterator<Item = BackendWindow>,
+        enumerated: impl Fn(BackendKind) -> bool,
     ) -> Result<Vec<WindowEntry>, CatalogError> {
         // Build the next catalog off to the side. A malformed or duplicate
         // backend record must not discard the last known-good catalog or leave
@@ -456,6 +493,15 @@ impl WindowCatalog {
         } else {
             None
         };
+        for (target, entry) in old_entries {
+            if !next_entries.contains_key(target) && enumerated(entry.source) {
+                if self.retired_windows.len() == MAX_RETIRED_WINDOWS {
+                    self.retired_windows.pop_front();
+                }
+                self.retired_windows
+                    .push_back((target.clone(), entry.source));
+            }
+        }
         self.active_apps = active_apps;
         self.active_windows = active_windows;
         self.entries = next_entries;
@@ -470,6 +516,7 @@ impl WindowCatalog {
         &mut self,
         apps: &[AppInfo],
         compositor: impl IntoIterator<Item = BackendWindow>,
+        compositor_source: Option<BackendKind>,
     ) -> Result<Vec<WindowEntry>, CatalogError> {
         let atspi = apps.iter().flat_map(|app| {
             app.windows.iter().map(|window| BackendWindow {
@@ -496,13 +543,14 @@ impl WindowCatalog {
                 ),
             })
         });
-        self.reconcile(atspi.chain(compositor))
+        self.reconcile_observed(atspi.chain(compositor), |source| {
+            source == BackendKind::Atspi || Some(source) == compositor_source
+        })
     }
 
-    pub fn get(&self, target: &WindowTarget) -> Result<WindowEntry, CatalogError> {
+    pub fn get(&self, target: &WindowTarget) -> Result<&WindowEntry, CatalogError> {
         self.entries
             .get(target)
-            .cloned()
             .ok_or_else(|| CatalogError::StaleTarget(target.clone()))
     }
 
@@ -643,6 +691,107 @@ mod tests {
             None,
         ));
         assert!(!is_protected_surface(None, "", None));
+    }
+
+    #[test]
+    fn switching_catalog_authority_does_not_prove_window_closure() {
+        let mut catalog = WindowCatalog::default();
+        let original = catalog
+            .reconcile_sources(
+                &[],
+                [record(
+                    BackendKind::ForeignToplevel,
+                    "app",
+                    "standard",
+                    "Editor",
+                )],
+                Some(BackendKind::ForeignToplevel),
+            )
+            .unwrap()[0]
+            .target
+            .clone();
+        catalog
+            .reconcile_sources(
+                &[],
+                [record(BackendKind::KdePlasma, "app", "rich", "Editor")],
+                Some(BackendKind::KdePlasma),
+            )
+            .unwrap();
+        assert!(catalog.get(&original).is_err());
+        assert!(catalog.known_window(&original.window_instance_id).is_none());
+    }
+
+    #[test]
+    fn recovering_authority_cannot_retroactively_prove_window_closure() {
+        let mut catalog = WindowCatalog::default();
+        let original = catalog
+            .reconcile_sources(
+                &[],
+                [record(
+                    BackendKind::KdePlasma,
+                    "app",
+                    "same-window",
+                    "Editor",
+                )],
+                Some(BackendKind::KdePlasma),
+            )
+            .unwrap()[0]
+            .target
+            .clone();
+        catalog.reconcile_sources(&[], [], None).unwrap();
+        let current = catalog
+            .reconcile_sources(
+                &[],
+                [record(
+                    BackendKind::KdePlasma,
+                    "app",
+                    "same-window",
+                    "Editor",
+                )],
+                Some(BackendKind::KdePlasma),
+            )
+            .unwrap()[0]
+            .target
+            .clone();
+        assert_ne!(original, current);
+        assert!(catalog.known_window(&original.window_instance_id).is_none());
+        catalog
+            .reconcile_sources(&[], [], Some(BackendKind::KdePlasma))
+            .unwrap();
+        assert!(catalog.known_window(&original.window_instance_id).is_none());
+        assert_eq!(
+            catalog.known_window(&current.window_instance_id),
+            Some((current, BackendKind::KdePlasma))
+        );
+    }
+
+    #[test]
+    fn retired_window_evidence_is_bounded_and_cannot_authorize_input() {
+        let mut catalog = WindowCatalog::default();
+        let first = catalog
+            .reconcile([record(BackendKind::Atspi, "app-a", "win-a", "Editor")])
+            .unwrap()[0]
+            .target
+            .clone();
+        catalog.reconcile([]).unwrap();
+        assert_eq!(
+            catalog.known_window(&first.window_instance_id),
+            Some((first.clone(), BackendKind::Atspi))
+        );
+        assert!(catalog.get(&first).is_err());
+        for index in 0..MAX_RETIRED_WINDOWS {
+            catalog
+                .reconcile([record(
+                    BackendKind::Atspi,
+                    "app-b",
+                    &format!("win-{index}"),
+                    "Editor",
+                )])
+                .unwrap();
+            catalog.reconcile([]).unwrap();
+        }
+        assert!(catalog.known_window(&first.window_instance_id).is_none());
+        assert_eq!(catalog.retired_windows.len(), MAX_RETIRED_WINDOWS);
     }
 
     #[test]

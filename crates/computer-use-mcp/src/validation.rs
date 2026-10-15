@@ -1,6 +1,9 @@
 use serde_json::{Map as JsonObject, Value};
 
-use crate::{contract::tool_definition, errors::RuntimeError};
+use crate::{
+    contract::{TOOL_NAMES, tool_definition},
+    errors::RuntimeError,
+};
 
 pub const MAX_CLICK_COUNT: usize = 3;
 pub const MAX_SCROLL_STEPS: u32 = 100;
@@ -16,7 +19,7 @@ pub const MAX_KEYBOARD_EXPANDED_ACTIONS: usize = 4_096;
 pub const MAX_WAIT_TIMEOUT_MS: u64 = 5_000;
 pub const MAX_HUMAN_IDLE_TIMEOUT_MS: u64 = 120_000;
 // The stable interval must fit inside the default wait deadline while still
-// leaving room to acquire at least one fresh frame and observe its metadata.
+// leaving room to validate capture health and observe subsequent changes.
 pub const MAX_WAIT_STABLE_MS: u64 = 1_500;
 pub const DEFAULT_DESKTOP_PAGE_SIZE: usize = 50;
 pub const MAX_DESKTOP_PAGE_SIZE: usize = 100;
@@ -45,13 +48,13 @@ pub(crate) fn validate_mcp_call(
     }
     let action = match arguments.remove("action") {
         None if name == "help" => None,
-        Some(Value::String(action)) => {
-            let Some(tool) = tool_definition(&action) else {
-                return invalid("action must name an operation returned by help");
-            };
-            Some(tool)
-        }
-        _ => return invalid("action must name an operation returned by help"),
+        value => Some(
+            value.as_ref().and_then(Value::as_str).and_then(tool_definition)
+                .ok_or_else(|| RuntimeError::invalid_arguments(format!(
+                    "Use an advertised desktop action: {}. Call help without action to list their schemas.",
+                    TOOL_NAMES.join(", ")
+                )))?,
+        ),
     };
     let call = if name == "help" {
         McpCall::Help(action)
@@ -173,20 +176,7 @@ pub enum DesktopScope {
     Applications,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct TargetRef {
-    pub app_instance_id: String,
-    pub window_instance_id: String,
-}
-
-impl TargetRef {
-    pub fn as_json(&self) -> Value {
-        serde_json::json!({
-            "app_instance_id": self.app_instance_id,
-            "window_instance_id": self.window_instance_id,
-        })
-    }
-}
+pub use crate::window_backend::WindowTarget as TargetRef;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObserveView {
@@ -1360,6 +1350,23 @@ mod routing_tests {
             ),
         ] {
             assert!(validate_routed_call(name, arguments.as_object().unwrap().clone()).is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_compact_action_names_the_real_operations_without_echoing_input() {
+        for tool in crate::contract::compact_tool_definitions() {
+            let arguments = serde_json::from_value(serde_json::json!({
+                "action": "private-unknown-action", "arguments": {}
+            }))
+            .unwrap();
+            let error = validate_mcp_call(tool, arguments).err().unwrap();
+            assert_eq!(error.code, "invalid_arguments");
+            for action in TOOL_NAMES {
+                assert!(error.message.contains(action));
+            }
+            assert!(error.message.contains("help without action"));
+            assert!(!error.message.contains("private-unknown-action"));
         }
     }
 }

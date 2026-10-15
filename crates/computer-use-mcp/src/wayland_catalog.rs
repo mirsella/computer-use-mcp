@@ -571,6 +571,20 @@ pub struct CompositorSnapshot {
     pub kde: BackendStatus,
 }
 
+impl CompositorSnapshot {
+    /// Aggregation prefers rich records; an available but omitted backend
+    /// cannot establish that one of its windows disappeared.
+    pub fn enumerated_backend(&self) -> Option<BackendKind> {
+        if self.kde.is_supported() {
+            Some(BackendKind::KdePlasma)
+        } else if self.standard.is_supported() {
+            Some(BackendKind::ForeignToplevel)
+        } else {
+            None
+        }
+    }
+}
+
 struct ProtocolRuntime {
     connection: Connection,
     queue: EventQueue<ProtocolState>,
@@ -614,6 +628,38 @@ struct ActivationWait {
     reply: oneshot::Sender<Result<(), BackendError>>,
     dispatched: bool,
     cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct ActivationSync(Arc<std::sync::atomic::AtomicBool>);
+
+fn confirm_activation_after_sync(
+    state: &mut ProtocolState,
+    request: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    let Some(activation) = state.activation.as_ref() else {
+        return;
+    };
+    if !Arc::ptr_eq(&activation.cancel, request)
+        || request.load(std::sync::atomic::Ordering::Acquire)
+        || !activation.dispatched
+        || activation.tracker.timed_out(Instant::now())
+    {
+        return;
+    }
+    let active = state
+        .kde
+        .as_ref()
+        .and_then(|kde| kde.records.get(&activation.tracker.uuid))
+        .is_some_and(|record| {
+            record.initialized && !record.unmapped && record.flags & KDE_STATE_ACTIVE != 0
+        });
+    if active {
+        let activation = state
+            .activation
+            .take()
+            .expect("verified pending activation");
+        let _ = activation.reply.send(Ok(()));
+    }
 }
 
 struct PendingWindowRequest {
@@ -799,6 +845,21 @@ impl Dispatch<wl_callback::WlCallback, ()> for ProtocolState {
         if matches!(event, wl_callback::Event::Done { .. }) {
             state.initial_done = true;
             state.initial_sync = None;
+        }
+    }
+}
+
+impl Dispatch<wl_callback::WlCallback, ActivationSync> for ProtocolState {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        data: &ActivationSync,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if matches!(event, wl_callback::Event::Done { .. }) {
+            confirm_activation_after_sync(state, &data.0);
         }
     }
 }
@@ -1661,16 +1722,17 @@ fn aggregate_snapshots(
         standard: BackendStatus::Unsupported("standard backend uses a separate connection".into()),
         kde: status_from_backend_error(error),
     });
-    let records = if kde.kde.is_supported() {
+    let mut snapshot = CompositorSnapshot {
+        records: Vec::new(),
+        standard: standard.standard,
+        kde: kde.kde,
+    };
+    snapshot.records = if snapshot.enumerated_backend() == Some(BackendKind::KdePlasma) {
         kde.records
     } else {
         standard.records
     };
-    CompositorSnapshot {
-        records,
-        standard: standard.standard,
-        kde: kde.kde,
-    }
+    snapshot
 }
 
 fn status_from_backend_error(error: BackendError) -> BackendStatus {
@@ -2382,6 +2444,13 @@ fn process_commands(
                     continue;
                 };
                 window.set_state(KDE_STATE_ACTIVE, KDE_STATE_ACTIVE);
+                // The app may have activated itself since the caller's catalog
+                // snapshot. An unchanged active state emits no new State event.
+                // Verify it behind a compositor barrier ordered after our request.
+                runtime
+                    .connection
+                    .display()
+                    .sync(&runtime.queue.handle(), ActivationSync(cancel.clone()));
                 runtime.state.activation = Some(ActivationWait {
                     tracker: ActivationTracker::new(uuid, Instant::now(), timeout),
                     reply,
@@ -2731,6 +2800,95 @@ mod tests {
             BackendStatus::Unsupported(_)
         ));
         assert!(poll_timeout(Duration::from_millis(5)).tv_nsec > 0);
+    }
+
+    #[test]
+    fn aggregation_only_enumerates_the_selected_supported_backend() {
+        let standard = CompositorSnapshot {
+            records: Vec::new(),
+            standard: BackendStatus::Supported,
+            kde: BackendStatus::Unsupported("separate connection".into()),
+        };
+        let kde = CompositorSnapshot {
+            records: Vec::new(),
+            standard: BackendStatus::Unsupported("separate connection".into()),
+            kde: BackendStatus::Supported,
+        };
+        let rich = aggregate_snapshots(Ok(standard.clone()), Ok(kde));
+        assert!(rich.standard.is_supported());
+        assert_eq!(rich.enumerated_backend(), Some(BackendKind::KdePlasma));
+        let fallback = aggregate_snapshots(
+            Ok(standard),
+            Err(BackendError::Unavailable("outage".into())),
+        );
+        assert_eq!(
+            fallback.enumerated_backend(),
+            Some(BackendKind::ForeignToplevel)
+        );
+        let unavailable = aggregate_snapshots(
+            Err(BackendError::Unavailable("outage".into())),
+            Err(BackendError::Unavailable("outage".into())),
+        );
+        assert_eq!(unavailable.enumerated_backend(), None);
+    }
+
+    #[test]
+    fn activation_sync_verifies_already_active_without_accepting_stale_requests() {
+        let mut state = ProtocolState::new(ProtocolBackend::Kde);
+        let mut kde = KdeRichReducer::new(17).unwrap();
+        kde.records.insert(
+            "u1".into(),
+            KdeRecord {
+                initialized: true,
+                flags: KDE_STATE_ACTIVE,
+                ..KdeRecord::default()
+            },
+        );
+        state.kde = Some(kde);
+        let (reply, mut result) = oneshot::channel();
+        let request = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state.activation = Some(ActivationWait {
+            tracker: ActivationTracker::new("u1", Instant::now(), Duration::from_secs(1)),
+            reply,
+            dispatched: false,
+            cancel: request.clone(),
+        });
+        confirm_activation_after_sync(&mut state, &request);
+        assert!(matches!(
+            result.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        state.activation.as_mut().unwrap().dispatched = true;
+        let old_request = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        confirm_activation_after_sync(&mut state, &old_request);
+        assert!(matches!(
+            result.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        state
+            .kde
+            .as_mut()
+            .unwrap()
+            .records
+            .get_mut("u1")
+            .unwrap()
+            .unmapped = true;
+        confirm_activation_after_sync(&mut state, &request);
+        assert!(matches!(
+            result.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        state
+            .kde
+            .as_mut()
+            .unwrap()
+            .records
+            .get_mut("u1")
+            .unwrap()
+            .unmapped = false;
+        confirm_activation_after_sync(&mut state, &request);
+        assert!(matches!(result.try_recv(), Ok(Ok(()))));
+        assert!(state.activation.is_none());
     }
 
     #[test]

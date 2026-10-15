@@ -382,6 +382,26 @@ def installed_applications(client):
             return result
 
 
+def wait_for_accessible_editor(client, initial_ids, catalog, timeout=5):
+    deadline = time.monotonic() + timeout
+    while True:
+        candidates = [
+            window for window in windows(catalog)
+            if window.get("target", {}).get("window_instance_id") not in initial_ids
+            and window.get("capabilities", {}).get("accessibility", {}).get("status") == "supported"
+            and not window.get("is_protected_surface")
+        ]
+        if len(candidates) > 1:
+            raise RuntimeError(f"expected one new accessible editor, found {len(candidates)}")
+        if candidates:
+            return candidates[0]
+        if time.monotonic() >= deadline:
+            raise RuntimeError("editor did not register an accessibility target before the deadline")
+        # Compositor window_opened cannot wait for AT-SPI registration; only
+        # independent catalog discovery can establish this target's readiness.
+        _, catalog = call(client, "list_desktop", {"scope": "windows", "limit": 100})
+
+
 def main():
     if len(sys.argv) == 2:
         client = Client(binary=sys.argv[1])
@@ -528,10 +548,12 @@ def main():
             _, catalog = call(
                 client, "list_desktop", {"scope": "windows", "limit": 100}
             )
-        target_window = next(
-            (window for window in windows(catalog) if window.get("target") == target),
-            {},
-        )
+        # Window-open identity comes from the compositor; editing needs an
+        # independently advertised accessibility target. Never fuse their IDs.
+        editor = wait_for_accessible_editor(client, initial_ids, catalog)
+        target = editor["target"]
+        target_pid = editor.get("pid")
+        target_window = editor
         print(
             "window_metadata="
             + json.dumps(

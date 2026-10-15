@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Optional paid model smoke against the local plugin and its private desktop."""
+"""Optional model smoke against the local plugin and its private desktop."""
 
 import argparse
 import base64
@@ -16,6 +16,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 MUTATIONS = {"launch_application", "activate_window", "act"}
+DESKTOP_ACTIONS = MUTATIONS | {"list_desktop", "observe", "wait_for"}
 
 
 def human_input_busy(part):
@@ -45,13 +46,21 @@ def read_events(stream):
         yield json.loads(line)
 
 
+def screenshots(state):
+    return (
+        item["uri"]
+        for item in state.get("metadata", {}).get("content", [])
+        if item.get("type") == "file" and item.get("mime") == "image/png"
+    )
+
+
 def summarize(events, phrase, task="editor"):
     desktop = "foreground" if task == "takeover" else "background"
     calls = [event["part"] for event in events if event["type"] == "tool_use"]
     assert calls, "model made no tool calls"
     assert any(
         part["tool"] == "skill"
-        and part["state"]["input"].get("name") == "computer-use-mcp"
+        and part["state"]["input"].get("id") == "computer-use-mcp"
         for part in calls
     ), "computer-use skill was not loaded"
     errors, waits, actions = [], [], set()
@@ -95,19 +104,23 @@ def summarize(events, phrase, task="editor"):
         "verification must be the final desktop operation"
     )
     assert f"Desktop: {desktop}" in final["output"]
-    assert f'value="{phrase}"' in final["output"], (
-        "fresh accessibility readback did not match"
-    )
-    images = [
-        item for item in final.get("attachments", []) if item.get("mime") == "image/png"
-    ]
-    assert images, "fresh observation has no screenshot"
-    image = base64.b64decode(images[0]["url"].split(",", 1)[1], validate=True)
+    readback = f'value="{phrase}"' in final["output"]
+    if task == "calculator":
+        readback = readback or f'name="{phrase}"' in final["output"]
+    assert readback, "fresh accessibility readback did not match"
+    image_uri = next(screenshots(final), None)
+    assert image_uri, "fresh observation has no screenshot"
+    prefix = "data:image/png;base64,"
+    assert image_uri.startswith(prefix), "screenshot is not inline PNG data"
+    image = base64.b64decode(image_uri.removeprefix(prefix), validate=True)
     assert image.startswith(b"\x89PNG\r\n\x1a\n"), "invalid screenshot"
     finishes = [event["part"] for event in events if event["type"] == "step_finish"]
-    assert finishes and finishes[-1]["reason"] == "stop", (
-        "model did not finish normally"
+    completed_text = (
+        events[-1].get("type") == "text"
+        and events[-1].get("part", {}).get("time", {}).get("end") is not None
     )
+    assert not any(event.get("type") == "error" for event in events), "model transport failed"
+    assert completed_text, "model did not finish normally"
     tokens = collections.Counter()
     for part in finishes:
         usage = part.get("tokens", {})
@@ -132,6 +145,18 @@ def summarize(events, phrase, task="editor"):
         "exact_readback": True,
         "screenshot_bytes": len(image),
     }
+    if task == "capabilities":
+        # Native call completion cannot establish these application effects.
+        # Keep the model's assessment for review without declaring broad success.
+        report.update(
+            task_complete=False,
+            verification_scope="editor_readback_only",
+            unverified_capabilities=[
+                "calculator_arithmetic", "window_controls", "target_window_crop",
+                "semantic_actions", "pointer_gestures", "keyboard_and_paste", "waits",
+            ],
+            model_assessment=events[-1]["part"]["text"],
+        )
     if desktop == "foreground":
         busy = next(
             (i for i, part in enumerate(dispatches) if human_input_busy(part)), None
@@ -208,7 +233,8 @@ def verify_history(events, records, phrase, task):
     expected = collections.Counter(
         (
             part["tool"].removeprefix("computer_use_"),
-            part["state"]["input"].get("action"),
+            part["state"]["input"].get("action")
+            if part["state"]["input"].get("action") in DESKTOP_ACTIONS else None,
             "error" if part["state"]["status"] == "error" else "succeeded",
         )
         for part in calls
@@ -220,8 +246,11 @@ def verify_history(events, records, phrase, task):
     desktop = "foreground" if task == "takeover" else "background"
     for record in finished:
         if record["tool"] == "dispatch":
-            assert record["desktop"] == desktop, "incorrect public desktop route"
-            assert "request" in record, "validated request metadata missing"
+            if "request" not in record:
+                assert record["status"] == "error" and record.get("result", {}).get("code") == "invalid_arguments", "validated request metadata missing"
+                assert record["result"].get("outcome") == "not_started", "invalid arguments dispatched input"
+            else:
+                assert record["desktop"] == desktop, "incorrect public desktop route"
     serialized = json.dumps(records)
     assert phrase not in serialized, "dummy text leaked into history"
     forbidden = {
@@ -246,11 +275,8 @@ def verify_history(events, records, phrase, task):
 
     check_keys(records)
     for part in calls:
-        for item in part["state"].get("attachments", []):
-            if item.get("mime") == "image/png":
-                assert item["url"].split(",", 1)[1] not in serialized, (
-                    "screenshot leaked into history"
-                )
+        for uri in screenshots(part["state"]):
+            assert uri.split(",", 1)[1] not in serialized, "screenshot leaked into history"
     errors = collections.Counter(
         record["result"].get("code", "unknown")
         for record in finished
@@ -374,6 +400,9 @@ class Processes:
             try:
                 argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
                 if Path(os.fsdecode(argv[0])).name == "computer-use-mcp":
+                    assert Path(f"/proc/{pid}/exe").samefile(ROOT / "vendor/bin/computer-use-mcp"), (
+                        "model MCP executable differs from the current checkout artifact; finish active tests before rebuilding or reconnect a stale server"
+                    )
                     if b"__desktop_worker" in argv:
                         assert self.allow_foreground, "foreground worker started"
                         assert isolation_markers(pid), (
@@ -408,7 +437,7 @@ def read_providers(config):
                 "bun",
                 "--eval",
                 "const config = Bun.JSONC.parse(await Bun.file(process.argv[1]).text()); "
-                "console.log(JSON.stringify(config.provider ?? {}));",
+                "console.log(JSON.stringify(config.providers ?? {}));",
                 str(config),
             ],
             text=True,
@@ -432,17 +461,20 @@ def run(model, variant, timeout_seconds, provider_config, task="editor"):
         (work / "package.json").write_text('{"private":true}')
         config = {
             "$schema": "https://opencode.ai/config.json",
-            "plugin": [ROOT.as_uri()],
-            "provider": providers,
-            "autoupdate": False,
+            "plugins": [ROOT.as_uri()],
+            "providers": providers,
+            "update": "disable",
             "share": "disabled",
-            "tools": {"*": False, "skill": True, "computer_use_*": True},
-            "permission": {"*": "deny", "skill": "allow", "computer_use_*": "allow"},
-            "agent": {
+            "permissions": [
+                {"action": "*", "resource": "*", "effect": "deny"},
+                {"action": "skill", "resource": "*", "effect": "allow"},
+                {"action": "computer_use_*", "resource": "*", "effect": "allow"},
+            ],
+            "agents": {
                 "desktop-test": {
                     "mode": "primary",
                     "description": "Private desktop release smoke",
-                    "prompt": (
+                    "system": (
                         "Use the computer-use skill and tools on the foreground route of the "
                         "runner-owned private desktop. Do not select background. "
                         "This disposable private desktop is authorized for the dummy task."
@@ -481,16 +513,6 @@ def run(model, variant, timeout_seconds, provider_config, task="editor"):
                 ),
             }
         )
-        resolved = json.loads(
-            subprocess.check_output(
-                ["opencode", "debug", "config"], cwd=work, env=env, text=True
-            )
-        )
-        assert resolved["mcp"]["computer_use"]["command"] == [
-            str(ROOT / "vendor/bin/computer-use-mcp"),
-            "mcp",
-            "--compact-tools",
-        ]
         run_id = uuid.uuid4().hex[:12]
         phrase = f"OpenCode {task} smoke {run_id}"
         history_state = ROOT / "target/model-smoke" / f"{task}-{run_id}"
@@ -503,6 +525,39 @@ def run(model, variant, timeout_seconds, provider_config, task="editor"):
             "Only use computer-use tools and skill. Do not use the foreground desktop or save a file. "
             "Leave the unsaved editor open for the test runner to clean up. Report the result and any recoveries."
         )
+        if task == "calculator":
+            prompt = (
+                "Use the computer-use skill and the six advertised desktop actions only. "
+                "On the private background desktop, discover and launch KCalc. "
+                "Use its actual UI to compute 17*23, then verify the result 391 in a fresh "
+                "observation containing both screenshot and accessibility. Do not merely "
+                "write the answer into an editable field. Use an AT-SPI target for buttons "
+                "or input, and only element IDs from the latest replacement observation. "
+                "Use desktop=background explicitly on discovery, launch and targetless "
+                "window-open waits. If an action name or shape is unclear, call help "
+                "without action to list the six names, then fetch the relevant schema. "
+                "Finish after the successful readback; the last desktop action must be "
+                "observe with both views. Leave the private app for the runner to clean up."
+            )
+        if task == "capabilities":
+            prompt += (
+                " Before the final editor verification, exercise the advertised desktop capabilities "
+                "using only your own private apps. Discover installed IDs; launch KCalc if available "
+                "and verify 17*23=391 through actual UI readback. Test window-open, activation, "
+                "minimize/maximize/restore, target_window screenshot cropping, and closure of a "
+                "disposable clean window with window_closed. Select KWin window targets for controls "
+                "and crops, and independently select AT-SPI targets for accessibility; never fuse "
+                "identities by title or PID. Test semantic invoke, set_value and named actions only "
+                "when advertised, pointer move/click/scroll/drag with fresh screenshot-grounded "
+                "coordinates, keyboard and paste. Use disposable editor text to demonstrate visible "
+                "scrolling and drag selection. Test frame_advanced, frame_changed, frame_stable, "
+                "accessibility_advanced and element_value waits with correct retained baselines. "
+                "A timeout or dispatch completion alone is not proof of application effect. "
+                "Do not repeat impossible waits or unchanged unsupported calls. Report PASS, "
+                "FAIL, UNSUPPORTED or UNTESTED per case, with actual evidence and your mistakes. "
+                "Finally restore the editor to the exact requested line and make a fresh both-view "
+                "observation the last desktop operation; leave that editor for runner cleanup."
+            )
         handoff = work / "handoff"
         env["COMPUTER_USE_MCP_TAKEOVER_FILE"] = str(handoff)
         if takeover:
@@ -526,10 +581,9 @@ def run(model, variant, timeout_seconds, provider_config, task="editor"):
         command = [
             "opencode",
             "run",
+            "--standalone",
             "--model",
-            model,
-            "--variant",
-            variant,
+            f"{model}#{variant}",
             "--agent",
             "desktop-test",
             "--format",
@@ -620,9 +674,9 @@ def run(model, variant, timeout_seconds, provider_config, task="editor"):
         with (work / "events.jsonl").open("rb") as stream:
             events = list(read_events(stream))
             assert not stream.read(), "unfinished JSON event at shutdown"
-        report = summarize(events, phrase, task)
         if not takeover:
             capture_history(history_state, env)
+        report = summarize(events, "391" if task == "calculator" else phrase, task)
         records = [
             json.loads(line)
             for line in (history_state / "computer-use-mcp/history/calls.jsonl")
@@ -651,7 +705,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", default="openai/gpt-6.1-sol")
     parser.add_argument("--variant", default="medium")
     parser.add_argument("--timeout", type=int, default=600)
-    parser.add_argument("--task", choices=("editor", "takeover"), default="editor")
+    parser.add_argument("--task", choices=("editor", "takeover", "capabilities", "calculator"), default="editor")
     parser.add_argument(
         "--provider-config",
         type=Path,

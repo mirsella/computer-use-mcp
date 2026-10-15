@@ -200,32 +200,26 @@ pub trait ScreenshotProvider: Send + Sync + 'static {
     }
 }
 
-fn update_stability(
-    metadata: &FrameMetadata,
-    baseline_change_epoch: &mut u64,
-    baseline_format_generation: &mut u64,
-    last_hash: &mut Option<u64>,
-    stable_since: &mut Option<tokio::time::Instant>,
-    now: tokio::time::Instant,
-    for_duration: Duration,
-) -> bool {
-    if metadata.change_epoch != *baseline_change_epoch
-        || metadata.format_generation != *baseline_format_generation
-    {
-        // A transient change or format renegotiation resets the interval even
-        // if the next pixels happen to hash back to the old content.
-        *baseline_change_epoch = metadata.change_epoch;
-        *baseline_format_generation = metadata.format_generation;
-        *last_hash = Some(metadata.content_hash);
-        *stable_since = Some(now);
-    } else if *last_hash == Some(metadata.content_hash) {
-        stable_since.get_or_insert(now);
-    } else {
-        *last_hash = Some(metadata.content_hash);
-        *stable_since = Some(now);
+#[derive(Default)]
+struct PixelStability {
+    baseline: Option<((u64, u64, u64), tokio::time::Instant)>,
+}
+
+impl PixelStability {
+    fn elapsed(&mut self, metadata: &FrameMetadata, now: tokio::time::Instant) -> Duration {
+        // Epoch changes catch transient damage even when pixels return to the same hash.
+        let key = (
+            metadata.change_epoch,
+            metadata.format_generation,
+            metadata.content_hash,
+        );
+        let (previous, since) = self.baseline.get_or_insert((key, now));
+        if *previous != key {
+            *previous = key;
+            *since = now;
+        }
+        now.duration_since(*since)
     }
-    stable_since
-        .is_some_and(|since| for_duration.is_zero() || now.duration_since(since) >= for_duration)
 }
 
 #[derive(Debug, Default)]
@@ -716,7 +710,7 @@ where
         if mapping.source.stream_health == crate::capture::StreamHealth::Failed {
             return Err(session_unavailable());
         }
-        let mut stable_elapsed_ms = None;
+        let mut stable_for_ms = None;
         let frame = match condition {
             FrameWaitCondition::Advanced { after_generation } => {
                 latest_frame_checked(&mut state, Some(after_generation), FRAME_WAIT_BOUND).await?
@@ -744,49 +738,76 @@ where
             }
             FrameWaitCondition::Stable {
                 after_generation,
-                after_change_epoch,
-                after_format_generation,
                 for_duration,
+                ..
             } => {
                 let deadline = tokio::time::Instant::now() + FRAME_WAIT_BOUND;
-                let mut generation = after_generation;
-                let mut change_epoch = after_change_epoch;
-                let mut format_generation = after_format_generation;
-                let mut last_hash = None;
-                let mut stable_since = None;
+                let mut stability = PixelStability::default();
+                let mut frame = latest_frame_checked(&mut state, None, FRAME_WAIT_BOUND).await?;
+                if frame.metadata.generation < after_generation {
+                    return Err(ScreenshotError("stable wait lost its source frame".into()));
+                }
+                if frame.metadata.stream_health == crate::capture::StreamHealth::Degraded {
+                    eprintln!(
+                        "computer-use-mcp: stability begins after a complete frame with prior discontinuity; requiring a full quiet interval and retaining degraded metadata"
+                    );
+                }
                 loop {
-                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    if remaining.is_zero() {
+                    let active = state.active().ok_or_else(session_unavailable)?;
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(ScreenshotError("stable wait timed out".into()));
+                    }
+                    let current = active
+                        .capture
+                        .current_metadata()
+                        .map_err(ScreenshotError)?
+                        .ok_or_else(|| {
+                            ScreenshotError("stable wait has no committed frame".into())
+                        })?;
+                    if current.stream_health == crate::capture::StreamHealth::Failed {
                         return Err(ScreenshotError(
-                            "timed out waiting for a stable frame with fresh evidence".into(),
+                            "stable wait cannot use a failed capture stream".into(),
                         ));
                     }
-                    let frame =
-                        latest_frame_checked(&mut state, Some(generation), remaining).await?;
-                    generation = frame.metadata.generation;
+                    verify_current_frame_metadata(&current, mapping).map_err(ScreenshotError)?;
+                    if current.generation < frame.metadata.generation {
+                        return Err(ScreenshotError(
+                            "stable wait committed frame generation regressed".into(),
+                        ));
+                    }
+                    if current.generation > frame.metadata.generation {
+                        frame = latest_frame_checked(&mut state, None, FRAME_WAIT_BOUND).await?;
+                        continue;
+                    }
                     let now = tokio::time::Instant::now();
-                    if update_stability(
-                        &frame.metadata,
-                        &mut change_epoch,
-                        &mut format_generation,
-                        &mut last_hash,
-                        &mut stable_since,
-                        now,
-                        for_duration,
-                    ) {
-                        stable_elapsed_ms = stable_since.map(|since| {
-                            now.duration_since(since)
-                                .as_millis()
-                                .min(u128::from(u64::MAX)) as u64
-                        });
+                    let elapsed = stability.elapsed(&frame.metadata, now);
+                    if elapsed >= for_duration {
+                        stable_for_ms = Some(elapsed.as_millis().min(u128::from(u64::MAX)) as u64);
                         break frame;
                     }
+                    let remaining = deadline.saturating_duration_since(now);
+                    if remaining.is_zero() {
+                        return Err(ScreenshotError(
+                            "timed out waiting for stable pixels".into(),
+                        ));
+                    }
+                    let stable_deadline = now + (for_duration - elapsed);
+                    // Damage-driven streams stay silent when pixels do not change.
+                    // Race new frames against the quiet interval, then re-read the
+                    // committed image and health; never invent a new generation.
+                    frame = tokio::select! {
+                        biased;
+                        result = latest_frame_checked(&mut state, Some(frame.metadata.generation), remaining) => result?,
+                        _ = tokio::time::sleep_until(stable_deadline) => {
+                            let current = latest_frame_checked(&mut state, None, remaining).await?;
+                            if current.metadata.generation == frame.metadata.generation {
+                                eprintln!("computer-use-mcp: stable interval uses unchanged pixels from a live damage-driven stream; frame generation is retained");
+                            }
+                            current
+                        }
+                    };
                 }
             }
-        };
-        let stable_for_ms = match condition {
-            FrameWaitCondition::Stable { .. } => stable_elapsed_ms,
-            _ => None,
         };
         verify_current_frame_metadata(&frame.metadata, mapping).map_err(ScreenshotError)?;
         let encode_crop = match (mapping.crop, mapping.window_crop_source) {
@@ -1613,6 +1634,7 @@ mod tests {
         format_generation: AtomicUsize,
         current_metadata_checks: AtomicUsize,
         single_frame: AtomicUsize,
+        idle_after_baseline: AtomicUsize,
         renegotiate_after_baseline: AtomicUsize,
         fail_after_baseline: AtomicUsize,
         invalidated: AtomicUsize,
@@ -1701,6 +1723,11 @@ mod tests {
             Box::pin(async move {
                 if let Some(error) = failure {
                     return Err(error);
+                }
+                if after_generation.is_some()
+                    && drops.idle_after_baseline.load(Ordering::Acquire) != 0
+                {
+                    std::future::pending::<()>().await;
                 }
                 if never_fresh {
                     return Err("timed out waiting for a complete frame".into());
@@ -2169,6 +2196,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stable_wait_accepts_healthy_damage_driven_silence_without_new_generation() {
+        let (connection, _) = test_connection(1, 11);
+        let capture_state = Arc::new(FakeCaptureState::default());
+        capture_state
+            .idle_after_baseline
+            .store(1, Ordering::Release);
+        let coordinator = test_coordinator([connection], Arc::clone(&capture_state));
+        coordinator.prepare().await.unwrap();
+        let mut mapping = test_mapping();
+        mapping.source.generation = 1;
+        let evidence = coordinator
+            .wait_for_frame(
+                FrameWaitCondition::Stable {
+                    after_generation: 1,
+                    after_change_epoch: 0,
+                    after_format_generation: 1,
+                    for_duration: Duration::from_millis(20),
+                },
+                &mapping,
+            )
+            .await
+            .unwrap();
+        assert_eq!(evidence.mapping.source.generation, 1);
+        assert!(evidence.stable_for_ms.unwrap() >= 20);
+        assert_eq!(evidence.changed, Some(false));
+    }
+
+    #[tokio::test]
+    async fn stable_wait_measures_quiet_after_prior_gap_without_upgrading_health() {
+        let (connection, _) = test_connection(1, 11);
+        let capture_state = Arc::new(FakeCaptureState::default());
+        capture_state
+            .idle_after_baseline
+            .store(1, Ordering::Release);
+        capture_state.degraded_health.store(1, Ordering::Release);
+        let coordinator = test_coordinator([connection], Arc::clone(&capture_state));
+        coordinator.prepare().await.unwrap();
+        let evidence = coordinator
+            .wait_for_frame(
+                FrameWaitCondition::Stable {
+                    after_generation: 0,
+                    after_change_epoch: 0,
+                    after_format_generation: 1,
+                    for_duration: Duration::from_millis(20),
+                },
+                &test_mapping(),
+            )
+            .await
+            .unwrap();
+        assert!(evidence.stable_for_ms.unwrap() >= 20);
+        assert_eq!(
+            evidence.mapping.source.stream_health,
+            crate::capture::StreamHealth::Degraded
+        );
+    }
+
+    #[tokio::test]
+    async fn stable_wait_rejects_stream_failure_during_damage_driven_silence() {
+        let (connection, _) = test_connection(1, 11);
+        let capture_state = Arc::new(FakeCaptureState::default());
+        capture_state
+            .idle_after_baseline
+            .store(1, Ordering::Release);
+        let coordinator = test_coordinator([connection], Arc::clone(&capture_state));
+        coordinator.prepare().await.unwrap();
+        let failure = Arc::clone(&capture_state.failures.lock().unwrap()[0]);
+        let fail = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            *failure.lock().unwrap() = Some("stream disappeared during quiet interval".into());
+        });
+        let error = coordinator
+            .wait_for_frame(
+                FrameWaitCondition::Stable {
+                    after_generation: 0,
+                    after_change_epoch: 0,
+                    after_format_generation: 1,
+                    for_duration: Duration::from_millis(20),
+                },
+                &test_mapping(),
+            )
+            .await
+            .unwrap_err();
+        fail.await.unwrap();
+        assert!(error.0.contains("request a new approved desktop session"));
+        assert!(coordinator.desktop_session_exhausted());
+    }
+
+    #[tokio::test]
     async fn frame_wait_binds_the_new_frame_to_the_existing_visual_mapping() {
         let (connection, _) = test_connection(1, 11);
         let coordinator = test_coordinator([connection], Arc::new(FakeCaptureState::default()));
@@ -2284,10 +2399,7 @@ mod tests {
 
     #[test]
     fn stability_resets_on_transient_change_and_format_renegotiation() {
-        let mut change_epoch = 0;
-        let mut format_generation = 1;
-        let mut last_hash = None;
-        let mut stable_since = None;
+        let mut stability = PixelStability::default();
         let start = tokio::time::Instant::now();
         let frame = |generation, format_generation, change_epoch, content_hash| FrameMetadata {
             generation,
@@ -2312,51 +2424,23 @@ mod tests {
             sequence_gap: None,
         };
 
-        assert!(!update_stability(
-            &frame(1, 1, 0, 7),
-            &mut change_epoch,
-            &mut format_generation,
-            &mut last_hash,
-            &mut stable_since,
-            start,
-            Duration::from_millis(50),
-        ));
-        assert!(update_stability(
-            &frame(2, 1, 0, 7),
-            &mut change_epoch,
-            &mut format_generation,
-            &mut last_hash,
-            &mut stable_since,
-            start + Duration::from_millis(60),
-            Duration::from_millis(50),
-        ));
-        assert!(!update_stability(
-            &frame(3, 1, 1, 7),
-            &mut change_epoch,
-            &mut format_generation,
-            &mut last_hash,
-            &mut stable_since,
-            start + Duration::from_millis(61),
-            Duration::from_millis(50),
-        ));
-        assert!(!update_stability(
-            &frame(4, 2, 1, 7),
-            &mut change_epoch,
-            &mut format_generation,
-            &mut last_hash,
-            &mut stable_since,
-            start + Duration::from_millis(62),
-            Duration::from_millis(50),
-        ));
-        assert!(update_stability(
-            &frame(5, 2, 1, 7),
-            &mut change_epoch,
-            &mut format_generation,
-            &mut last_hash,
-            &mut stable_since,
-            start + Duration::from_millis(120),
-            Duration::from_millis(50),
-        ));
+        for (generation, format, epoch, hash, at_ms, elapsed_ms) in [
+            (1, 1, 0, 7, 0, 0),
+            (2, 1, 0, 7, 60, 60),
+            (3, 1, 1, 7, 61, 0),
+            (4, 2, 1, 7, 62, 0),
+            (5, 2, 1, 7, 120, 58),
+            (6, 2, 1, 8, 121, 0),
+            (7, 2, 1, 8, 180, 59),
+        ] {
+            assert_eq!(
+                stability.elapsed(
+                    &frame(generation, format, epoch, hash),
+                    start + Duration::from_millis(at_ms)
+                ),
+                Duration::from_millis(elapsed_ms),
+            );
+        }
     }
 
     #[tokio::test]

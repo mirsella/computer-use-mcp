@@ -49,6 +49,13 @@ node --test tests/npm.test.mjs
 The symlink is a checkout-only build artifact. The Node tests load the local
 plugin and check MCP discovery and validation without a desktop.
 
+Rebuilding does not replace an already running MCP process: it can keep the old,
+deleted executable inode. Reconnect only the computer-use server in the affected
+OpenCode workspace after rebuilding, then verify `/proc/<pid>/exe` refers to the
+current artifact. Use `opencode run --standalone` for model smoke tests so a
+long-lived shared service cannot supply a stale server. Finish active smoke tests
+before rebuilding; replacing their executable invalidates the provenance check.
+
 To use that build in OpenCode, replace the published computer-use plugin entry
 with `"file:///absolute/path/to/computer-use-mcp"`. Point at the checkout
 directory, whose package exports resolve the plugin. Quit and restart OpenCode
@@ -251,3 +258,8 @@ without portal consent, `init` requests a reusable KDE portal grant, and
 Static batch entries cannot feed opaque IDs returned by earlier entries into
 later entries. See [README.md](README.md#install) for installation and host
 registration.
+
+The model smoke runner's `--task capabilities` is exploratory: its automatic
+acceptance verifies editor readback and a PNG only. Its JSON marks the task
+incomplete, lists capabilities requiring manual verification, and preserves the
+model's assessment. A successful model run is not a full capability pass.

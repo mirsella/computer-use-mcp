@@ -109,7 +109,8 @@ fn harness(fail_role: Option<&str>) -> (TempDir, Command) {
         )
         .env("AT_SPI_BUS_ADDRESS", "unix:path=/physical/at-spi-bus")
         .env("DISPLAY", ":99")
-        .env("XAUTHORITY", "/physical/xauthority");
+        .env("XAUTHORITY", "/physical/xauthority")
+        .env_remove("KWIN_WAYLAND_NO_PERMISSION_CHECKS");
 
     for (variable, role) in [
         ("COMPUTER_USE_MCP_DBUS_DAEMON_BIN", "dbus-daemon"),
@@ -154,6 +155,15 @@ fn recorded_pids(root: &Path) -> Vec<u32> {
         .lines()
         .filter_map(|line| line.split_whitespace().nth(1))
         .map(|pid| pid.parse().expect("numeric fixture pid"))
+        .collect()
+}
+
+fn recorded_arguments(root: &Path, role: &str) -> Vec<String> {
+    fs::read_to_string(root.join("env").join(format!("{role}.argv")))
+        .expect("fixture argument log")
+        .lines()
+        .filter_map(|line| line.strip_prefix("argv="))
+        .map(str::to_owned)
         .collect()
 }
 
@@ -376,6 +386,103 @@ fn isolated_session_rejects_missing_required_dependency_before_startup() {
         !temp.path.join("pids").exists(),
         "services started before dependency validation"
     );
+}
+
+#[test]
+fn isolated_session_starts_atspi_services_with_supported_arguments() {
+    let (temp, command) = harness(None);
+    let output = run(command);
+    assert!(
+        output.status.success(),
+        "launcher failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The private accessibility bus must be started with arguments the
+    // installed launcher accepts.  An unsupported flag aborts the launcher
+    // before it binds its socket, so the private session never becomes ready.
+    let launcher_arguments = recorded_arguments(&temp.path, "at-spi-bus-launcher");
+    assert_eq!(
+        launcher_arguments,
+        vec!["--launch-immediately".to_owned()],
+        "at-spi-bus-launcher must be started with only the supported flag"
+    );
+    let registry_arguments = recorded_arguments(&temp.path, "at-spi2-registryd");
+    assert_eq!(
+        registry_arguments,
+        vec![
+            "--dbus-name".to_owned(),
+            "org.a11y.atspi.Registry".to_owned()
+        ],
+        "at-spi2-registryd must own the registry name on the private bus"
+    );
+}
+
+#[test]
+fn isolated_session_enables_and_verifies_private_accessibility_status() {
+    let (temp, command) = harness(None);
+    let output = run(command);
+    assert!(output.status.success());
+    let calls = read_file(&temp.path, "dbus-send.calls");
+    assert!(calls.contains("org.freedesktop.DBus.Properties.Set string:org.a11y.Status string:IsEnabled variant:boolean:true"));
+    assert!(
+        calls.contains(
+            "org.freedesktop.DBus.Properties.Get string:org.a11y.Status string:IsEnabled"
+        )
+    );
+}
+
+#[test]
+fn isolated_session_rejects_disabled_accessibility_before_server_start() {
+    let (temp, mut command) = harness(None);
+    command.env("STUB_ATSPI_ENABLED", "false");
+    let output = run(command);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("private AT-SPI status remained disabled")
+    );
+    assert!(!temp.path.join("env/server").exists());
+    assert_processes_gone(&recorded_pids(&temp.path));
+}
+
+#[test]
+fn isolated_session_enables_private_kde_rich_window_management_by_default() {
+    let (temp, command) = harness(None);
+    let output = run(command);
+    assert!(
+        output.status.success(),
+        "launcher failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let server_environment = read_file(&temp.path, "server");
+    assert!(
+        server_environment.contains("COMPUTER_USE_MCP_KDE_WINDOW_MANAGEMENT=1"),
+        "the private runner must enable KDE rich window management by default"
+    );
+    assert!(read_file(&temp.path, "kwin_wayland").contains("KWIN_WAYLAND_NO_PERMISSION_CHECKS=1"));
+    assert!(server_environment.contains("KWIN_WAYLAND_NO_PERMISSION_CHECKS=<unset>"));
+}
+
+#[test]
+fn isolated_session_preserves_explicit_kde_rich_window_management_value() {
+    for value in ["0", "false", ""] {
+        let (temp, mut command) = harness(None);
+        command.env("COMPUTER_USE_MCP_KDE_WINDOW_MANAGEMENT", value);
+        let output = run(command);
+        assert!(
+            output.status.success(),
+            "launcher failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            read_file(&temp.path, "server")
+                .contains(&format!("COMPUTER_USE_MCP_KDE_WINDOW_MANAGEMENT={value}\n"))
+        );
+        assert!(
+            read_file(&temp.path, "kwin_wayland").contains("KWIN_WAYLAND_NO_PERMISSION_CHECKS=0")
+        );
+    }
 }
 
 #[test]

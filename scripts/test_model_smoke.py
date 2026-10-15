@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location(
     "model_smoke", Path(__file__).with_name("opencode-model-smoke.py")
@@ -15,9 +16,15 @@ spec = importlib.util.spec_from_file_location(
 smoke = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(smoke)
 
+isolated_spec = importlib.util.spec_from_file_location(
+    "isolated_smoke", Path(__file__).with_name("isolated-mcp-smoke.py")
+)
+isolated = importlib.util.module_from_spec(isolated_spec)
+isolated_spec.loader.exec_module(isolated)
+
 
 def trace():
-    def tool(name, arguments, output="", attachments=None):
+    def tool(name, arguments, output="", content=None):
         return {
             "type": "tool_use",
             "sessionID": "test-session",
@@ -27,13 +34,13 @@ def trace():
                     "input": arguments,
                     "status": "completed",
                     "output": output,
-                    "attachments": attachments or [],
+                    "metadata": {"content": content or []},
                 },
             },
         }
 
     return [
-        tool("skill", {"name": "computer-use-mcp"}),
+        tool("skill", {"id": "computer-use-mcp"}),
         tool(
             "computer_use_dispatch",
             {"action": "launch_application", "arguments": {"desktop": "background"}},
@@ -45,15 +52,16 @@ def trace():
             'Desktop: background\nvalue="exact smoke text"',
             [
                 {
+                    "type": "file",
                     "mime": "image/png",
-                    "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aXioAAAAASUVORK5CYII=",
+                    "uri": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aXioAAAAASUVORK5CYII=",
                 }
             ],
         ),
         {
             "type": "step_finish",
             "part": {
-                "reason": "stop",
+                "reason": "tool-calls",
                 "tokens": {
                     "input": 120,
                     "output": 30,
@@ -62,6 +70,7 @@ def trace():
                 },
             },
         },
+        {"type": "text", "part": {"text": "Done", "time": {"end": 1}}},
     ]
 
 
@@ -99,7 +108,36 @@ def history_trace(events):
     return records
 
 
+class AccessibleEditorReadiness(unittest.TestCase):
+    def test_accessibility_may_register_after_compositor_window(self):
+        editor = {"target": {"window_instance_id": "atspi-window"},
+                  "capabilities": {"accessibility": {"status": "supported"}}}
+        with patch.object(isolated, "call", return_value=({}, {"windows": [editor]})) as call:
+            self.assertEqual(isolated.wait_for_accessible_editor(None, set(), {"windows": []}), editor)
+        call.assert_called_once_with(None, "list_desktop", {"scope": "windows", "limit": 100})
+
+    def test_accessibility_registration_has_a_deadline(self):
+        with patch.object(isolated, "call") as call:
+            with self.assertRaisesRegex(RuntimeError, "deadline"):
+                isolated.wait_for_accessible_editor(None, set(), {"windows": []}, timeout=0)
+        call.assert_not_called()
+
+    def test_ambiguous_accessible_targets_are_rejected(self):
+        editor = {"target": {"window_instance_id": "atspi-window"},
+                  "capabilities": {"accessibility": {"status": "supported"}}}
+        with self.assertRaisesRegex(RuntimeError, "found 2"):
+            isolated.wait_for_accessible_editor(None, set(), {"windows": [editor, editor]})
+
+
 class ModelSmokeEvidence(unittest.TestCase):
+    def test_editor_completion_does_not_verify_broad_capabilities(self):
+        events = trace()
+        report = smoke.summarize(events, "exact smoke text", task="capabilities")
+        self.assertFalse(report["task_complete"])
+        self.assertEqual(report["verification_scope"], "editor_readback_only")
+        self.assertIn("calculator_arithmetic", report["unverified_capabilities"])
+        self.assertEqual(report["model_assessment"], events[-1]["part"]["text"])
+
     @unittest.skipUnless(
         shutil.which("bun"), "optional provider JSONC check requires Bun"
     )
@@ -108,7 +146,7 @@ class ModelSmokeEvidence(unittest.TestCase):
             config = Path(directory) / "opencode.jsonc"
             config.write_text("""{
               // Provider settings must not come from redacted debug output.
-              "provider": {"openai": {"options": {
+              "providers": {"openai": {"options": {
                 "apiKey": "test-key",
                 "headers": {"sleev-provider": "test-provider"},
               }}},
@@ -119,7 +157,7 @@ class ModelSmokeEvidence(unittest.TestCase):
 
     def test_verified_trace_and_task_token_totals(self):
         events = trace()
-        events.insert(-1, copy.deepcopy(events[-1]))
+        events.insert(-1, copy.deepcopy(events[-2]))
         report = smoke.summarize(events, "exact smoke text")
         self.assertTrue(report["exact_readback"])
         self.assertEqual(
@@ -133,6 +171,27 @@ class ModelSmokeEvidence(unittest.TestCase):
             },
         )
 
+    def test_calculator_accepts_exact_accessible_result_name(self):
+        events = trace()
+        for event in events:
+            if event.get("type") == "tool_use":
+                state = event["part"]["state"]
+                state["output"] = state.get("output", "").replace(
+                    'value="exact smoke text"', 'name="391"'
+                )
+        self.assertTrue(smoke.summarize(events, "391", "calculator")["exact_readback"])
+        with self.assertRaisesRegex(AssertionError, "readback"):
+            smoke.summarize(events, "391", "editor")
+
+    def test_transport_failure_and_incomplete_completion_are_rejected(self):
+        events = trace()
+        events.insert(-1, {"type": "error", "error": "transport closed"})
+        with self.assertRaisesRegex(AssertionError, "transport failed"):
+            smoke.summarize(events, "exact smoke text")
+        with self.assertRaisesRegex(AssertionError, "finish normally"):
+            smoke.summarize(trace()[:-1], "exact smoke text")
+
+
     def test_foreground_or_implicit_route_is_rejected(self):
         for arguments in [{}, {"desktop": "foreground"}]:
             events = trace()
@@ -141,7 +200,7 @@ class ModelSmokeEvidence(unittest.TestCase):
                 smoke.summarize(events, "exact smoke text")
 
     def test_claim_without_fresh_readback_or_image_is_rejected(self):
-        for field, value in [("output", "Done"), ("attachments", [])]:
+        for field, value in [("output", "Done"), ("metadata", {"content": []})]:
             events = trace()
             events[3]["part"]["state"][field] = value
             with self.assertRaises(AssertionError):
@@ -175,8 +234,9 @@ class ModelSmokeEvidence(unittest.TestCase):
             output="Wait: human_idle satisfied=false reason=physical_monitor_unavailable",
             time={"start": 0, "end": 60000},
         )
+        fresh_observation = copy.deepcopy(events[3])
         events[1:1] = [refusal, idle]
-        events.insert(4, copy.deepcopy(events[-2]))
+        events.insert(4, fresh_observation)
         report = smoke.summarize(events, "exact smoke text", "takeover")
         self.assertTrue(report["takeover_then_fresh_observation"])
         self.assertFalse(report["background_only"])
@@ -267,7 +327,7 @@ class ModelSmokeEvidence(unittest.TestCase):
             ("message", "other contents", "raw contents"),
             (
                 "image_blob",
-                events[3]["part"]["state"]["attachments"][0]["url"].split(",", 1)[1],
+                events[3]["part"]["state"]["metadata"]["content"][0]["uri"].split(",", 1)[1],
                 "screenshot",
             ),
         ]:
@@ -275,6 +335,21 @@ class ModelSmokeEvidence(unittest.TestCase):
             leaked[-1]["result"][key] = value
             with self.assertRaisesRegex(AssertionError, error):
                 smoke.verify_history(events, leaked, "exact smoke text", "editor")
+
+    def test_invalid_calls_preserve_privacy_without_losing_history(self):
+        events = trace()
+        invalid = copy.deepcopy(events[2])
+        invalid["part"]["state"] = {"input": {"action": "invented_action", "arguments": {}}, "status": "error"}
+        events.insert(-1, invalid)
+        records = history_trace(events)
+        for record in records[-2:]:
+            for key in ("action", "desktop", "request"):
+                record.pop(key, None)
+        records[-1]["result"] = {"code": "invalid_arguments", "outcome": "not_started"}
+        smoke.verify_history(events, records, "exact smoke text", "editor")
+        records[-1]["result"]["outcome"] = "unknown"
+        with self.assertRaisesRegex(AssertionError, "dispatched input"):
+            smoke.verify_history(events, records, "exact smoke text", "editor")
 
     def test_history_reports_errors_cleanup_failures_and_longest_calls(self):
         events = trace()
