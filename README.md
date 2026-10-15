@@ -117,7 +117,10 @@ Add the package to your OpenCode configuration, using OpenCode 2.0.27 or newer:
 ```
 
 The native v2 plugin registers `mcp.servers.computer_use` with the bundled executable, a
-150-second timeout, and the computer-use skill. It is enabled by default.
+150-second timeout, and the computer-use skill. It passes along the graphical session
+environment the server needs for input, filling missing Wayland session variables from the
+systemd user manager when a harness lacks them, such as a service-started `opencode serve`.
+It is enabled by default.
 
 When enabled, the model sees `computer_use_help` and
 `computer_use_dispatch`. Help lists operation names or returns one

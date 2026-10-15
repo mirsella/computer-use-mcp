@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { access, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { access, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -56,6 +56,44 @@ test("native adapter registers its server and skill", async () => {
   assert.equal(skills.length,1);
   assert.equal(await readFile(new URL("skills/computer-use-mcp/SKILL.md",root),"utf8"),await readFile(new URL("../crates/computer-use-mcp/guidance/skill.md",import.meta.url),"utf8"));
 });
+async function withSystemctl(stub, run) {
+  const directory = await mkdtemp(join(tmpdir(), "computer-use-mcp-systemctl-"));
+  const script = ["#!/bin/sh", ': > "$0.log"', ...stub.map(line => `printf '%s\\n' '${line}'`), ""].join("\n");
+  await writeFile(join(directory, "systemctl"), script, { mode: 0o755 });
+  const saved = { ...process.env };
+  process.env.PATH = `${directory}:${saved.PATH}`;
+  try {
+    return await run(directory);
+  } finally {
+    process.env = saved;
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+test("a harness outside the session falls back to the systemd user environment", async () => {
+  const stub = ["WAYLAND_DISPLAY=wayland-stub", "XDG_SESSION_TYPE=wayland", "DISPLAY=:9", "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/stub/bus", "PATH=/stub/bin"];
+  await withSystemctl(stub, async () => {
+    for (const key of ["WAYLAND_DISPLAY", "XDG_SESSION_TYPE", "DBUS_SESSION_BUS_ADDRESS"]) delete process.env[key];
+    process.env.DISPLAY = "";
+    const { server } = await configure();
+    assert.equal(server.environment.WAYLAND_DISPLAY, "wayland-stub");
+    assert.equal(server.environment.XDG_SESSION_TYPE, "wayland");
+    assert.equal(server.environment.DISPLAY, ":9", "an empty variable must not shadow the session value");
+    assert.equal(server.environment.DBUS_SESSION_BUS_ADDRESS, "unix:path=/run/stub/bus");
+    assert.equal(server.environment.PATH, process.env.PATH, "the process environment wins over the session manager");
+  });
+});
+
+test("a disabled plugin does not read the session environment", async () => {
+  await withSystemctl([], async (directory) => {
+    delete process.env.WAYLAND_DISPLAY;
+    delete process.env.XDG_SESSION_TYPE;
+    const { skills } = await configure({ enabled: false });
+    assert.deepEqual(skills, []);
+    await assert.rejects(readFile(join(directory, "systemctl.log"), "utf8"), { code: "ENOENT" });
+  });
+});
+
 test("disablement, custom MCPs and invalid options", async () => {
   assert.deepEqual((await configure({enabled:false})).skills,[]);
   await assert.rejects(configure({enabled:"yes"}),/boolean/);
