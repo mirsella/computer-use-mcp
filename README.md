@@ -16,6 +16,10 @@ See [MCP.md](MCP.md) for setup and the six-tool public contract,
 [SECURITY.md](SECURITY.md) for trust boundaries, and
 [ARCHITECTURE.md](ARCHITECTURE.md) for implementation authorities.
 
+Package 1.x is the OpenCode v1 release line (1.18 or newer, below 2).
+Use package 2.x for the native OpenCode v2 adapter. Codex uses the same
+standalone Rust server in both release lines.
+
 ## Requirements
 
 - KDE Plasma Wayland with `kwin_wayland` and the KDE desktop portals
