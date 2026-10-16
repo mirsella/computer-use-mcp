@@ -128,3 +128,25 @@ jobs:
             gh release create "$tag" release-artifacts/*.tgz release-artifacts/SHA256SUMS \
               --target "$RELEASE_COMMIT" --title "$tag" --generate-notes --latest="$latest"
           fi
+      # Codex installs plugins from a Git marketplace. Publish the packed
+      # package layout to release/latest so
+      # `codex plugin marketplace add mirsella/computer-use-mcp --ref release/latest`
+      # tracks every latest-channel release.
+      - name: Publish the Codex marketplace branch
+        if: inputs.npm_mode != 'dry-run' && steps.package.outputs.channel == 'latest'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          set -euo pipefail
+          workdir="$(mktemp -d)"
+          tar -xzf release-artifacts/*.tgz -C "$workdir"
+          git -C "$workdir/package" init -q -b release/latest
+          git -C "$workdir/package" add -A -f .
+          git -C "$workdir/package" \
+            -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "v$VERSION"
+          git -C "$workdir/package" push --force \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            refs/heads/release/latest
