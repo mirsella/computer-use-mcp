@@ -24,7 +24,7 @@ function requiresDirectTools(config) {
 }
 
 export default {
-  id: "@mirsella/opencode-computer-use-mcp",
+  id: "@mirsella/computer-use-mcp",
   server: async (_input, options) => {
     const { enabled = true, compactTools = true } = options ?? {};
     if (typeof enabled !== "boolean") throw new Error("enabled must be a boolean");
@@ -35,7 +35,7 @@ export default {
         if (!config.mcp.computer_use) {
           const compact = compactTools && !requiresDirectTools(config);
           if (enabled && compactTools && !compact) {
-            console.warn("@mirsella/opencode-computer-use-mcp uses direct tools to preserve per-tool permissions");
+            console.warn("@mirsella/computer-use-mcp uses direct tools to preserve per-tool permissions");
           }
           config.mcp.computer_use = {
             type: "local",

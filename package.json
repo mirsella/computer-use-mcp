@@ -1,11 +1,11 @@
 {
-  "name": "@mirsella/opencode-computer-use-mcp",
+  "name": "@mirsella/computer-use-mcp",
   "version": "1.0.0",
   "description": "Standalone Computer Use MCP for KDE Plasma Wayland, with OpenCode and Codex integrations",
   "type": "module",
   "exports": {
-    ".": "./plugin/computer-use.mjs",
-    "./server": "./plugin/computer-use.mjs"
+    ".": "./server.mjs",
+    "./server": "./server.mjs"
   },
   "bin": {
     "computer-use-mcp": "vendor/bin/computer-use-mcp"
@@ -20,7 +20,8 @@
     "LICENSE",
     ".codex-plugin/plugin.json",
     ".agents/plugins/marketplace.json",
-    ".mcp.json"
+    ".mcp.json",
+    "server.mjs"
   ],
   "scripts": {
     "prepack": "node scripts/package-native.mjs",
@@ -56,6 +57,8 @@
     "opencode": ">=1.18.0 <2"
   },
   "publishConfig": {
-    "access": "public"
-  }
+    "access": "public",
+    "tag": "opencode1"
+  },
+  "main": "./server.mjs"
 }

@@ -61,7 +61,7 @@ authority rules described below.
 ### OpenCode Configuration
 
 The npm package includes the precompiled Linux x64 server. With OpenCode 1.18
-or newer, add `"@mirsella/opencode-computer-use-mcp"` to the `plugin` array and
+or newer, add `"@mirsella/computer-use-mcp@opencode1"` to the `plugin` array and
 restart OpenCode. The plugin registers compact tools and the bundled skill.
 Per-tool `permission` or `tools` rules at global or agent scope select direct
 tools automatically; broad `computer_use_*` rules apply in either mode.
@@ -79,7 +79,7 @@ each call:
   "mcp": {
     "computer_use": {
       "type": "local",
-      "command": ["npx", "-y", "@mirsella/opencode-computer-use-mcp", "mcp"],
+      "command": ["npx", "-y", "@mirsella/computer-use-mcp@opencode1", "mcp"],
       "enabled": true,
       "timeout": 90000
     }

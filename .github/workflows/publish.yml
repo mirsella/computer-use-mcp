@@ -5,11 +5,6 @@ on:
     branches: ['**']
   pull_request:
   workflow_dispatch:
-    inputs:
-      publish_npm:
-        description: Publish the existing npm package
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -26,6 +21,11 @@ jobs:
         with:
           node-version: 24
           package-manager-cache: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - name: Install JavaScript dependencies
+        run: pnpm install --frozen-lockfile
 
       - name: Install native dependencies
         run: |
@@ -42,44 +42,25 @@ jobs:
           cargo test --locked --workspace --all-features
 
       - name: Build npm tarball
-        run: npm pack
+        run: pnpm pack
 
       - name: Test the packed plugin and MCP executable
         run: |
-          mkdir -p target/npm-package-test
-          tar -xzf mirsella-opencode-computer-use-mcp-*.tgz -C target/npm-package-test
-          COMPUTER_USE_MCP_PACKAGE_DIR=target/npm-package-test/package npm test
+          consumer=$(mktemp -d "$RUNNER_TEMP/computer-use-consumer.XXXXXX")
+          printf '{"name":"package-consumer","private":true}\n' > "$consumer/package.json"
+          pnpm --dir "$consumer" add "$GITHUB_WORKSPACE"/mirsella-computer-use-mcp-*.tgz @opencode-ai/plugin@1.18.11
+          package="$consumer/node_modules/@mirsella/computer-use-mcp"
+          COMPUTER_USE_MCP_PACKAGE_DIR="$package" pnpm test
           python3 -B -m unittest discover -s scripts -p 'test_model_smoke.py'
-          ldd target/npm-package-test/package/vendor/bin/computer-use-mcp
+          ldd "$package/vendor/bin/computer-use-mcp"
 
       - name: Checksum release package
-        run: sha256sum mirsella-opencode-computer-use-mcp-*.tgz > SHA256SUMS
+        run: sha256sum mirsella-computer-use-mcp-*.tgz > SHA256SUMS
 
       - uses: actions/upload-artifact@v7
         with:
           name: npm-package
           path: |
-            mirsella-opencode-computer-use-mcp-*.tgz
+            mirsella-computer-use-mcp-*.tgz
             SHA256SUMS
           if-no-files-found: error
-
-  publish:
-    if: inputs.publish_npm
-    needs: test
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 24
-          registry-url: https://registry.npmjs.org
-          package-manager-cache: false
-      - uses: actions/download-artifact@v8
-        with:
-          name: npm-package
-      - name: Publish with npm trusted publishing
-        env:
-          NPM_TAG: latest
-        run: npm publish ./mirsella-opencode-computer-use-mcp-*.tgz --access public --tag "$NPM_TAG"
