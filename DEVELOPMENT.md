@@ -246,13 +246,12 @@ Push the versioned source commit to `main` for 2.x, or to
 `main` with the full source `commit` SHA. It verifies the pinned workflow and
 source branch, then reuses the checksummed `npm-package` artifact.
 
-Use `npm_mode=stage` to submit a release for approval on npm's Staged Packages
-page. For a new npm name, a temporary staging-only `NPM_STAGE_TOKEN` can
-bootstrap the first release; remove that secret and revoke the token after
-approval. Configure npm's trusted publisher as this repository's `release.yml`
-without an environment, then use `npm_mode=publish` for OIDC publication.
-Versions 1.x use `opencode1`; 2.x use `latest`. GitHub releases attach the same
-tested tarball and `SHA256SUMS`. Keep npm, Cargo and Codex versions synchronized.
+Configure npm's trusted publisher as this repository's `release.yml` without
+an environment. Dispatch with `npm_mode=publish` to publish through OIDC,
+create the GitHub release, and update the Codex marketplace branch for `latest`.
+Use `npm_mode=dry-run` to verify without writing. Versions 1.x use `opencode1`;
+2.x use `latest`. GitHub releases attach the same tested tarball and
+`SHA256SUMS`. Keep npm, Cargo and Codex versions synchronized.
 
 ### Native CLI
 

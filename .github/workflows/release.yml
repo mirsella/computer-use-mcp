@@ -8,9 +8,9 @@ on:
         required: true
         type: string
       npm_mode:
-        description: Stage for browser approval, publish with OIDC, or verify without writing
+        description: Verify the pinned artifact without writing, or publish with OIDC and finish the release
         type: choice
-        options: [dry-run, stage, publish]
+        options: [dry-run, publish]
         default: dry-run
 
 concurrency:
@@ -92,17 +92,6 @@ jobs:
         env:
           TARBALL: ${{ steps.package.outputs.tarball }}
         run: npm publish "$TARBALL" --dry-run --ignore-scripts
-      - name: Stage for npm browser approval
-        if: inputs.npm_mode == 'stage' && steps.package.outputs.exists != 'true'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_STAGE_TOKEN }}
-          TARBALL: ${{ steps.package.outputs.tarball }}
-          NPM_TAG: ${{ steps.package.outputs.channel }}
-        run: |
-          if [ -n "$NODE_AUTH_TOKEN" ]; then
-            unset ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN
-          fi
-          npm stage publish "$TARBALL" --access public --tag "$NPM_TAG" --ignore-scripts
       - name: Publish with npm trusted publishing
         if: inputs.npm_mode == 'publish' && steps.package.outputs.exists != 'true'
         env:

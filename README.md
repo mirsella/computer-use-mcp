@@ -271,6 +271,8 @@ automation, and a standalone desktop UI are not supported.
 CI builds and tests the distributable tarball on every push. Run the `release`
 workflow from `main` with the full tested source commit: `main` for 2.x, or
 `release/opencode-v1` for 1.x. The workflow verifies that commit and downloads
-its checksummed CI artifact instead of rebuilding it. Use `stage` for npm
-browser approval, or `publish` after configuring `release.yml` as an npm
-trusted publisher. The channels are `latest` for 2.x and `opencode1` for 1.x.
+its checksummed CI artifact instead of rebuilding it. Dispatch with
+`npm_mode=publish` to publish through npm's OIDC trusted publisher, create the
+GitHub release, and update the Codex marketplace branch for `latest`. Use
+`npm_mode=dry-run` to verify without writing. The channels are `latest` for 2.x
+and `opencode1` for 1.x.
