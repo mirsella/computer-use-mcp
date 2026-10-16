@@ -54,7 +54,15 @@ jobs:
             2.*:latest) branch=main ;;
             *) echo "::error::Unexpected release version/channel: $version:$channel"; exit 1 ;;
           esac
-          test "$RELEASE_COMMIT" = "$(git rev-parse "origin/$branch")"
+          branch_tip="$(git rev-parse "origin/$branch")"
+          git merge-base --is-ancestor "$RELEASE_COMMIT" "$branch_tip"
+          # Reuse passing artifacts when only this release workflow was repaired.
+          # Any package, dependency, documentation or test change requires new CI.
+          changed="$(git diff --name-only "$RELEASE_COMMIT" "$branch_tip" -- . ':!.github/workflows/release.yml')"
+          if [ -n "$changed" ]; then
+            echo "::error::Source branch changed outside the release workflow: $changed"
+            exit 1
+          fi
           run_id="$(gh run list --commit "$RELEASE_COMMIT" --workflow publish.yml --event push --status success --json databaseId --jq '.[0].databaseId')"
           test -n "$run_id"
           gh run download "$run_id" --name npm-package --dir release-artifacts
@@ -66,7 +74,7 @@ jobs:
           const source = JSON.parse(readFileSync('package.json', 'utf8'));
           const files = readdirSync('release-artifacts').filter(name => name.endsWith('.tgz'));
           if (files.length !== 1) throw new Error('Expected exactly one release tarball');
-          const tarball = `release-artifacts/${files[0]}`;
+          const tarball = `./release-artifacts/${files[0]}`;
           const packed = JSON.parse(execFileSync('tar', ['-xOf', tarball, 'package/package.json'], { encoding: 'utf8' }));
           if (packed.name !== source.name || packed.version !== source.version || packed.publishConfig.tag !== source.publishConfig.tag)
             throw new Error('Artifact metadata differs from the pinned source');
