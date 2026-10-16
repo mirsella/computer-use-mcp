@@ -1,16 +1,16 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import { access, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { constants } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createInterface } from "node:readline";
 import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = process.env.COMPUTER_USE_MCP_PACKAGE_DIR
-  ? pathToFileURL(`${resolve(process.env.COMPUTER_USE_MCP_PACKAGE_DIR)}/`)
+  ? pathToFileURL(`${await realpath(process.env.COMPUTER_USE_MCP_PACKAGE_DIR)}/`)
   : new URL("../", import.meta.url);
 const manifest = JSON.parse(await readFile(new URL("package.json", root), "utf8"));
 const plugin = (await import(new URL(manifest.exports["./server"], root))).default;
