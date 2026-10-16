@@ -31,7 +31,7 @@ async function sessionEnvironment() {
 }
 
 export default Plugin.define({
-  id: "@mirsella/opencode-computer-use-mcp",
+  id: "@mirsella/computer-use-mcp",
   async setup(ctx) {
     const { enabled = true, compactTools = true } = ctx.options;
     if (typeof enabled !== "boolean") throw new Error("enabled must be a boolean");

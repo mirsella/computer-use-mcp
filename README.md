@@ -16,15 +16,14 @@ See [MCP.md](MCP.md) for setup and the six-tool public contract,
 [SECURITY.md](SECURITY.md) for trust boundaries, and
 [ARCHITECTURE.md](ARCHITECTURE.md) for implementation authorities.
 
-
 Package 2.x targets OpenCode v2 (2.0.27 or newer). Package 1.x retains the
 OpenCode v1 adapter (1.18 or newer, below 2). Codex uses the same Rust MCP
 server and manifests in both releases. The native v2 adapter uses
 `@opencode/plugin`; local directories also expose a physical `server` entrypoint.
 
-Until these releases are published, use the v2 worktree through a `file://`
-plugin reference and its packaged Codex marketplace. The v1 and v2 preparation
-worktrees are independent; neither requires changing an installed package.
+Install `@mirsella/computer-use-mcp` for OpenCode v2, or `@mirsella/computer-use-mcp@opencode1`
+for OpenCode v1. Existing Nix-managed and local-directory installations can keep
+their configured paths.
 
 ## Requirements
 
@@ -56,8 +55,8 @@ runtime prerequisites.
 Run the precompiled npm package with Node.js 22 or newer:
 
 ```sh
-npx -y @mirsella/opencode-computer-use-mcp version
-npx -y @mirsella/opencode-computer-use-mcp mcp
+npx -y @mirsella/computer-use-mcp version
+npx -y @mirsella/computer-use-mcp mcp
 ```
 
 Or build and install the binary from the repository:
@@ -101,8 +100,8 @@ args = ["mcp", "--compact-tools"]
 tool_timeout_sec = 150
 ```
 
-The npm name remains `@mirsella/opencode-computer-use-mcp` until its separate
-migration. To use a GitHub release in OpenCode, set the plugin entry to
+The npm package is now `@mirsella/computer-use-mcp`; it replaces `@mirsella/opencode-computer-use-mcp`.
+To use a GitHub release in OpenCode, set the plugin entry to
 `"file:///absolute/path/to/unpacked/computer-use-mcp"` instead of the npm name.
 
 ## OpenCode setup
@@ -112,7 +111,7 @@ Add the package to your OpenCode configuration, using OpenCode 2.0.27 or newer:
 ```jsonc
 {
   "$schema": "https://opencode.ai/v2/config.json",
-  "plugins": ["@mirsella/opencode-computer-use-mcp"]
+  "plugins": ["@mirsella/computer-use-mcp"]
 }
 ```
 
@@ -155,7 +154,7 @@ This example asks for review before each tool call:
     "servers": {
       "computer_use": {
         "type": "local",
-        "command": ["pnpm", "dlx", "@mirsella/opencode-computer-use-mcp", "mcp"],
+        "command": ["pnpm", "dlx", "@mirsella/computer-use-mcp", "mcp"],
         "disabled": false,
         "codemode": false,
         "timeout": { "execution": 150000 }
@@ -266,3 +265,12 @@ automation, and a standalone desktop UI are not supported.
 - [SECURITY.md](SECURITY.md): trust boundary and residual risks
 - [ARCHITECTURE.md](ARCHITECTURE.md): implementation and invariants
 - [DEVELOPMENT.md](DEVELOPMENT.md): contributor workflow and checks
+
+## Releases
+
+CI builds and tests the distributable tarball on every push. Run the `release`
+workflow from `main` with the full tested source commit: `main` for 2.x, or
+`release/opencode-v1` for 1.x. The workflow verifies that commit and downloads
+its checksummed CI artifact instead of rebuilding it. Use `stage` for npm
+browser approval, or `publish` after configuring `release.yml` as an npm
+trusted publisher. The channels are `latest` for 2.x and `opencode1` for 1.x.

@@ -225,7 +225,7 @@ Linux/KDE environment, not a claim of support for every platform.
 
 ### npm packaging and releases
 
-`@mirsella/opencode-computer-use-mcp` ships the Linux x64 GNU executable, an
+`@mirsella/computer-use-mcp` ships the Linux x64 GNU executable, an
 OpenCode adapter, Codex plugin, and a copy of the canonical skill. `npm pack` uses
 `cargo install` to build the release executable into `vendor/bin` and copies
 the canonical skill. Cargo and npm versions must match.
@@ -241,14 +241,18 @@ extracted package's OpenCode permissions, Codex registration, direct/compact
 MCP discovery, and dispatch validation without a desktop. It uploads the
 tested tarball and `SHA256SUMS` as the `npm-package` artifact.
 
-Push the release commit to main and wait for CI. Dispatch `release.yml` with
-that full `commit` SHA to publish the tested artifact to GitHub Releases.
-The workflow verifies that the pinned commit is still main.
+Push the versioned source commit to `main` for 2.x, or to
+`release/opencode-v1` for 1.x, and wait for CI. Dispatch `release.yml` from
+`main` with the full source `commit` SHA. It verifies the pinned workflow and
+source branch, then reuses the checksummed `npm-package` artifact.
 
-The npm name remains unchanged. npm publishing requires an explicit
-`publish.yml` dispatch with `publish_npm=true`. Its trusted publisher is
-`mirsella/computer-use-mcp`, workflow `publish.yml`, without an environment.
-The job uses OIDC and needs no npm token.
+Use `npm_mode=stage` to submit a release for approval on npm's Staged Packages
+page. For a new npm name, a temporary staging-only `NPM_STAGE_TOKEN` can
+bootstrap the first release; remove that secret and revoke the token after
+approval. Configure npm's trusted publisher as this repository's `release.yml`
+without an environment, then use `npm_mode=publish` for OIDC publication.
+Versions 1.x use `opencode1`; 2.x use `latest`. GitHub releases attach the same
+tested tarball and `SHA256SUMS`. Keep npm, Cargo and Codex versions synchronized.
 
 ### Native CLI
 

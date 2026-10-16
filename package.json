@@ -1,5 +1,5 @@
 {
-  "name": "@mirsella/opencode-computer-use-mcp",
+  "name": "@mirsella/computer-use-mcp",
   "version": "2.0.0",
   "description": "Standalone Computer Use MCP for KDE Plasma Wayland, with OpenCode and Codex integrations",
   "type": "module",
@@ -57,7 +57,8 @@
     "opencode": ">=2.0.27 <3"
   },
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "tag": "latest"
   },
   "peerDependencies": {
     "@opencode/plugin": ">=2.0.27 <3"

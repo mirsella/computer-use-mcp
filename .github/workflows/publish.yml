@@ -5,11 +5,6 @@ on:
     branches: ['**']
   pull_request:
   workflow_dispatch:
-    inputs:
-      publish_npm:
-        description: Publish the existing npm package
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -53,40 +48,19 @@ jobs:
         run: |
           consumer=$(mktemp -d "$RUNNER_TEMP/computer-use-consumer.XXXXXX")
           printf '{"name":"package-consumer","private":true}\n' > "$consumer/package.json"
-          pnpm --dir "$consumer" add "$GITHUB_WORKSPACE"/mirsella-opencode-computer-use-mcp-*.tgz @opencode/plugin@2.0.28
-          package="$consumer/node_modules/@mirsella/opencode-computer-use-mcp"
+          pnpm --dir "$consumer" add "$GITHUB_WORKSPACE"/mirsella-computer-use-mcp-*.tgz @opencode/plugin@2.0.28
+          package="$consumer/node_modules/@mirsella/computer-use-mcp"
           COMPUTER_USE_MCP_PACKAGE_DIR="$package" pnpm test
           python3 -B -m unittest discover -s scripts -p 'test_model_smoke.py'
           ldd "$package/vendor/bin/computer-use-mcp"
 
       - name: Checksum release package
-        run: sha256sum mirsella-opencode-computer-use-mcp-*.tgz > SHA256SUMS
+        run: sha256sum mirsella-computer-use-mcp-*.tgz > SHA256SUMS
 
       - uses: actions/upload-artifact@v7
         with:
           name: npm-package
           path: |
-            mirsella-opencode-computer-use-mcp-*.tgz
+            mirsella-computer-use-mcp-*.tgz
             SHA256SUMS
           if-no-files-found: error
-
-  publish:
-    if: inputs.publish_npm
-    needs: test
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 24
-          registry-url: https://registry.npmjs.org
-          package-manager-cache: false
-      - uses: actions/download-artifact@v8
-        with:
-          name: npm-package
-      - name: Publish with npm trusted publishing
-        env:
-          NPM_TAG: latest
-        run: npm publish ./mirsella-opencode-computer-use-mcp-*.tgz --access public --tag "$NPM_TAG"

@@ -4,16 +4,26 @@ on:
   workflow_dispatch:
     inputs:
       commit:
-        description: Tested main commit to release
+        description: Full tested source commit (main for v2, release/opencode-v1 for v1)
         required: true
         type: string
+      npm_mode:
+        description: Stage for browser approval, publish with OIDC, or verify without writing
+        type: choice
+        options: [dry-run, stage, publish]
+        default: dry-run
+
+concurrency:
+  group: npm-release
+  cancel-in-progress: false
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
       actions: read
+      id-token: write
     steps:
       - uses: actions/checkout@v6
         with:
@@ -22,24 +32,91 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - name: Release the tested package from pinned main
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - run: npm install --global npm@11.15.0
+      - name: Select the pinned, tested release artifact
+        id: package
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_COMMIT: ${{ inputs.commit }}
+          WORKFLOW_COMMIT: ${{ github.sha }}
+          WORKFLOW_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
-          commit="$(git rev-parse HEAD)"
-          test "$RELEASE_COMMIT" = "$commit"
-          test "$(git rev-parse origin/main)" = "$commit"
+          test "$WORKFLOW_REF" = refs/heads/main
+          test "$WORKFLOW_COMMIT" = "$(git rev-parse origin/main)"
+          test "$RELEASE_COMMIT" = "$(git rev-parse HEAD)"
           version="$(node -p 'require("./package.json").version')"
-          tag="v${version}"
-          if gh release view "$tag" >/dev/null 2>&1 || git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
-            echo "::error::Release or tag $tag already exists"
-            exit 1
-          fi
-          run_id="$(gh run list --commit "$commit" --workflow publish.yml --event push --status success --json databaseId --jq '.[0].databaseId')"
+          channel="$(node -p 'require("./package.json").publishConfig.tag')"
+          case "$version:$channel" in
+            1.*:opencode1) branch=release/opencode-v1 ;;
+            2.*:latest) branch=main ;;
+            *) echo "::error::Unexpected release version/channel: $version:$channel"; exit 1 ;;
+          esac
+          test "$RELEASE_COMMIT" = "$(git rev-parse "origin/$branch")"
+          run_id="$(gh run list --commit "$RELEASE_COMMIT" --workflow publish.yml --event push --status success --json databaseId --jq '.[0].databaseId')"
           test -n "$run_id"
           gh run download "$run_id" --name npm-package --dir release-artifacts
-          cd release-artifacts
-          sha256sum --check SHA256SUMS
-          gh release create "$tag" ./*.tgz SHA256SUMS --target "$commit" --title "$tag" --generate-notes
+          (cd release-artifacts && sha256sum --check SHA256SUMS)
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync, readdirSync } from 'node:fs';
+          import { execFileSync } from 'node:child_process';
+          import { createHash } from 'node:crypto';
+          const source = JSON.parse(readFileSync('package.json', 'utf8'));
+          const files = readdirSync('release-artifacts').filter(name => name.endsWith('.tgz'));
+          if (files.length !== 1) throw new Error('Expected exactly one release tarball');
+          const tarball = `release-artifacts/${files[0]}`;
+          const packed = JSON.parse(execFileSync('tar', ['-xOf', tarball, 'package/package.json'], { encoding: 'utf8' }));
+          if (packed.name !== source.name || packed.version !== source.version || packed.publishConfig.tag !== source.publishConfig.tag)
+            throw new Error('Artifact metadata differs from the pinned source');
+          const response = await fetch(`https://registry.npmjs.org/${encodeURIComponent(source.name)}/${encodeURIComponent(source.version)}`);
+          if (!response.ok && response.status !== 404) throw new Error(`Registry lookup failed: ${response.status}`);
+          if (response.ok) {
+            const published = await response.json();
+            const integrity = 'sha512-' + createHash('sha512').update(readFileSync(tarball)).digest('base64');
+            if (published.dist.integrity !== integrity) throw new Error('Published version has different contents');
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, `tarball=${tarball}\nchannel=${source.publishConfig.tag}\nversion=${source.version}\nexists=${response.ok}\n`);
+          NODE
+      - name: Verify without publishing
+        if: inputs.npm_mode == 'dry-run'
+        env:
+          TARBALL: ${{ steps.package.outputs.tarball }}
+        run: npm publish "$TARBALL" --dry-run --ignore-scripts
+      - name: Stage for npm browser approval
+        if: inputs.npm_mode == 'stage' && steps.package.outputs.exists != 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_STAGE_TOKEN }}
+          TARBALL: ${{ steps.package.outputs.tarball }}
+          NPM_TAG: ${{ steps.package.outputs.channel }}
+        run: |
+          if [ -n "$NODE_AUTH_TOKEN" ]; then
+            unset ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN
+          fi
+          npm stage publish "$TARBALL" --access public --tag "$NPM_TAG" --ignore-scripts
+      - name: Publish with npm trusted publishing
+        if: inputs.npm_mode == 'publish' && steps.package.outputs.exists != 'true'
+        env:
+          TARBALL: ${{ steps.package.outputs.tarball }}
+          NPM_TAG: ${{ steps.package.outputs.channel }}
+        run: npm publish "$TARBALL" --access public --tag "$NPM_TAG" --ignore-scripts
+      - name: Create the matching GitHub release
+        if: inputs.npm_mode != 'dry-run'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ inputs.commit }}
+          VERSION: ${{ steps.package.outputs.version }}
+          CHANNEL: ${{ steps.package.outputs.channel }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            test "$(git rev-parse "$tag^{commit}")" = "$RELEASE_COMMIT"
+            echo "GitHub release $tag already exists for this commit."
+          else
+            latest=false
+            if [ "$CHANNEL" = latest ]; then latest=true; fi
+            gh release create "$tag" release-artifacts/*.tgz release-artifacts/SHA256SUMS \
+              --target "$RELEASE_COMMIT" --title "$tag" --generate-notes --latest="$latest"
+          fi
