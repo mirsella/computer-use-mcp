@@ -1,0 +1,33 @@
+{
+  "mcpServers": {
+    "computer_use": {
+      "command": "./vendor/bin/computer-use-mcp",
+      "args": [
+        "mcp",
+        "--compact-tools"
+      ],
+      "cwd": ".",
+      "startup_timeout_sec": 40,
+      "tool_timeout_sec": 150,
+      "env_vars": [
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "XDG_RUNTIME_DIR",
+        "XDG_SESSION_TYPE",
+        "XDG_CURRENT_DESKTOP",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+        "AT_SPI_BUS_ADDRESS",
+        "COMPUTER_USE_MCP_DISPLAY",
+        "COMPUTER_USE_MCP_TAKEOVER",
+        "COMPUTER_USE_MCP_TAKEOVER_FILE",
+        "COMPUTER_USE_MCP_INPUT_DEVICES",
+        "COMPUTER_USE_MCP_PERSIST_PORTAL",
+        "COMPUTER_USE_MCP_KDE_WINDOW_MANAGEMENT"
+      ]
+    }
+  }
+}
