@@ -148,6 +148,8 @@ fn tool(
     destructive: bool,
 ) -> Tool {
     let annotations = ToolAnnotations::new()
+        // First AT-SPI use may enable the session bridge (SECURITY.md); that
+        // service activation leaves no user-visible state, keeping this true.
         .read_only(read_only)
         .open_world(true)
         .destructive(destructive)

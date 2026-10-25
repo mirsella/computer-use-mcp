@@ -13,6 +13,11 @@ six operations: `list_desktop`, `launch_application`, `activate_window`,
   Direct tool names are unavailable in compact mode; recursive dispatch and
   unknown operations are rejected before desktop startup.
 
+Annotations mark `list_desktop`, `observe`, and `wait_for` read-only and
+idempotent. The first operation needing the accessibility tree may enable the
+session's AT-SPI bridge (see [SECURITY.md](SECURITY.md)); that one-time service
+activation changes no desktop state.
+
 Initialize carries shared evidence/recovery rules. Direct tool definitions or
 on-demand help carry operation details; the skill carries workflow guidance.
 
