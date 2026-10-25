@@ -1835,7 +1835,7 @@ fn initialize_protocol_state(backend: ProtocolBackend) -> Result<ProtocolRuntime
         state,
     };
     send_initial_sync(&mut runtime);
-    bounded_initial_roundtrip(&mut runtime, INITIAL_ROUNDTRIP_BOUND)?;
+    bounded_initial_roundtrip(&mut runtime)?;
 
     let qh = runtime.queue.handle();
     let registry = runtime.state.registry.as_ref().ok_or_else(|| {
@@ -1926,7 +1926,7 @@ fn initialize_protocol_state(backend: ProtocolBackend) -> Result<ProtocolRuntime
     // in the first published snapshot.
     runtime.state.initial_done = false;
     send_initial_sync(&mut runtime);
-    bounded_initial_roundtrip(&mut runtime, INITIAL_ROUNDTRIP_BOUND)?;
+    bounded_initial_roundtrip(&mut runtime)?;
     runtime.state.publish();
     Ok(runtime)
 }
@@ -1952,13 +1952,10 @@ fn send_initial_sync(runtime: &mut ProtocolRuntime) {
 /// backend for the rest of the server's life.
 const INITIAL_ROUNDTRIP_BOUND: Duration = Duration::from_secs(4);
 
-fn bounded_initial_roundtrip(
-    runtime: &mut ProtocolRuntime,
-    bound: Duration,
-) -> Result<(), BackendError> {
+fn bounded_initial_roundtrip(runtime: &mut ProtocolRuntime) -> Result<(), BackendError> {
     use rustix::event::{PollFd, PollFlags, poll};
 
-    let deadline = Instant::now() + bound;
+    let deadline = Instant::now() + INITIAL_ROUNDTRIP_BOUND;
     while !runtime.state.initial_done {
         if Instant::now() >= deadline {
             return Err(BackendError::Unavailable(
