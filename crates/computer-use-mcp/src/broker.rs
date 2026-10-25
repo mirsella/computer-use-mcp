@@ -249,16 +249,18 @@ struct Worker {
 
 impl Worker {
     fn spawn(desktop: Desktop, generation: u64) -> io::Result<Self> {
-        Self::from_command(Self::command(desktop)?, generation)
+        Self::from_command(Self::command(desktop), generation)
     }
 
-    fn command(desktop: Desktop) -> io::Result<Command> {
-        let executable = std::env::current_exe()?;
-        let command = if desktop == Desktop::Background {
+    fn command(desktop: Desktop) -> Command {
+        // The pid-qualified path keeps reaching the running image after an
+        // upgrade unlinks the installed binary; its recorded path would fail.
+        let executable = format!("/proc/{}/exe", std::process::id());
+        if desktop == Desktop::Background {
             let mut command = Command::new("bash");
             command
                 .args(["-c", RUNNER, "computer-use-mcp-background", "--"])
-                .arg(&executable)
+                .arg(executable.as_str())
                 .arg("__background_worker");
             // A user's standalone runner override must not change the worker
             // executable or protocol of the installed broker.
@@ -266,11 +268,10 @@ impl Worker {
             command.env("COMPUTER_USE_MCP_PRIVATE_PORTAL_AUTH", "require");
             command
         } else {
-            let mut command = Command::new(executable);
+            let mut command = Command::new(executable.as_str());
             command.arg("__desktop_worker");
             command
-        };
-        Ok(command)
+        }
     }
 
     fn from_command(mut command: Command, generation: u64) -> io::Result<Self> {
@@ -899,6 +900,21 @@ mod tests {
     use crate::validation::ToolCall;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    #[test]
+    fn workers_execute_the_running_image() {
+        let executable = format!("/proc/{}/exe", std::process::id());
+        assert_eq!(
+            Worker::command(Desktop::Foreground).as_std().get_program(),
+            std::ffi::OsStr::new(&executable),
+        );
+        assert!(
+            Worker::command(Desktop::Background)
+                .as_std()
+                .get_args()
+                .any(|argument| argument == std::ffi::OsStr::new(&executable)),
+        );
+    }
+
     // A real subprocess with deliberately colliding local IDs. It echoes
     // received arguments rather than implementing any broker routing logic.
     fn fixture_command(desktop: Desktop) -> Command {
@@ -1242,7 +1258,7 @@ for line in sys.stdin:
 
     #[test]
     fn background_command_requires_private_preauthorization() {
-        let command = Worker::command(Desktop::Background).unwrap();
+        let command = Worker::command(Desktop::Background);
         assert!(
             command
                 .as_std()
@@ -1252,7 +1268,6 @@ for line in sys.stdin:
         );
         assert!(
             !Worker::command(Desktop::Foreground)
-                .unwrap()
                 .as_std()
                 .get_envs()
                 .any(|(key, _)| key == "COMPUTER_USE_MCP_PRIVATE_PORTAL_AUTH")
