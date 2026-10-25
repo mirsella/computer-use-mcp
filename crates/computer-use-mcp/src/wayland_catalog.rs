@@ -1835,7 +1835,7 @@ fn initialize_protocol_state(backend: ProtocolBackend) -> Result<ProtocolRuntime
         state,
     };
     send_initial_sync(&mut runtime);
-    bounded_initial_roundtrip(&mut runtime, Duration::from_secs(2))?;
+    bounded_initial_roundtrip(&mut runtime, INITIAL_ROUNDTRIP_BOUND)?;
 
     let qh = runtime.queue.handle();
     let registry = runtime.state.registry.as_ref().ok_or_else(|| {
@@ -1926,7 +1926,7 @@ fn initialize_protocol_state(backend: ProtocolBackend) -> Result<ProtocolRuntime
     // in the first published snapshot.
     runtime.state.initial_done = false;
     send_initial_sync(&mut runtime);
-    bounded_initial_roundtrip(&mut runtime, Duration::from_secs(2))?;
+    bounded_initial_roundtrip(&mut runtime, INITIAL_ROUNDTRIP_BOUND)?;
     runtime.state.publish();
     Ok(runtime)
 }
@@ -1946,6 +1946,11 @@ fn send_initial_sync(runtime: &mut ProtocolRuntime) {
         .sync(&runtime.queue.handle(), ());
     runtime.state.initial_sync = Some(callback);
 }
+
+/// A compositor can stall its event loop long enough to miss a tight bound
+/// while the session is healthy; allow a longer wait before degrading this
+/// backend for the rest of the server's life.
+const INITIAL_ROUNDTRIP_BOUND: Duration = Duration::from_secs(4);
 
 fn bounded_initial_roundtrip(
     runtime: &mut ProtocolRuntime,
