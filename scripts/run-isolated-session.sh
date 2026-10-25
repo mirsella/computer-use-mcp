@@ -192,7 +192,7 @@ process_has_isolation_marker() {
     local pid="$1"
     local entry
     local environment_fd
-    if ! exec {environment_fd}<"/proc/$pid/environ" 2>/dev/null; then
+    if ! exec {environment_fd}<"/proc/$pid/environ"; then
         return 1
     fi
     while IFS= read -r -d '' entry; do
@@ -227,7 +227,7 @@ kill_marked_processes() {
         [ -d "$process_path" ] || continue
         pid="${process_path##*/}"
         [ "$pid" = "$$" ] && continue
-        if [[ -O "$process_path" ]] && process_has_isolation_marker "$pid"; then
+        if [[ -O "$process_path" ]] && process_has_isolation_marker "$pid" 2>/dev/null; then
             kill "-$signal" "$pid" 2>/dev/null || true
         fi
     done
@@ -261,6 +261,16 @@ trap 'exit 143' TERM
 
 export XDG_RUNTIME_DIR="$RUNTIME_DIR"
 export WAYLAND_DISPLAY="wayland-virtual-$$"
+# The Wayland socket address is limited to 107 bytes plus a NUL terminator.
+# Check before starting services so a long TMPDIR fails with a usable message
+# instead of an opaque compositor crash.
+wayland_socket_bytes=$(printf '%s/%s' "$RUNTIME_DIR" "$WAYLAND_DISPLAY" | wc -c)
+if [ "$wayland_socket_bytes" -gt 107 ]; then
+    printf 'run-isolated-session.sh: Wayland socket path exceeds 107 bytes: %s/%s\n' \
+        "$RUNTIME_DIR" "$WAYLAND_DISPLAY" >&2
+    printf 'run-isolated-session.sh: set TMPDIR to a shorter disk-backed directory\n' >&2
+    exit 1
+fi
 export DBUS_SESSION_BUS_ADDRESS="unix:path=$RUNTIME_DIR/bus"
 export PIPEWIRE_RUNTIME_DIR="$RUNTIME_DIR"
 export PIPEWIRE_REMOTE=pipewire-0

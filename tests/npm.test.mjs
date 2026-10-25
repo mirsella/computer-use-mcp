@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { access, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -15,6 +15,8 @@ const root = process.env.COMPUTER_USE_MCP_PACKAGE_DIR
 const manifest = JSON.parse(await readFile(new URL("package.json", root), "utf8"));
 const plugin = (await import(new URL(manifest.exports["./server"], root))).default;
 const binary = fileURLToPath(new URL(manifest.bin["computer-use-mcp"], root));
+const launcher = fileURLToPath(new URL("./host/mcp-server", root));
+const desktopKeys = ["XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "DISPLAY", "XAUTHORITY", "XDG_SESSION_TYPE", "DBUS_SESSION_BUS_ADDRESS", "XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP"];
 
 test("Codex packages the same standalone server and canonical skill", async () => {
   const load = async (path) => JSON.parse(await readFile(new URL(path, root), "utf8"));
@@ -26,10 +28,11 @@ test("Codex packages the same standalone server and canonical skill", async () =
   assert.equal(codex.skills, "./skills/");
   assert.equal(marketplace.name, "computer-use-mcp");
   assert.equal(marketplace.plugins[0].name, codex.name);
-  assert.equal(fileURLToPath(new URL(server.command, root)), binary);
+  assert.equal(fileURLToPath(new URL(server.command, root)), launcher);
+  await access(launcher, constants.X_OK);
   assert.deepEqual(server.args, ["mcp", "--compact-tools"]);
   assert.equal(server.tool_timeout_sec, 150);
-  for (const file of [".codex-plugin/plugin.json", ".agents/plugins/marketplace.json", ".mcp.json"])
+  for (const file of [".codex-plugin/plugin.json", ".agents/plugins/marketplace.json", ".mcp.json", "host/mcp-server"])
     assert.ok(manifest.files.includes(file), `${file} must ship in the tarball`);
 });
 
@@ -48,9 +51,19 @@ async function configure(options = {}, permissions = [], existing, listAgents = 
   await prompt?.();
   return {server, skills};
 }
+test("Codex entry point starts the server with the recovered session environment", async () => {
+  await withSystemctl(["WAYLAND_DISPLAY=wayland-stub", "XDG_SESSION_TYPE=wayland", "XDG_CURRENT_DESKTOP=KDE"], async environment => {
+    for (const key of desktopKeys) delete environment[key];
+    const { stdout, status } = spawnSync(launcher, ["doctor"], { encoding: "utf8", env: environment, timeout: 30_000 });
+    assert.equal(status, 0, "the entry point hands back the server exit status");
+    assert.match(stdout, /^Session type: wayland$/m);
+    assert.match(stdout, /^Display: wayland-stub$/m);
+    assert.match(stdout, /^Desktop: KDE$/m);
+  });
+});
 test("native adapter registers its server and skill", async () => {
   const {server, skills} = await configure();
-  assert.deepEqual(server.command, [binary,"mcp","--compact-tools"]);
+  assert.deepEqual(server.command, [launcher,"mcp","--compact-tools"]);
   assert.equal(server.timeout.execution,150000);
   assert.equal(server.codemode,false);
   assert.equal(skills.length,1);
@@ -60,44 +73,61 @@ async function withSystemctl(stub, run) {
   const directory = await mkdtemp(join(tmpdir(), "computer-use-mcp-systemctl-"));
   const script = ["#!/bin/sh", ': > "$0.log"', ...stub.map(line => `printf '%s\\n' '${line}'`), ""].join("\n");
   await writeFile(join(directory, "systemctl"), script, { mode: 0o755 });
-  const saved = { ...process.env };
-  process.env.PATH = `${directory}:${saved.PATH}`;
   try {
-    return await run(directory);
+    return await run({ ...process.env, PATH: `${directory}:${process.env.PATH}` }, directory);
   } finally {
-    process.env = saved;
     await rm(directory, { recursive: true, force: true });
   }
 }
 
-test("a harness outside the session falls back to the systemd user environment", async () => {
-  const stub = ["WAYLAND_DISPLAY=wayland-stub", "XDG_SESSION_TYPE=wayland", "DISPLAY=:9", "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/stub/bus", "XDG_RUNTIME_DIR=/stub/run", "PATH=/stub/bin"];
-  await withSystemctl(stub, async () => {
-    for (const key of ["WAYLAND_DISPLAY", "XDG_SESSION_TYPE", "DBUS_SESSION_BUS_ADDRESS"]) delete process.env[key];
-    process.env.DISPLAY = "";
-    process.env.XDG_RUNTIME_DIR = "/run/user/test";
-    const { server } = await configure();
-    assert.equal(server.environment.WAYLAND_DISPLAY, "wayland-stub");
-    assert.equal(server.environment.XDG_SESSION_TYPE, "wayland");
-    assert.equal(server.environment.DISPLAY, ":9", "an empty variable must not shadow the session value");
-    assert.equal(server.environment.DBUS_SESSION_BUS_ADDRESS, "unix:path=/run/stub/bus");
-    assert.equal(server.environment.XDG_RUNTIME_DIR, undefined, "present variables are not copied from the session manager");
-    assert.equal(server.environment.PATH, undefined, "the process environment is not duplicated into the configuration");
+test("Codex entry point keeps a harness display and recovers only the desktop identity", async () => {
+  await withSystemctl(["WAYLAND_DISPLAY=wayland-stub", "XDG_CURRENT_DESKTOP=KDE"], async environment => {
+    Object.assign(environment, {
+      XDG_RUNTIME_DIR: "/run/user/test",
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/test/bus",
+      WAYLAND_DISPLAY: "wayland-harness",
+      XDG_SESSION_TYPE: "wayland",
+    });
+    delete environment.XDG_CURRENT_DESKTOP;
+    const { stdout, status } = spawnSync(launcher, ["doctor"], { encoding: "utf8", env: environment, timeout: 30_000 });
+    assert.equal(status, 0);
+    assert.match(stdout, /^Display: wayland-harness$/m);
+    assert.match(stdout, /^Desktop: KDE$/m);
   });
 });
-
-test("a disabled plugin does not read the session environment", async () => {
-  await withSystemctl([], async (directory) => {
-    delete process.env.WAYLAND_DISPLAY;
-    delete process.env.XDG_SESSION_TYPE;
-    const { skills } = await configure({ enabled: false });
-    assert.deepEqual(skills, []);
-    await assert.rejects(readFile(join(directory, "systemctl.log"), "utf8"), { code: "ENOENT" });
+test("Codex entry point skips the session manager when the desktop identity is complete", async () => {
+  await withSystemctl([], async (environment, directory) => {
+    Object.assign(environment, {
+      XDG_RUNTIME_DIR: "/run/user/test",
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/test/bus",
+      WAYLAND_DISPLAY: "wayland-harness",
+      XDG_SESSION_TYPE: "wayland",
+      XDG_CURRENT_DESKTOP: "KDE",
+    });
+    const { stdout, status } = spawnSync(launcher, ["version"], { encoding: "utf8", env: environment, timeout: 30_000 });
+    assert.equal(status, 0);
+    assert.equal(stdout.trim(), manifest.version);
+    await assert.rejects(access(join(directory, "systemctl.log"), constants.F_OK), { code: "ENOENT" });
   });
 });
-
+test("Codex entry point starts when systemctl is unavailable", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "computer-use-mcp-nosystemd-"));
+  try {
+    for (const name of ["bash", "timeout"])
+      await symlink(execFileSync("bash", ["-c", `command -v ${name}`], { encoding: "utf8" }).trim(), join(directory, name));
+    const environment = { ...process.env, PATH: directory };
+    for (const key of desktopKeys) delete environment[key];
+    const { stdout, status } = spawnSync(launcher, ["version"], { encoding: "utf8", env: environment, timeout: 30_000 });
+    assert.equal(status, 0);
+    assert.equal(stdout.trim(), manifest.version);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 test("disablement, custom MCPs and invalid options", async () => {
-  assert.deepEqual((await configure({enabled:false})).skills,[]);
+  const disabled = await configure({enabled:false});
+  assert.deepEqual(disabled.skills,[]);
+  assert.equal(disabled.server.disabled,true);
   await assert.rejects(configure({enabled:"yes"}),/boolean/);
   const existing={type:"local",command:["custom","mcp"],disabled:false};
   assert.strictEqual((await configure({},[],existing)).server,existing);
@@ -105,7 +135,7 @@ test("disablement, custom MCPs and invalid options", async () => {
 test("direct tools and custom registrations do not wait on agent catalogs", async () => {
   const catalog = () => { throw new Error("agent catalog must not be read"); };
   const direct = await configure({compactTools:false}, [], undefined, catalog);
-  assert.deepEqual(direct.server.command, [binary, "mcp"]);
+  assert.deepEqual(direct.server.command, [launcher, "mcp"]);
   const custom = {type:"local", command:["custom","mcp"], disabled:false};
   const existing = await configure({}, [], custom, catalog);
   assert.strictEqual(existing.server, custom);
@@ -120,7 +150,7 @@ test("bundled executable has the package version", async () => {
 test("native per-tool rules select direct tools", async () => {
   for (const action of ["computer_use_act","computer_use_observe","computer_use_a*"]) {
     const {server}=await configure({},[{action,resource:"*",effect:"ask"}]);
-    assert.deepEqual(server.command,[binary,"mcp"]);
+    assert.deepEqual(server.command,[launcher,"mcp"]);
   }
   const {server}=await configure({},[{action:"computer_use_*",resource:"*",effect:"ask"}]);
   assert.equal(server.command.at(-1),"--compact-tools");
@@ -285,4 +315,22 @@ test("public call history records compact validation and protocol errors without
   assert.throws(() => query("--last"));
   assert.throws(() => query("--since", "yesterday"));
   assert.throws(() => query("--call-id"));
+});
+
+test("isolated session rejects a Wayland socket path over the address limit", async () => {
+  const directory = await mkdtemp(join(tmpdir(), `long-${"x".repeat(120)}`));
+  const stub = join(directory, "stub");
+  await writeFile(stub, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  try {
+    const script = fileURLToPath(new URL("../scripts/run-isolated-session.sh", import.meta.url));
+    const env = { ...process.env, TMPDIR: directory };
+    for (const role of ["DBUS_DAEMON", "DBUS_SEND", "SETSID", "COMPOSITOR", "PIPEWIRE", "WIREPLUMBER", "PORTAL", "PORTAL_BACKEND", "ATSPI_BUS", "ATSPI_REGISTRY"]) {
+      env[`COMPUTER_USE_MCP_${role}_BIN`] = stub;
+    }
+    const { status, stderr } = spawnSync("bash", [script, "--", "true"], { encoding: "utf8", env, timeout: 30_000 });
+    assert.equal(status, 1);
+    assert.match(stderr, /Wayland socket path exceeds 107 bytes/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

@@ -37,9 +37,19 @@ macro_rules! proxy_builder {
 #[derive(Debug, Default)]
 pub struct AtspiAdapter {
     connection: OnceCell<Connection>,
+    enable_accessibility: bool,
 }
 
 impl AtspiAdapter {
+    /// Interactive desktop use turns the session's accessibility bridge on when a
+    /// desktop has it off; diagnostics and tests leave session state untouched.
+    pub fn enabling_accessibility() -> Self {
+        Self {
+            enable_accessibility: true,
+            ..Self::default()
+        }
+    }
+
     async fn connection(&self) -> Result<&Connection, RuntimeError> {
         self.connection
             .get_or_try_init(|| async {
@@ -58,10 +68,20 @@ impl AtspiAdapter {
                         "cannot read AT-SPI status: {error}; enable accessibility in the desktop settings"
                     ))
                 })?;
-                if !enabled {
+                if !enabled && !self.enable_accessibility {
                     return Err(runtime_error(
                         "AT-SPI is disabled for this login session; enable accessibility in the desktop settings, then restart the app and this server",
                     ));
+                }
+                if !enabled {
+                    status.set_is_enabled(true).await.map_err(|error| {
+                        runtime_error(format!(
+                            "AT-SPI is disabled for this login session and could not be enabled automatically: {error}; enable accessibility in the desktop settings"
+                        ))
+                    })?;
+                    eprintln!(
+                        "computer-use-mcp: enabled the session's accessibility bridge because AT-SPI was disabled"
+                    );
                 }
                 let bus = BusProxy::new(&session).await.map_err(|error| {
                     runtime_error(format!(

@@ -38,6 +38,13 @@ requires glibc 2.39 or newer. It needs no Rust toolchain, install scripts, or
 binary downloads at installation time. Desktop services and shared libraries
 must be installed separately. Other architectures can build from source.
 
+The OpenCode and Codex integrations start the package through a bash entry
+point. When a host strips the graphical session variables, it fills them from
+`systemctl --user show-environment`. A host without systemd still starts the
+server with the environment it inherited; it just cannot recover a stripped
+session. The lookup is bounded by coreutils `timeout`; a host without it skips
+recovery and starts with the inherited environment.
+
 Source builds require Rust 1.97 or newer and development files. Ubuntu 24.04
 build dependencies:
 
@@ -48,7 +55,8 @@ sudo apt-get install build-essential clang libclang-dev libdbus-1-dev \
 ```
 
 The exact service package names vary by distribution. `doctor` reports missing
-runtime prerequisites.
+runtime prerequisites. Interactive calls enable the session's AT-SPI bridge when
+a desktop has it disabled; `doctor` only reports that state.
 
 ## Install
 
@@ -77,6 +85,15 @@ The server runs independently of OpenCode. Any stdio MCP host can launch
 `--compact-tools` for the six direct tools. No host-specific hooks or session
 fields are needed.
 
+The native server reaches the compositor, portal, and session bus through the
+environment it inherits. A host started by a service manager (T3, a systemd
+user unit, a login shell without the graphical variables) can lack it, so the
+packaged Codex manifest starts `host/mcp-server` instead: that entry point
+fills missing desktop variables from `systemctl --user show-environment`,
+including `XDG_CURRENT_DESKTOP`, then runs the native executable. The OpenCode
+plugin starts the same entry point. Use the native executable directly only when
+the host already runs inside the graphical session.
+
 The [GitHub release](https://github.com/mirsella/computer-use-mcp/releases)
 tarball contains the executable, both integrations, and the skill. Extract it
 to a permanent directory and register the packaged Codex plugin:
@@ -91,11 +108,12 @@ set `enabled = false` in `[plugins."computer-use@computer-use-mcp"]` in
 `~/.codex/config.toml`. In OpenCode, set the plugin option `enabled` to `false`
 or disable `mcp.servers.computer_use`.
 
-For direct Codex MCP registration, use the installed executable:
+For direct Codex MCP registration, use the packaged entry point when the host
+may not inherit the graphical session environment:
 
 ```toml
 [mcp_servers.computer_use]
-command = "/absolute/path/to/computer-use-mcp"
+command = "/absolute/path/to/host/mcp-server"
 args = ["mcp", "--compact-tools"]
 tool_timeout_sec = 150
 ```
@@ -115,10 +133,10 @@ Add the package to your OpenCode configuration, using OpenCode 2.0.27 or newer:
 }
 ```
 
-The native v2 plugin registers `mcp.servers.computer_use` with the bundled executable, a
-150-second timeout, and the computer-use skill. It supplies the graphical session
-variables the server needs for input that the harness lacks, reading them from the systemd
-user manager, such as under a service-started `opencode serve`.
+The native v2 plugin registers `mcp.servers.computer_use` with the same bash entry point,
+a 150-second timeout, and the computer-use skill. The entry point recovers the graphical
+session variables the server needs for input when the harness lacks them, such as under a
+service-started `opencode serve`.
 It is enabled by default.
 
 When enabled, the model sees `computer_use_help` and

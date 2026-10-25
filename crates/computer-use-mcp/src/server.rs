@@ -267,7 +267,7 @@ pub fn production_runtime() -> Arc<SemanticRuntime<AtspiAdapter, ProductionScree
     // `SemanticRuntime` directly and keep the disabled provider, so no
     // session-bus traffic exists under test. Fail-closed downstream.
     let runtime = SemanticRuntime::with_screenshot_provider(
-        AtspiAdapter::default(),
+        AtspiAdapter::enabling_accessibility(),
         ProductionScreenshotCoordinator::default(),
         RuntimeConfig::default(),
     )

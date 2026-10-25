@@ -63,6 +63,11 @@ is useful defense in depth, not a complete classifier.
   previous clipboard, and the text is not logged. If the capability is
   unavailable, it uses bounded simulated EIS typing.
 - Restore tokens use private XDG state storage and are never logged.
+- Desktop operations that use AT-SPI enable the session-wide
+  `org.a11y.Status IsEnabled` property when the desktop has accessibility
+  disabled. The change affects every application in the login session and is
+  not persisted by this project. `doctor` only reports the state and never
+  changes it.
 
 ## Broker Workers
 

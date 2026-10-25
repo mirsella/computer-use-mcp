@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Hosts started by a service manager can lose the graphical session environment.
+# Recover the missing values, then replace this shell with the native server so
+# signals and stdio go straight to it.
+keys="XDG_RUNTIME_DIR WAYLAND_DISPLAY DISPLAY XAUTHORITY XDG_SESSION_TYPE DBUS_SESSION_BUS_ADDRESS XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP"
+required="XDG_RUNTIME_DIR WAYLAND_DISPLAY XDG_SESSION_TYPE DBUS_SESSION_BUS_ADDRESS XDG_CURRENT_DESKTOP"
+
+if [ -z "${XDG_RUNTIME_DIR-}" ] && [ -d "/run/user/$UID" ]; then
+    export XDG_RUNTIME_DIR="/run/user/$UID"
+fi
+incomplete=0
+for key in $required; do
+    [ -n "${!key-}" ] || incomplete=1
+done
+if [ "$incomplete" -eq 1 ]; then
+    while IFS= read -r assignment; do
+        key=${assignment%%=*}
+        [[ " $keys " == *" $key "* ]] || continue
+        [ -n "${!key-}" ] || export "$assignment"
+    done < <(timeout 5 systemctl --user show-environment 2>/dev/null)
+fi
+
+exec "${BASH_SOURCE[0]%/*}/../vendor/bin/computer-use-mcp" "$@"

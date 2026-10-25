@@ -261,6 +261,10 @@ async fn doctor() {
         "Session type: {}",
         session_type.as_deref().unwrap_or("<unset>")
     );
+    println!(
+        "Desktop: {}",
+        std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "<unset>".into())
+    );
     println!("Display: {}", display.as_deref().unwrap_or("<unset>"));
     match session.socket.as_ref() {
         Some(socket) => println!(

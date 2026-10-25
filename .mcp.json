@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "computer_use": {
-      "command": "./vendor/bin/computer-use-mcp",
+      "command": "./host/mcp-server",
       "args": [
         "mcp",
         "--compact-tools"
@@ -16,6 +16,8 @@
         "XDG_RUNTIME_DIR",
         "XDG_SESSION_TYPE",
         "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_DESKTOP",
+        "KDE_FULL_SESSION",
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
         "XDG_STATE_HOME",

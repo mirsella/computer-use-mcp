@@ -18,6 +18,7 @@
     "MCP.md",
     "SECURITY.md",
     "LICENSE",
+    "host/mcp-server",
     ".codex-plugin/plugin.json",
     ".agents/plugins/marketplace.json",
     ".mcp.json",
