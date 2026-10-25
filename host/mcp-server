@@ -20,4 +20,11 @@ if [ "$incomplete" -eq 1 ]; then
     done < <(timeout 5 systemctl --user show-environment 2>/dev/null)
 fi
 
-exec "${BASH_SOURCE[0]%/*}/../vendor/bin/computer-use-mcp" "$@"
+self=${BASH_SOURCE[0]}
+if [[ $self != */* ]]; then
+    self=$(command -v -- "$self") || {
+        echo "computer-use-mcp: cannot locate the entry point on PATH" >&2
+        exit 1
+    }
+fi
+exec "${self%/*}/../vendor/bin/computer-use-mcp" "$@"

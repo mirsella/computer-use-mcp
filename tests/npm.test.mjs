@@ -124,6 +124,14 @@ test("Codex entry point starts when systemctl is unavailable", async () => {
     await rm(directory, { recursive: true, force: true });
   }
 });
+test("Codex entry point resolves a bare script name from PATH", () => {
+  const directory = join(launcher, "..");
+  const environment = { ...process.env, PATH: `${directory}:${process.env.PATH}` };
+  for (const key of desktopKeys) delete environment[key];
+  const { stdout, status } = spawnSync("bash", ["mcp-server", "version"], { cwd: directory, encoding: "utf8", env: environment, timeout: 30_000 });
+  assert.equal(status, 0);
+  assert.equal(stdout.trim(), manifest.version);
+});
 test("disablement, custom MCPs and invalid options", async () => {
   const disabled = await configure({enabled:false});
   assert.deepEqual(disabled.skills,[]);
