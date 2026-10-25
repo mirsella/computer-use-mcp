@@ -88,7 +88,7 @@ fields are needed.
 The native server reaches the compositor, portal, and session bus through the
 environment it inherits. A host started by a service manager (T3, a systemd
 user unit, a login shell without the graphical variables) can lack it, so the
-packaged Codex manifest starts `host/mcp-server` instead: that entry point
+packaged Codex manifest starts `host/mcp-server` through `bash` instead: that entry point
 fills missing desktop variables from `systemctl --user show-environment`,
 including `XDG_CURRENT_DESKTOP`, then runs the native executable. The OpenCode
 plugin starts the same entry point. Use the native executable directly only when
@@ -113,8 +113,8 @@ may not inherit the graphical session environment:
 
 ```toml
 [mcp_servers.computer_use]
-command = "/absolute/path/to/host/mcp-server"
-args = ["mcp", "--compact-tools"]
+command = "bash"
+args = ["/absolute/path/to/host/mcp-server", "mcp", "--compact-tools"]
 tool_timeout_sec = 150
 ```
 

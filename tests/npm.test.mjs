@@ -28,9 +28,9 @@ test("Codex packages the same standalone server and canonical skill", async () =
   assert.equal(codex.skills, "./skills/");
   assert.equal(marketplace.name, "computer-use-mcp");
   assert.equal(marketplace.plugins[0].name, codex.name);
-  assert.equal(fileURLToPath(new URL(server.command, root)), launcher);
-  await access(launcher, constants.X_OK);
-  assert.deepEqual(server.args, ["mcp", "--compact-tools"]);
+  assert.equal(server.command, "bash");
+  await access(launcher, constants.F_OK);
+  assert.deepEqual(server.args, ["./host/mcp-server", "mcp", "--compact-tools"]);
   assert.equal(server.tool_timeout_sec, 150);
   for (const file of [".codex-plugin/plugin.json", ".agents/plugins/marketplace.json", ".mcp.json", "host/mcp-server"])
     assert.ok(manifest.files.includes(file), `${file} must ship in the tarball`);
@@ -54,7 +54,7 @@ async function configure(options = {}, permissions = [], existing, listAgents = 
 test("Codex entry point starts the server with the recovered session environment", async () => {
   await withSystemctl(["WAYLAND_DISPLAY=wayland-stub", "XDG_SESSION_TYPE=wayland", "XDG_CURRENT_DESKTOP=KDE"], async environment => {
     for (const key of desktopKeys) delete environment[key];
-    const { stdout, status } = spawnSync(launcher, ["doctor"], { encoding: "utf8", env: environment, timeout: 30_000 });
+    const { stdout, status } = spawnSync("bash", [launcher, "doctor"], { encoding: "utf8", env: environment, timeout: 30_000 });
     assert.equal(status, 0, "the entry point hands back the server exit status");
     assert.match(stdout, /^Session type: wayland$/m);
     assert.match(stdout, /^Display: wayland-stub$/m);
@@ -63,7 +63,7 @@ test("Codex entry point starts the server with the recovered session environment
 });
 test("native adapter registers its server and skill", async () => {
   const {server, skills} = await configure();
-  assert.deepEqual(server.command, [launcher,"mcp","--compact-tools"]);
+  assert.deepEqual(server.command, ["bash", launcher, "mcp", "--compact-tools"]);
   assert.equal(server.timeout.execution,150000);
   assert.equal(server.codemode,false);
   assert.equal(skills.length,1);
@@ -89,7 +89,7 @@ test("Codex entry point keeps a harness display and recovers only the desktop id
       XDG_SESSION_TYPE: "wayland",
     });
     delete environment.XDG_CURRENT_DESKTOP;
-    const { stdout, status } = spawnSync(launcher, ["doctor"], { encoding: "utf8", env: environment, timeout: 30_000 });
+    const { stdout, status } = spawnSync("bash", [launcher, "doctor"], { encoding: "utf8", env: environment, timeout: 30_000 });
     assert.equal(status, 0);
     assert.match(stdout, /^Display: wayland-harness$/m);
     assert.match(stdout, /^Desktop: KDE$/m);
@@ -104,7 +104,7 @@ test("Codex entry point skips the session manager when the desktop identity is c
       XDG_SESSION_TYPE: "wayland",
       XDG_CURRENT_DESKTOP: "KDE",
     });
-    const { stdout, status } = spawnSync(launcher, ["version"], { encoding: "utf8", env: environment, timeout: 30_000 });
+    const { stdout, status } = spawnSync("bash", [launcher, "version"], { encoding: "utf8", env: environment, timeout: 30_000 });
     assert.equal(status, 0);
     assert.equal(stdout.trim(), manifest.version);
     await assert.rejects(access(join(directory, "systemctl.log"), constants.F_OK), { code: "ENOENT" });
@@ -117,7 +117,7 @@ test("Codex entry point starts when systemctl is unavailable", async () => {
       await symlink(execFileSync("bash", ["-c", `command -v ${name}`], { encoding: "utf8" }).trim(), join(directory, name));
     const environment = { ...process.env, PATH: directory };
     for (const key of desktopKeys) delete environment[key];
-    const { stdout, status } = spawnSync(launcher, ["version"], { encoding: "utf8", env: environment, timeout: 30_000 });
+    const { stdout, status } = spawnSync("bash", [launcher, "version"], { encoding: "utf8", env: environment, timeout: 30_000 });
     assert.equal(status, 0);
     assert.equal(stdout.trim(), manifest.version);
   } finally {
@@ -135,7 +135,7 @@ test("disablement, custom MCPs and invalid options", async () => {
 test("direct tools and custom registrations do not wait on agent catalogs", async () => {
   const catalog = () => { throw new Error("agent catalog must not be read"); };
   const direct = await configure({compactTools:false}, [], undefined, catalog);
-  assert.deepEqual(direct.server.command, [launcher, "mcp"]);
+  assert.deepEqual(direct.server.command, ["bash", launcher, "mcp"]);
   const custom = {type:"local", command:["custom","mcp"], disabled:false};
   const existing = await configure({}, [], custom, catalog);
   assert.strictEqual(existing.server, custom);
@@ -150,7 +150,7 @@ test("bundled executable has the package version", async () => {
 test("native per-tool rules select direct tools", async () => {
   for (const action of ["computer_use_act","computer_use_observe","computer_use_a*"]) {
     const {server}=await configure({},[{action,resource:"*",effect:"ask"}]);
-    assert.deepEqual(server.command,[launcher,"mcp"]);
+    assert.deepEqual(server.command, ["bash", launcher, "mcp"]);
   }
   const {server}=await configure({},[{action:"computer_use_*",resource:"*",effect:"ask"}]);
   assert.equal(server.command.at(-1),"--compact-tools");

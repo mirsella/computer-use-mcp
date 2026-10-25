@@ -1,8 +1,9 @@
 {
   "mcpServers": {
     "computer_use": {
-      "command": "./host/mcp-server",
+      "command": "bash",
       "args": [
+        "./host/mcp-server",
         "mcp",
         "--compact-tools"
       ],

@@ -20,7 +20,7 @@ export default Plugin.define({
       existingServer = editor.get("computer_use");
       if (existingServer) return;
       editor.set("computer_use", {
-        type: "local", command: [launcher, "mcp", ...(compact ? ["--compact-tools"] : [])],
+        type: "local", command: ["bash", launcher, "mcp", ...(compact ? ["--compact-tools"] : [])],
         disabled: !enabled, codemode: false,
         timeout: { startup: 30_000, catalog: 30_000, execution: 150_000 },
       });
