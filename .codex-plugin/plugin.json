@@ -1,6 +1,6 @@
 {
   "name": "computer-use",
-  "version": "2.1.2",
+  "version": "2.1.3",
   "description": "Operate a KDE Wayland desktop through the standalone Computer Use MCP server.",
   "author": {
     "name": "mirsella"
