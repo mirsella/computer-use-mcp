@@ -434,6 +434,9 @@ struct ClickGrace {
 
 /// Maximum age for consuming best-effort click evidence once.
 const CLICK_GRACE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+/// A cold scan enumerates every registered application; the interactive call
+/// budget is too tight for the first scan of a busy session.
+const DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug)]
 struct CachedObservation {
@@ -2850,7 +2853,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
     }
 
     async fn discover(&self) -> Result<Vec<AppInfo>, RuntimeError> {
-        timeout(self.config.call_timeout, self.adapter.discover())
+        timeout(DISCOVERY_TIMEOUT, self.adapter.discover())
             .await
             .map_err(|_| operational_error("AT-SPI application discovery timed out"))?
     }
@@ -7236,6 +7239,28 @@ pub(crate) mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.message, "fake discovery refresh failure");
+    }
+
+    #[tokio::test]
+    async fn cold_discovery_outlives_a_short_call_budget() {
+        let fake = FakeAdapter::tree();
+        fake.state.lock().unwrap().discover_delay = Some(Duration::from_millis(50));
+        let mut config = test_config();
+        config.call_timeout = Duration::from_millis(5);
+        let runtime = SemanticRuntime::with_config(fake, config);
+        let output = runtime
+            .execute_call(ToolCall::ListDesktop {
+                scope: DesktopScope::Windows,
+                limit: DEFAULT_DESKTOP_PAGE_SIZE,
+                cursor: None,
+            })
+            .await
+            .expect("cold discovery has its own budget");
+        assert!(
+            output.text.contains("win-0000000000000001"),
+            "{}",
+            output.text
+        );
     }
 
     #[tokio::test]
