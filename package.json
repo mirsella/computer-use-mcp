@@ -1,0 +1,73 @@
+{
+  "name": "@mirsella/computer-use-mcp",
+  "version": "2.1.3",
+  "description": "Standalone Computer Use MCP for KDE Plasma Wayland, with OpenCode and Codex integrations",
+  "type": "module",
+  "exports": {
+    ".": "./server.mjs",
+    "./server": "./server.mjs"
+  },
+  "bin": {
+    "computer-use-mcp": "vendor/bin/computer-use-mcp"
+  },
+  "files": [
+    "plugin/computer-use.mjs",
+    "skills/computer-use-mcp/SKILL.md",
+    "vendor/bin/computer-use-mcp",
+    "README.md",
+    "MCP.md",
+    "SECURITY.md",
+    "LICENSE",
+    "host/mcp-server",
+    ".codex-plugin/plugin.json",
+    ".agents/plugins/marketplace.json",
+    ".mcp.json",
+    "server.mjs"
+  ],
+  "keywords": [
+    "opencode",
+    "mcp",
+    "computer-use",
+    "wayland",
+    "kde",
+    "codex"
+  ],
+  "homepage": "https://github.com/mirsella/computer-use-mcp#readme",
+  "bugs": "https://github.com/mirsella/computer-use-mcp/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mirsella/computer-use-mcp.git"
+  },
+  "license": "MIT",
+  "author": "mirsella",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "engines": {
+    "node": ">=22",
+    "opencode": ">=2.0.27 <3"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "latest"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": ">=2.0.27 <3"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.0.28"
+  },
+  "dependencies": {
+    "yaml": "2.8.3"
+  },
+  "main": "./server.mjs",
+  "scripts": {
+    "test": "node --test tests/npm.test.mjs"
+  }
+}
