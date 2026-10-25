@@ -272,13 +272,15 @@ Protected surfaces are refused before dispatch with
     "window_instance_id":"win-0000000000000002"
   },
   "view":"both",
-  "accessibility":{"scope":"interactive"}
+  "accessibility":{"scope":"interactive","limits":{"max_nodes":40}}
 }
 ```
 
-`view` is `screenshot`, `accessibility`, or `both`. Accessibility scopes are
-`full`, `visible`, and `interactive`. Accessibility-only observations do not
-wait for portal capture.
+`view` is `screenshot`, `accessibility`, or `both`. Accessibility options are
+`scope` (`full`, `visible`, or `interactive`), `query`, and a `limits` object
+with `text_limit` (characters or `"max"`), `max_nodes`, and `max_depth`.
+Accessibility-only observations do not wait for portal capture. Unknown
+argument names are rejected.
 
 The optional crop is `monitor` (default) or `target_window`. Target-window crop
 uses KDE logical geometry, never AT-SPI extents. It is applied to raw source
