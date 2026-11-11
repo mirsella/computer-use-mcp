@@ -7,8 +7,8 @@ and the authorities used to make decisions.
 ## Boundaries
 
 - `contract` and `validation` define the ordered tool schemas and convert
-  untrusted JSON into typed calls. The optional compact transport fetches these
-  same schemas on demand and unwraps dispatch before ordinary broker validation;
+  untrusted JSON into typed calls. The optional compact transport serves a compact
+  reference of these schemas on demand and unwraps dispatch before ordinary broker validation;
   it owns no separate execution or desktop state.
 - Observation IDs come from canonical snapshots. The private worker response
   carries the snapshot's element IDs separately from bounded text/JSON so
@@ -182,11 +182,14 @@ portal stream extent; aspect ratio alone is insufficient.
 
 AT-SPI traversal and text reads are bounded. Selected text is range-capped
 before `GetText`, and value reads use bounded `CurrentValue`. Text replacement
-requires `Component`, `Text`, and `EditableText`, focuses the target, performs
+requires `Component`, `Text`, and `EditableText`, verifies focus or requests it, performs
 the replacement, and verifies a fresh full-text readback. One editable-target
 interface supplies the operations to the shared replacement policy. If `GrabFocus` returns
 false, replacement proceeds only after a fresh state query confirms the exact
 target is focused and non-defunct. Replacement values are not logged.
+Already focused targets skip a redundant focus request only after a fresh
+exact focused/non-defunct read. This avoids the tested GTK4 provider's
+unsupported `GrabFocus` without bypassing editing or readback checks.
 Replacement insertion uses UTF-8 byte length and verification
 compares the exact returned text and Unicode scalar count. The project
 intentionally does not promise password redaction.
@@ -207,3 +210,18 @@ focus or geometry change, takeover, or expiry. For generated typing, a false
 `Component.GrabFocus` result is accepted only after a fresh exact element-focused
 and window-active readback. Unknown focus state is reported as unavailable or
 null, never inferred as focused.
+
+Generated-key resolution finishes before semantic focus can mutate the UI.
+After EIS preparation, fresh exact focused-element and active-window evidence
+can avoid a redundant focus request. Unrepresentable EIS text is an explicit
+unsupported-input result, not permission to change keyboard backends.
+
+Semantic calls and semantic-focus keyboard/paste may omit source and target only when their exact element ID
+belongs to one retained, target-bound observation. Existing source freshness,
+target identity, scope and native-object revalidation still apply. Generated
+point input retains its explicit source/frame requirements. Keyboard/paste with
+omitted focus binds the named window, or with neither source nor target the
+window this session last observed or acted on, and is refused unless a fresh
+read shows that window active. Names and roles are not
+persistent native identities; client workflows select only from complete
+current replacement evidence and stop on ambiguity or error.

@@ -8,8 +8,10 @@ explains ownership and dispatch. Read the relevant sections, not every document.
 
 ## Boundaries that matter
 
-- Opaque IDs identify exact backend objects and observation generations. Never
-  join windows by title/PID or infer image coordinates from AT-SPI bounds.
+- Opaque IDs identify exact backend objects. Observation and frame IDs name one
+  generation; an element ID stays with its accessibility object across
+  observations and grants identity only, so every action re-reads the object.
+  Never join windows by title/PID or infer image coordinates from AT-SPI bounds.
 - Dispatch progress determines retry safety. Cancellation after any mutation is
   not `not_started`; protocol completion is not application effect.
 - One generated-input operation owns focus, input emission, and cleanup. Its

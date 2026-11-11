@@ -969,7 +969,8 @@ where
                 events,
             } => {
                 let focus = mapper.point(focus.x, focus.y)?;
-                keyboard_input::preflight_transaction(
+                keyboard_input::preflight_resolved_transaction(
+                    input.as_ref(),
                     Some(KeyboardPoint {
                         x: focus.0,
                         y: focus.1,
@@ -987,12 +988,13 @@ where
                     y: focus.1,
                 };
                 if clipboard_available {
-                    keyboard_input::preflight_transaction(
+                    keyboard_input::preflight_resolved_transaction(
+                        input.as_ref(),
                         Some(focus),
                         &[KeyboardEvent::Press("CTRL+V".into())],
                     )?;
                 } else {
-                    keyboard_input::preflight_paste(Some(focus), text).map(drop)?;
+                    keyboard_input::preflight_resolved_paste(input.as_ref(), Some(focus), text)?;
                 }
             }
             GeneratedInputAction::KeyboardTransaction { .. }
@@ -1135,16 +1137,7 @@ where
         &'a self,
         action: &'a GeneratedInputAction,
     ) -> Result<(), String> {
-        if !matches!(
-            action,
-            GeneratedInputAction::KeyboardTransaction {
-                focus: KeyboardFocus::Semantic { .. },
-                ..
-            } | GeneratedInputAction::Paste {
-                focus: KeyboardFocus::Semantic { .. },
-                ..
-            }
-        ) {
+        if !action.uses_focused_path() {
             return Err("focused-element input requires semantic focus".into());
         }
         let mut state = self.state.lock().await;
@@ -1187,22 +1180,23 @@ where
             .is_some();
         match action {
             GeneratedInputAction::KeyboardTransaction {
-                focus: KeyboardFocus::Semantic { .. },
+                focus: KeyboardFocus::Semantic { .. } | KeyboardFocus::Window,
                 events,
             } => {
-                keyboard_input::preflight_transaction(None, events)?;
+                keyboard_input::preflight_resolved_transaction(input.as_ref(), None, events)?;
             }
             GeneratedInputAction::Paste {
-                focus: KeyboardFocus::Semantic { .. },
+                focus: KeyboardFocus::Semantic { .. } | KeyboardFocus::Window,
                 text,
             } => {
                 if clipboard_available {
-                    keyboard_input::preflight_transaction(
+                    keyboard_input::preflight_resolved_transaction(
+                        input.as_ref(),
                         None,
                         &[KeyboardEvent::Press("CTRL+V".into())],
                     )?;
                 } else {
-                    keyboard_input::preflight_paste(None, text).map(drop)?;
+                    keyboard_input::preflight_resolved_paste(input.as_ref(), None, text)?;
                 }
             }
             _ => {
@@ -1237,14 +1231,14 @@ where
         let result: Result<(), String> = async {
             match action {
                 GeneratedInputAction::KeyboardTransaction {
-                    focus: KeyboardFocus::Semantic { .. },
+                    focus: KeyboardFocus::Semantic { .. } | KeyboardFocus::Window,
                     events,
                 } => {
                     keyboard_input::perform_transaction(input, None, events, Arc::clone(&progress))
                         .await?;
                 }
                 GeneratedInputAction::Paste {
-                    focus: KeyboardFocus::Semantic { .. },
+                    focus: KeyboardFocus::Semantic { .. } | KeyboardFocus::Window,
                     text,
                 } => {
                     let mechanism = perform_clipboard_paste(
@@ -1543,16 +1537,10 @@ fn require_focused_capabilities(
     backend: &ReisInputBackend,
     action: &GeneratedInputAction,
 ) -> Result<(), String> {
-    match action {
-        GeneratedInputAction::KeyboardTransaction {
-            focus: KeyboardFocus::Semantic { .. },
-            ..
-        }
-        | GeneratedInputAction::Paste {
-            focus: KeyboardFocus::Semantic { .. },
-            ..
-        } => backend.require_focused_keyboard(),
-        _ => Err("focused-element input requires semantic focus".into()),
+    if action.uses_focused_path() {
+        backend.require_focused_keyboard()
+    } else {
+        Err("focused-element input requires semantic focus".into())
     }
 }
 
@@ -1909,6 +1897,8 @@ mod tests {
         Snapshot {
             view: crate::validation::AccessibilityScope::Full,
             element_query: None,
+            search: None,
+            traversal: Default::default(),
             app: AppInfo {
                 object: ObjectId {
                     bus_name: ":1.5".into(),

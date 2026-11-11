@@ -3,7 +3,9 @@ use std::{sync::Arc, time::Duration};
 use tokio::time::sleep;
 
 use super::{
-    backend::{ActionProgress, HeldInput, HeldInputGuard, InputBackend, InputEvent, KeyboardKey},
+    backend::{
+        ActionProgress, HeldInput, HeldInputGuard, InputBackend, InputEvent, KeyCode, KeyboardKey,
+    },
     eis::{ReisInputBackend, ResolvedKey},
     keyboard::{KeyChord, parse_chord, unicode_keysym},
     pointer::button_code,
@@ -44,6 +46,27 @@ pub fn preflight_transaction(
         validate_focus(focus)?;
     }
     Ok(())
+}
+
+pub fn preflight_resolved_transaction(
+    backend: &ReisInputBackend,
+    focus: Option<KeyboardPoint>,
+    events: &[KeyboardEvent],
+) -> Result<(), String> {
+    preflight_transaction(focus, events)?;
+    // Keymap and device resolution must finish before a semantic focus change,
+    // not only before the first EIS key. Emission re-resolves to bind the actual
+    // current device/resume generation; this does not authorize cached keys.
+    resolve_transaction(backend, events).map(drop)
+}
+
+pub fn preflight_resolved_paste(
+    backend: &ReisInputBackend,
+    focus: Option<KeyboardPoint>,
+    text: &str,
+) -> Result<(), String> {
+    preflight_paste(focus, text)?;
+    resolve_paste(backend, text).map(drop)
 }
 
 pub async fn perform_transaction(
@@ -154,20 +177,24 @@ fn validate_transaction_shape(events: &[KeyboardEvent]) -> Result<(), String> {
             "keyboard transactions must contain 1 through {MAX_KEYBOARD_EVENTS} events"
         ));
     }
-    let has_type = events
-        .iter()
-        .any(|event| matches!(event, KeyboardEvent::Type(_)));
-    if has_type {
-        if events.len() != 1 || !matches!(events, [KeyboardEvent::Type(_)]) {
-            return Err(
-                "keyboard events must be either press-only or exactly one type event; mixed press/type transactions are rejected".into(),
-            );
+    let mut text_count = 0;
+    for event in events {
+        match event {
+            KeyboardEvent::Press(chord) => {
+                parse_chord(chord)?;
+            }
+            KeyboardEvent::Type(text) => {
+                if text.is_empty() || text.contains('\0') {
+                    return Err("keyboard type text must be nonempty and contain no NUL".into());
+                }
+                text_count += text.chars().count();
+            }
         }
-    } else if !events
-        .iter()
-        .all(|event| matches!(event, KeyboardEvent::Press(_)))
-    {
-        return Err("keyboard event type is unsupported".into());
+    }
+    if text_count > MAX_KEYBOARD_TRANSACTION_TEXT {
+        return Err(format!(
+            "keyboard transaction text must contain at most {MAX_KEYBOARD_TRANSACTION_TEXT} Unicode scalar values in total"
+        ));
     }
     Ok(())
 }
@@ -177,10 +204,16 @@ fn resolve_transaction(
     events: &[KeyboardEvent],
 ) -> Result<ResolvedTransaction, String> {
     validate_transaction_shape(events)?;
-    events
+    let resolved: ResolvedTransaction = events
         .iter()
         .map(|action| resolve_action(backend, action))
-        .collect()
+        .collect::<Result<_, _>>()?;
+    if resolved.iter().map(Vec::len).sum::<usize>() > MAX_KEYBOARD_EXPANDED_ACTIONS {
+        return Err(format!(
+            "keyboard expanded action count exceeds {MAX_KEYBOARD_EXPANDED_ACTIONS}"
+        ));
+    }
+    Ok(resolved)
 }
 
 fn resolve_action(
@@ -209,19 +242,25 @@ fn resolve_chord(backend: &ReisInputBackend, chord: &KeyChord) -> Result<Resolve
                 .modifiers
                 .into_iter()
                 .flatten()
-                .map(|keycode| keyboard_key(&modifier, keycode)),
+                .map(|keycode| KeyboardKey {
+                    keycode: KeyCode::Physical(keycode),
+                    ..modifier.key
+                }),
         );
-        modifiers.push(keyboard_key(&modifier, modifier.keycode));
+        modifiers.push(modifier.key);
     }
     modifiers.extend(
         key.modifiers
             .into_iter()
             .flatten()
-            .map(|keycode| keyboard_key(&key, keycode)),
+            .map(|keycode| KeyboardKey {
+                keycode: KeyCode::Physical(keycode),
+                ..key.key
+            }),
     );
     modifiers.sort_unstable_by_key(|key| key.keycode);
     modifiers.dedup();
-    Ok(vec![(modifiers, keyboard_key(&key, key.keycode))])
+    Ok(vec![(modifiers, key.key)])
 }
 
 fn resolve_text_keys(backend: &ReisInputBackend, text: &str) -> Result<Vec<ResolvedKey>, String> {
@@ -237,7 +276,7 @@ fn resolve_text_keys(backend: &ReisInputBackend, text: &str) -> Result<Vec<Resol
         .chars()
         .map(unicode_keysym)
         .collect::<Result<Vec<_>, _>>()?;
-    let resolved = backend.resolve_keysyms(&keysyms)?;
+    let resolved = backend.resolve_text_keysyms(&keysyms)?;
     if resolved.len() > MAX_KEYBOARD_EXPANDED_ACTIONS {
         return Err(format!(
             "keyboard expanded action count exceeds {MAX_KEYBOARD_EXPANDED_ACTIONS}"
@@ -257,9 +296,12 @@ fn resolved_text_action(resolved: &[ResolvedKey]) -> ResolvedAction {
                 .modifiers
                 .into_iter()
                 .flatten()
-                .map(|keycode| keyboard_key(key, keycode))
+                .map(|keycode| KeyboardKey {
+                    keycode: KeyCode::Physical(keycode),
+                    ..key.key
+                })
                 .collect();
-            (modifiers, keyboard_key(key, key.keycode))
+            (modifiers, key.key)
         })
         .collect()
 }
@@ -272,14 +314,6 @@ fn resolve_paste(backend: &ReisInputBackend, text: &str) -> Result<ResolvedPaste
         chunk_ends.push(keys.len());
     }
     Ok(ResolvedPaste { keys, chunk_ends })
-}
-
-fn keyboard_key(resolved: &ResolvedKey, keycode: u32) -> KeyboardKey {
-    KeyboardKey {
-        device_id: resolved.device_id,
-        resume_generation: resolved.resume_generation,
-        keycode,
-    }
 }
 
 async fn tap_sequence<B>(
@@ -455,9 +489,11 @@ mod tests {
     fn resolved_paste(key_count: usize) -> ResolvedPaste {
         let keys = (0..key_count)
             .map(|index| ResolvedKey {
-                device_id: 7,
-                resume_generation: 2,
-                keycode: 30 + (index as u32 % 4),
+                key: KeyboardKey {
+                    device_id: 7,
+                    resume_generation: 2,
+                    keycode: KeyCode::Physical(30 + (index as u32 % 4)),
+                },
                 modifiers: [None; 4],
             })
             .collect();
@@ -514,7 +550,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let expected_keycodes = (0..MAX_KEYBOARD_TRANSACTION_TEXT + 1)
-            .map(|index| 30 + (index as u32 % 4))
+            .map(|index| KeyCode::Physical(30 + (index as u32 % 4)))
             .collect::<Vec<_>>();
         assert_eq!(key_presses, expected_keycodes);
         // One barrier flushes the focus click and one separates the two
@@ -577,10 +613,10 @@ mod tests {
         let modifier = KeyboardKey {
             device_id: 7,
             resume_generation: 2,
-            keycode: 42,
+            keycode: KeyCode::Physical(42),
         };
         let key = KeyboardKey {
-            keycode: 30,
+            keycode: KeyCode::Physical(30),
             ..modifier
         };
         tap_sequence(
@@ -641,10 +677,10 @@ mod tests {
         let modifier = KeyboardKey {
             device_id: 7,
             resume_generation: 2,
-            keycode: 42,
+            keycode: KeyCode::Physical(42),
         };
         let key = KeyboardKey {
-            keycode: 30,
+            keycode: KeyCode::Physical(30),
             ..modifier
         };
         type_into_focus(
@@ -692,7 +728,7 @@ mod tests {
         let key = KeyboardKey {
             device_id: 7,
             resume_generation: 2,
-            keycode: 30,
+            keycode: KeyCode::Physical(30),
         };
 
         tap_sequence(
@@ -732,7 +768,7 @@ mod tests {
         let key = KeyboardKey {
             device_id: 7,
             resume_generation: 2,
-            keycode: 30,
+            keycode: KeyCode::Physical(30),
         };
 
         let error = tap_sequence(
@@ -763,10 +799,10 @@ mod tests {
         let first = KeyboardKey {
             device_id: 7,
             resume_generation: 2,
-            keycode: 30,
+            keycode: KeyCode::Physical(30),
         };
         let second = KeyboardKey {
-            keycode: 31,
+            keycode: KeyCode::Physical(31),
             ..first
         };
 
@@ -794,5 +830,55 @@ mod tests {
             .iter()
             .position(|event| matches!(event, TraceEvent::Emit(InputEvent::Keycode { key, pressed: true }) if *key == second))
             .unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mixed_text_submit_is_bounded_and_synchronized_under_one_cleanup_guard() {
+        let transaction = vec![
+            KeyboardEvent::Type("ab".into()),
+            KeyboardEvent::Press("Return".into()),
+        ];
+        preflight_transaction(None, &transaction).unwrap();
+        let oversized = vec![
+            KeyboardEvent::Type("é".repeat(2_048)),
+            KeyboardEvent::Type("🙂".repeat(2_049)),
+        ];
+        assert!(
+            preflight_transaction(None, &oversized)
+                .unwrap_err()
+                .contains("in total")
+        );
+        let backend = FakeBackend::new();
+        let key = |keycode| KeyboardKey {
+            device_id: 7,
+            resume_generation: 2,
+            keycode: KeyCode::Physical(keycode),
+        };
+        type_into_focus(
+            Arc::clone(&backend),
+            vec![
+                vec![(vec![], key(30)), (vec![], key(48))],
+                vec![(vec![], key(28))],
+            ],
+            progress(),
+        )
+        .await
+        .unwrap();
+        let trace = backend.trace.lock().unwrap();
+        let submit = trace.iter().position(|event| matches!(event, TraceEvent::Emit(InputEvent::Keycode {key: found, pressed: true}) if *found == key(28))).unwrap();
+        let barrier = trace
+            .iter()
+            .position(|event| matches!(event, TraceEvent::SyncBarrier))
+            .unwrap();
+        assert!(barrier < submit);
+        assert_eq!(backend.cleanup_calls.load(Ordering::Acquire), 1);
+        assert!(
+            backend
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| matches!(event, InputEvent::Keycode { .. }))
+        );
     }
 }

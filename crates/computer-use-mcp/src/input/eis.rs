@@ -23,7 +23,7 @@ use crate::portal::PortalSessionLease;
 
 use super::{
     InputMode,
-    backend::{HeldInput, InputBackend, InputEvent, InputFuture, KeyboardKey},
+    backend::{HeldInput, InputBackend, InputEvent, InputFuture, KeyCode, KeyboardKey},
     coordinates::{
         EisRegion, EisRoute, StreamExtent, describe_region, resolve_union_tiling_with_extent,
     },
@@ -34,9 +34,7 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedKey {
-    pub device_id: u64,
-    pub resume_generation: u64,
-    pub keycode: u32,
+    pub key: KeyboardKey,
     pub modifiers: [Option<u32>; 4],
 }
 
@@ -237,6 +235,22 @@ impl EisState {
         )
     }
 
+    fn text_device(&self, keyboard_id: u64) -> Result<Option<u64>, String> {
+        let keyboard = self
+            .devices
+            .get(&keyboard_id)
+            .ok_or("selected EIS keyboard disappeared")?;
+        let seat = keyboard.device.seat();
+        self.unique_device(
+            "resumed EIS Text devices share the selected keyboard seat",
+            |state| {
+                state.resumed
+                    && state.device.seat() == seat
+                    && state.device.interface::<ei::Text>().is_some()
+            },
+        )
+    }
+
     fn keyboard_diagnostics(&self, route: &EisRoute) -> Result<String, String> {
         let pointer_id = self
             .matched_pointer_regions(route)
@@ -428,6 +442,16 @@ impl ReisInputBackend {
         }
         let attempt = EisAttemptGuard::new(Arc::clone(&session))?;
         let socket = session.connect_to_eis().await?;
+        let backend = Self::from_socket(session, route, socket)?;
+        attempt.complete()?;
+        Ok(backend)
+    }
+
+    fn from_socket(
+        session: Arc<PortalSessionLease>,
+        route: EisRoute,
+        socket: UnixStream,
+    ) -> Result<Arc<Self>, String> {
         let shutdown = socket
             .try_clone()
             .map_err(|error| format!("cannot clone EIS shutdown socket: {error}"))?;
@@ -469,7 +493,6 @@ impl ReisInputBackend {
             }),
             sync_requests,
         });
-        attempt.complete()?;
         Ok(backend)
     }
 
@@ -813,6 +836,18 @@ impl ReisInputBackend {
     }
 
     pub fn resolve_keysyms(&self, keysyms: &[u32]) -> Result<Vec<ResolvedKey>, String> {
+        self.resolve_symbols(keysyms, false)
+    }
+
+    pub fn resolve_text_keysyms(&self, keysyms: &[u32]) -> Result<Vec<ResolvedKey>, String> {
+        self.resolve_symbols(keysyms, true)
+    }
+
+    fn resolve_symbols(
+        &self,
+        keysyms: &[u32],
+        allow_text: bool,
+    ) -> Result<Vec<ResolvedKey>, String> {
         let state = self
             .state
             .lock()
@@ -830,13 +865,14 @@ impl ReisInputBackend {
             },
             || state.focused_keyboard_device(),
         )?;
-        Self::resolve_keysyms_with_device(&state, id, keysyms)
+        Self::resolve_keysyms_with_device(&state, id, keysyms, allow_text)
     }
 
     fn resolve_keysyms_with_device(
         state: &EisState,
         id: u64,
         keysyms: &[u32],
+        allow_text: bool,
     ) -> Result<Vec<ResolvedKey>, String> {
         let device = &state.devices[&id];
         let keymap = parse_keymap(
@@ -853,6 +889,11 @@ impl ReisInputBackend {
         validate_physical_modifiers(&keymap, (depressed, latched, locked, group))?;
         xkb_state.update_mask(depressed, latched, locked, 0, 0, group);
         let active = xkb_state.serialize_mods(xkb::STATE_MODS_EFFECTIVE);
+        let bind = |keycode| KeyboardKey {
+            device_id: id,
+            resume_generation: device.resume_generation,
+            keycode,
+        };
         keysyms
             .iter()
             .map(|&keysym| {
@@ -861,11 +902,10 @@ impl ReisInputBackend {
                     let keycode = xkb::Keycode::new(raw);
                     if xkb_state.key_get_one_sym(keycode) == target {
                         return Ok(ResolvedKey {
-                            device_id: id,
-                            resume_generation: device.resume_generation,
-                            keycode: raw
-                                .checked_sub(8)
-                                .ok_or("XKB keycode is below the evdev offset")?,
+                            key: bind(KeyCode::Physical(
+                                raw.checked_sub(8)
+                                    .ok_or("XKB keycode is below the evdev offset")?,
+                            )),
                             modifiers: [None; 4],
                         });
                     }
@@ -882,37 +922,40 @@ impl ReisInputBackend {
                         let mut masks = [0; 16];
                         let count =
                             keymap.key_get_mods_for_level(keycode, group, level, &mut masks);
-                        let required = masks[..count]
-                            .iter()
-                            .copied()
-                            .filter_map(|mask| {
-                                let added = mask & !active;
-                                let mut candidate = xkb::State::new(&keymap);
-                                candidate.update_mask(
-                                    depressed | added,
-                                    latched,
-                                    locked,
-                                    0,
-                                    0,
-                                    group,
-                                );
-                                (candidate.key_get_one_sym(keycode) == target).then_some(added)
-                            })
-                            .next()
-                            .ok_or_else(|| {
-                                format!(
-                                    "active EIS keymap has no safe modifier mask for keysym 0x{keysym:x}"
-                                )
-                            })?;
+                        let modifiers = masks[..count].iter().copied().find_map(|mask| {
+                            let added = mask & !active;
+                            let mut candidate = xkb::State::new(&keymap);
+                            candidate.update_mask(depressed | added, latched, locked, 0, 0, group);
+                            if candidate.key_get_one_sym(keycode) != target {
+                                return None;
+                            }
+                            // An unrepresentable modifier (for example
+                            // AltGr) is not a usable physical candidate.
+                            // Keep looking before negotiated Text fallback.
+                            modifier_keys(&keymap, added).ok()
+                        });
+                        let Some(modifiers) = modifiers else {
+                            continue;
+                        };
                         return Ok(ResolvedKey {
-                            device_id: id,
-                            resume_generation: device.resume_generation,
-                            keycode: raw
-                                .checked_sub(8)
-                                .ok_or("XKB keycode is below the evdev offset")?,
-                            modifiers: modifier_keys(&keymap, required)?,
+                            key: bind(KeyCode::Physical(
+                                raw.checked_sub(8)
+                                    .ok_or("XKB keycode is below the evdev offset")?,
+                            )),
+                            modifiers,
                         });
                     }
+                }
+                if allow_text && let Some(text_id) = state.text_device(id)? {
+                    let text = &state.devices[&text_id];
+                    return Ok(ResolvedKey {
+                        key: bind(KeyCode::Text {
+                            device_id: text_id,
+                            resume_generation: text.resume_generation,
+                            keysym,
+                        }),
+                        modifiers: [None; 4],
+                    });
                 }
                 Err(format!(
                     "active EIS keymap cannot represent keysym 0x{keysym:x}"
@@ -958,7 +1001,24 @@ impl ReisInputBackend {
                     .get(&key.device_id)
                     .ok_or("resolved EIS keyboard disappeared")?;
                 validate_key_binding(current, device.resume_generation, *key)?;
-                Ok(current)
+                match key.keycode {
+                    KeyCode::Physical(_) => Ok(current),
+                    KeyCode::Text {
+                        device_id,
+                        resume_generation,
+                        ..
+                    } => {
+                        let selected = state
+                            .text_device(current)?
+                            .ok_or("EIS Text device is no longer resumed")?;
+                        if selected != device_id
+                            || state.devices[&selected].resume_generation != resume_generation
+                        {
+                            return Err("EIS Text device changed after key resolution".into());
+                        }
+                        Ok(selected)
+                    }
+                }
             }
         }
     }
@@ -1015,6 +1075,15 @@ impl ReisInputBackend {
             .clone()
             .ok_or("EIS connection is not ready")?;
         let device_id = self.selected_device(&state, mode, &event)?;
+        if let InputEvent::Keycode { key, .. } = &event {
+            let keyboard = state
+                .devices
+                .get(&key.device_id)
+                .ok_or("resolved EIS keyboard disappeared")?;
+            if !state.devices[&device_id].emulating {
+                ensure_safe_physical_modifiers(keyboard)?;
+            }
+        }
         let device = state
             .devices
             .get_mut(&device_id)
@@ -1025,9 +1094,6 @@ impl ReisInputBackend {
                 InputEvent::ScrollDiscrete { .. } | InputEvent::Keycode { .. }
             ) {
                 return Err("selected EIS device is not in an emulation sequence".into());
-            }
-            if matches!(event, InputEvent::Keycode { .. }) {
-                ensure_safe_physical_modifiers(device)?;
             }
             device.start_emulating(connection.serial());
         }
@@ -1061,18 +1127,25 @@ impl ReisInputBackend {
                     .frame(connection.serial(), monotonic_microseconds());
                 scroll.scroll_stop(u32::from(x != 0), u32::from(y != 0), 0);
             }
-            InputEvent::Keycode { key, pressed } => device
-                .device
-                .interface::<ei::Keyboard>()
-                .ok_or("EIS device lost keyboard capability")?
-                .key(
-                    key.keycode,
-                    if pressed {
-                        ei::keyboard::KeyState::Press
-                    } else {
-                        ei::keyboard::KeyState::Released
-                    },
-                ),
+            InputEvent::Keycode { key, pressed } => {
+                let state = if pressed {
+                    ei::keyboard::KeyState::Press
+                } else {
+                    ei::keyboard::KeyState::Released
+                };
+                match key.keycode {
+                    KeyCode::Physical(code) => device
+                        .device
+                        .interface::<ei::Keyboard>()
+                        .ok_or("EIS device lost keyboard capability")?
+                        .key(code, state),
+                    KeyCode::Text { keysym, .. } => device
+                        .device
+                        .interface::<ei::Text>()
+                        .ok_or("EIS device lost Text capability")?
+                        .keysym(keysym, state),
+                }
+            }
         }
         device
             .device
@@ -1332,6 +1405,8 @@ fn run_eis_inner(
         .build()
         .map_err(|error| format!("cannot create EIS runtime: {error}"))?;
     runtime.block_on(async move {
+        let report_capabilities =
+            std::env::var("COMPUTER_USE_MCP_PROFILE_EIS_CAPABILITIES").as_deref() == Ok("1");
         let mut wire_events = reis::tokio::EiEventStream::new(context.clone())
             .map_err(|error| format!("cannot monitor EIS socket: {error}"))?;
         let handshake = reis::tokio::ei_handshake(
@@ -1389,6 +1464,17 @@ fn run_eis_inner(
                     "EIS rejected object {invalid_id} after serial {last_serial}"
                 ));
             }
+            if report_capabilities
+                && let ei::Event::Seat(_, ei::seat::Event::Capability { interface, .. }) =
+                    &wire_event
+            {
+                // Log only fixed metadata, never server strings or input.
+                eprintln!(
+                    "computer-use-mcp: EIS seat interface: keyboard={} text={}",
+                    interface == "ei_keyboard",
+                    interface == "ei_text"
+                );
+            }
             converter
                 .handle_event(wire_event)
                 .map_err(|error| format!("EIS protocol failed: {error}"))?;
@@ -1412,7 +1498,8 @@ fn handle_event(
                 DeviceCapability::PointerAbsolute
                     | DeviceCapability::Button
                     | DeviceCapability::Scroll
-                    | DeviceCapability::Keyboard,
+                    | DeviceCapability::Keyboard
+                    | DeviceCapability::Text,
             );
             connection
                 .flush()
@@ -1782,6 +1869,185 @@ fn device_id(device: &Device) -> u64 {
 mod tests {
     use super::*;
 
+    // Drive the production EIS event thread against an actual protocol peer.
+    // This checks negotiated capability routing, wire keysyms, and generation
+    // rejection rather than reproducing the resolver in a fake backend.
+    #[tokio::test]
+    async fn text_keysym_wire_roundtrip_and_resume_generation_authority() {
+        text_keysym_roundtrip("us", 'λ').await;
+        text_keysym_roundtrip("de", '@').await;
+    }
+
+    async fn text_keysym_roundtrip(layout: &'static str, character: char) {
+        use reis::{
+            eis,
+            handshake::EisHandshaker,
+            request::{EisRequest, EisRequestConverter},
+        };
+        use std::{io::Write, os::fd::AsFd};
+        let (client_socket, server_socket) = UnixStream::pair().unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let receiver = Arc::clone(&received);
+        let peer = std::thread::spawn(move || {
+            let context = eis::Context::new(server_socket).unwrap();
+            let mut handshake = EisHandshaker::new(&context, 1);
+            let mut converter: Option<EisRequestConverter> = None;
+            loop {
+                let mut polls = [rustix::event::PollFd::new(
+                    &context,
+                    rustix::event::PollFlags::IN,
+                )];
+                assert!(
+                    rustix::event::poll(
+                        &mut polls,
+                        Some(&rustix::time::Timespec {
+                            tv_sec: 5,
+                            tv_nsec: 0
+                        })
+                    )
+                    .unwrap()
+                        > 0,
+                    "protocol peer stalled"
+                );
+                match context.read() {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(error) => panic!("EIS peer read failed: {error}"),
+                }
+                while let Some(result) = context.pending_request() {
+                    let request = match result {
+                        PendingRequestResult::Request(request) => request,
+                        other => panic!("invalid EIS request: {other:?}"),
+                    };
+                    if let Some(converter) = converter.as_mut() {
+                        converter.handle_request(request).unwrap();
+                        while let Some(request) = converter.next_request() {
+                            match request {
+                                EisRequest::Bind(binding) => {
+                                    assert!(binding.capabilities.contains(DeviceCapability::Text));
+                                    let xkb_context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+                                    let keymap = xkb::Keymap::new_from_names(
+                                        &xkb_context,
+                                        "",
+                                        "",
+                                        layout,
+                                        "",
+                                        None,
+                                        xkb::KEYMAP_COMPILE_NO_FLAGS,
+                                    )
+                                    .unwrap()
+                                    .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
+                                    let mut file = std::fs::File::from(
+                                        rustix::fs::memfd_create(
+                                            "test-eis-keymap",
+                                            rustix::fs::MemfdFlags::CLOEXEC,
+                                        )
+                                        .unwrap(),
+                                    );
+                                    file.write_all(keymap.as_bytes()).unwrap();
+                                    file.write_all(&[0]).unwrap();
+                                    let keyboard = binding.seat.add_device(
+                                        Some("keyboard"),
+                                        eis::device::DeviceType::Virtual,
+                                        DeviceCapability::Keyboard.into(),
+                                        |device| {
+                                            device.interface::<eis::Keyboard>().unwrap().keymap(
+                                                eis::keyboard::KeymapType::Xkb,
+                                                (keymap.len() + 1) as u32,
+                                                file.as_fd(),
+                                            );
+                                        },
+                                    );
+                                    keyboard.resumed();
+                                    let text = binding.seat.add_device(
+                                        Some("text"),
+                                        eis::device::DeviceType::Virtual,
+                                        DeviceCapability::Text.into(),
+                                        |_| {},
+                                    );
+                                    text.resumed();
+                                }
+                                EisRequest::TextKeysym(event) => {
+                                    receiver.lock().unwrap().push((event.keysym, event.state))
+                                }
+                                EisRequest::TextUtf8(_) => {
+                                    panic!("typing must not use input-method text insertion")
+                                }
+                                EisRequest::Disconnect => return,
+                                _ => {}
+                            }
+                        }
+                    } else if let Some(response) = handshake.handle_request(request).unwrap() {
+                        let new = EisRequestConverter::new(&context, response, 1);
+                        let _ = new.handle().add_seat(
+                            Some("seat"),
+                            DeviceCapability::Keyboard | DeviceCapability::Text,
+                        );
+                        converter = Some(new);
+                    }
+                }
+                context.flush().unwrap();
+            }
+        });
+        let (session, _) = PortalSessionLease::for_test("/session/text", 1);
+        let backend =
+            ReisInputBackend::from_socket(session, EisRoute::UniqueResumedRegion, client_socket)
+                .unwrap();
+        backend.wait_for_keyboard().await.unwrap();
+        let symbol = xkb::utf32_to_keysym(character as u32).raw();
+        assert!(
+            backend.resolve_keysyms(&[symbol]).is_err(),
+            "shortcuts must stay physical-keymap-only"
+        );
+        let key = backend.resolve_text_keysyms(&[symbol]).unwrap()[0].key;
+        let KeyCode::Text { device_id, .. } = key.keycode else {
+            panic!("{layout} keymap must use negotiated Text for {character}");
+        };
+        if layout == "us" {
+            let mut events = vec![crate::validation::KeyboardEvent::Type(
+                "a".repeat(crate::validation::MAX_KEYBOARD_TRANSACTION_TEXT),
+            )];
+            events.extend(std::iter::repeat_n(
+                crate::validation::KeyboardEvent::Press("Return".into()),
+                crate::validation::MAX_KEYBOARD_EVENTS - 1,
+            ));
+            crate::input::keyboard_input::preflight_resolved_transaction(&backend, None, &events)
+                .expect("the full text budget must permit the remaining press events");
+        }
+        let event = |pressed| InputEvent::Keycode { key, pressed };
+        backend
+            .emit_inner_for_mode(InputMode::FocusedKeyboard, event(true))
+            .unwrap();
+        backend
+            .emit_inner_for_mode(InputMode::FocusedKeyboard, event(false))
+            .unwrap();
+        backend.synchronize(None).await.unwrap();
+        assert_eq!(
+            *received.lock().unwrap(),
+            [
+                (symbol, ei::keyboard::KeyState::Press),
+                (symbol, ei::keyboard::KeyState::Released)
+            ]
+        );
+        {
+            let mut state = backend.state.lock().unwrap();
+            state.devices.get_mut(&device_id).unwrap().resume_generation += 1;
+        }
+        assert!(
+            backend
+                .emit_inner_for_mode(InputMode::FocusedKeyboard, event(true))
+                .is_err()
+        );
+        assert_eq!(
+            received.lock().unwrap().len(),
+            2,
+            "stale Text authority emitted no additional event"
+        );
+        drop(backend);
+        peer.join().unwrap();
+    }
+
     #[test]
     fn interrupted_attempt_invalidates_the_portal_session() {
         let (session, _) = PortalSessionLease::for_test("/session/eis", 1);
@@ -1804,7 +2070,7 @@ mod tests {
         let key = KeyboardKey {
             device_id: 4,
             resume_generation: 7,
-            keycode: 30,
+            keycode: KeyCode::Physical(30),
         };
         assert!(validate_key_binding(4, 7, key).is_ok());
         assert!(validate_key_binding(5, 7, key).is_err());

@@ -6,12 +6,21 @@ six operations: `list_desktop`, `launch_application`, `activate_window`,
 `mcp --compact-tools` exposes only `help` and `dispatch` over the same broker.
 
 - `help {}` lists operation names. `help {"action":"observe"}` returns that
-  operation's authoritative description, input schema, and annotations in one
-  text block, without initializing a desktop.
+  operation's description and a compact reference in one text block, without
+  initializing a desktop: copyable argument templates plus every field, enum
+  value, and limit. Each template passes the native validator, and a test
+  keeps the reference complete against the input schema. The full JSON Schema
+  stays on the direct `mcp` tool definitions.
 - `dispatch {"action":"observe","arguments":{...}}` executes the operation
   using normal validation, identity routing, cancellation, and result encoding.
   Direct tool names are unavailable in compact mode; recursive dispatch and
   unknown operations are rejected before desktop startup.
+
+The compact dispatch description includes validated argument templates for
+window discovery, accessibility observation, and semantic invoke/set-value.
+These common paths need no help call. Fetch the help reference for other
+fields and operations, including screenshot-grounded pointer and keyboard input.
+This is the same native validator, not a second permissive action interface.
 
 Annotations mark `list_desktop`, `observe`, and `wait_for` read-only and
 idempotent. The first operation needing the accessibility tree may enable the
@@ -169,7 +178,25 @@ The server does not advertise prompts, resources, resource templates, or an
   `session_id`; it is not part of the caller API. Mixed desktop identities are
   rejected.
 - Copy `observation_id`, `frame_id`, and `element_id` unchanged. They are bound
-  to a process, observation, or source frame.
+  to a process, observation, or source frame. An `element_id` stays bound to the
+  same accessibility object across consecutive observations of the same window,
+  so the latest readback for that window remains the authoritative source; every
+  semantic action still re-reads the exact object before dispatching. A newer
+  observation of the same window replaces only the authority it carries: an
+  earlier observation stays a valid element source while it lists elements that
+  no newer retained observation of that window lists, so a screenshot-only look
+  or a narrow search does not strand IDs from a wider observation, and an
+  accessibility-only observation keeps the latest unmutated frame. Retention
+  grants identity only; any action on the window still invalidates its frames.
+- A bare `app_instance_id` plus `window_instance_id` beside the other arguments
+  is read as `target`; a bare `observation_id`/`frame_id` beside `operation`, or
+  a `source_observation` inside it, is read as `act.source_observation`. A
+  semantic action type used as `operation.type` together with an `element_id`
+  is read as the semantic operation, and `named_action` as the action `name`. These
+  are spelling tolerances only: every ID is validated exactly as usual.
+- Key chords are validated with the arguments. Names accept the documented
+  aliases plus X keysym names such as `comma`, `period`, `plus`, or `Menu`,
+  case-insensitively; a chord has at most one non-modifier key.
 - Use only capabilities advertised for the exact target and observation.
 - Treat `unknown`, `completed`, stale, unavailable, and timeout results as
   evidence to inspect, not as permission to retry blindly.
@@ -177,7 +204,7 @@ The server does not advertise prompts, resources, resource templates, or an
 Semantic operations may omit a frame. Pointer operations and point-focused
 keyboard or paste operations require the exact ready PNG frame named by
 `act.source_observation.frame_id`. A semantic focus operation uses an
-`element_id`, grabs AT-SPI focus, and verifies focus and active-window state
+`element_id`, requests AT-SPI focus if needed, and verifies focus and active-window state
 without moving the pointer.
 
 ## Tools
@@ -189,7 +216,8 @@ without moving the pointer.
 ```
 
 Use `{"scope":"windows","desktop":"background"}` to discover the
-private background desktop. `desktop` is optional and defaults to foreground;
+private background desktop. `scope` defaults to `windows` when omitted.
+`desktop` is optional and defaults to foreground;
 the applications scope accepts the same explicit selector.
 
 Results are paged. `limit` defaults to 50 and is bounded at 100. Pass the
@@ -208,6 +236,11 @@ because it is a single-client protocol; that does not weaken other authorities.
 The result reports backend status as `supported`, `unsupported`, `unavailable`,
 or `busy`. KDE geometry and desktop fields are logical diagnostics. AT-SPI
 extents are not input or crop authority.
+
+An exact direct child of an AT-SPI application may be a visible Component
+`filler` or `panel` rather than a frame (as in the tested Qt QWidget). It can
+provide an accessibility target under its own native object identity. This is
+not a compositor-window match, and grants no geometry or pixel authority.
 
 Use the other scope for installed applications:
 
@@ -255,6 +288,14 @@ unknown desktop location does not become proof through a guess. A bounded
 AT-SPI desktop hunt may try each non-current desktop once and restore the
 original desktop when no active state verifies.
 
+Toolkits commonly decline AT-SPI activation, because a Wayland client cannot
+raise its own window. When the toolkit declines and one fresh read shows the
+window still inactive, the call ends with `capability_unavailable` and outcome
+`completed`: nothing is uncertain and no desktop hunt runs. Activate the
+`kde-plasma-window-management` entry `list_desktop` shows for that window, or
+click inside it from a fresh screenshot. The server does not pair the two
+entries itself, since title and PID do not identify a window.
+
 Minimize, maximize, restore, and close require the KDE-rich authority. Their
 results distinguish request acceptance, protocol send, and connection flush.
 Restore may contain two state subrequests. No window action claims application
@@ -277,10 +318,59 @@ Protected surfaces are refused before dispatch with
 ```
 
 `view` is `screenshot`, `accessibility`, or `both`. Accessibility options are
-`scope` (`full`, `visible`, or `interactive`), `query`, and a `limits` object
+`scope` (`full`, `visible`, or `interactive`), `query` or `search`, and a `limits` object
 with `text_limit` (characters or `"max"`), `max_nodes`, and `max_depth`.
 Accessibility-only observations do not wait for portal capture. Unknown
 argument names are rejected.
+
+`query` remains a substring filter on already-collected metadata. For a bounded
+native search instead, use, for example:
+
+```json
+"accessibility": {
+  "scope": "interactive",
+  "search": {"name": "Save", "role": "push button", "exact": true, "limit": 5}
+}
+```
+
+Search matches native accessible **name** and/or **role**, case-insensitively;
+both predicates must match when supplied. Role is always an exact native role
+name; `exact` changes name matching from substring to equality. Exact misses
+never loosen. This is not a value/text-content search or a persistent selector.
+`query` and `search` cannot be combined. Name/role are nonblank strings of at
+most 1,000 characters. Search defaults: `limit=20` (1–100), `max_nodes=500`
+(1–5,000 attempted discovery reads), `timeout_ms=2000` (1–2,000). The ordinary
+output-node, depth, scope, text and response-byte limits still apply.
+
+Traversal prioritizes focused and showing controls outside collections before
+large collection contents, then emits selected nodes in original tree order.
+Ordinary discovery attempts have a separate cap of
+`clamp(4 * limits.max_nodes, 64, 10000)`. Discovery reads native name, role,
+states and bounded child edges; action, text/value and geometry metadata is
+acquired only for retained nodes. Uninspected capabilities are not advertised
+as supported. These choices do not make AT-SPI geometry input authority or
+weaken fresh exact-object action revalidation.
+
+Visible/interactive scope keeps selectable page tabs for navigation but omits
+descendants of tabs whose native selected state is false. Full scope retains
+them. A search that skips such contents reports `scope_omitted`; it cannot prove
+absence in another page. Noninvokable tabs are identified explicitly in text;
+use a supported parent tab-list keyboard operation or screenshot input instead
+of inventing an `invoke` action.
+
+Visible/interactive traversal also skips closed, nonshowing collections whose
+descendants can otherwise claim misleading visible states. Short navigation
+lists are visited before deep settings pages and large inventories. Empty
+focus-only containers are not presented as interactive controls. Full scope
+retains these objects; skipped search scope cannot establish absence.
+
+`accessibility.traversal` reports `visited_nodes`, `detailed_nodes`, `truncated`
+and `stop_reason`. Incompleteness can result from node/result, discovery, depth,
+time, scope or read-error bounds. Reaching a search result limit conservatively
+reports incomplete. **An incomplete empty search does not prove absence.**
+Results carry the usual observation-bound opaque element IDs. Search is not
+run for screenshot-only observations. A separate top-level `truncated` flag
+reports response projection limits, not search completeness.
 
 The optional crop is `monitor` (default) or `target_window`. Target-window crop
 uses KDE logical geometry, never AT-SPI extents. It is applied to raw source
@@ -293,6 +383,24 @@ exact `frame_id` required for spatial input. Accessibility elements expose
 opaque `element_id` values. Text and structured output are bounded and report
 truncation without cutting serialized JSON at an arbitrary byte.
 
+The text projection omits repeated action descriptions and duplicate noneditable
+name/value strings. Named action identifiers remain available; the structured
+projection retains full metadata. Checkable controls report `checked=true/false`
+and decision-relevant states such as selected, expanded, or invalid. An
+unfiltered interactive observation also includes up to eight visible label/status
+names within a 1,024-byte escaped-JSON budget. Text identifies these as fresh
+AT-SPI readback, not dispatch success. Omitted nodes do not invalidate included
+facts; another observation is needed only if the included evidence does not
+establish the requested result. This does not attribute causality to the action
+or prove anything about omitted nodes.
+
+Actions may include `keybinding` copied from native AT-SPI metadata. It is
+bounded, locale/toolkit-dependent text, not a portable command or input
+authority. Some toolkits use `mnemonic;sequence;shortcut`; others return a
+single mnemonic. An absent binding must not be guessed. Modal-opening actions
+can block AT-SPI `DoAction`; a fresh screenshot-grounded click avoids that
+synchronous reply path. No automatic action replay or shortcut fallback occurs.
+
 Ready screenshots may include `changed_rect`, an advisory tile-hash bounding box
 against the previous committed captured frame. It is not a model observation
 delta. The first captured frame has no baseline. A new stream may still return
@@ -300,28 +408,44 @@ that complete baseline if no newer frame arrives during startup capture.
 
 ### `act`
 
-Every call names the exact source observation:
+For a semantic operation or keyboard/paste with semantic focus, the exact live
+`element_id` identifies the newest retained observation that contains it. Both
+`source_observation` and `target` may then be
+omitted. The retained source still binds one exact application/window target
+and desktop route. Supplied source/target authority must match; stale or
+unbound authority fails before input. Omission never selects the current
+foreground window or infers identity by name/PID/geometry. Pointer and
+point-focused keyboard/paste always require explicit source and frame.
+
+Keyboard and paste operations may omit `focus`. Input then goes to whatever
+holds keyboard focus inside the exact `target` window, which suits shortcuts and
+typing straight after a click. With `target` or a `source_observation` it uses
+the newest retained observation of that window; with neither it binds the
+window this session last observed or acted on. It moves neither the pointer
+nor AT-SPI focus. It is refused before any input with
+`target_unavailable` unless a fresh read shows the window active or a click
+focus grace applies, and the active state is re-read after input preparation.
+It never types into another window; `activate_window` first if needed.
 
 ```json
 {
-  "target": {
-    "app_instance_id":"app-0000000000000001",
-    "window_instance_id":"win-0000000000000002"
-  },
-  "source_observation": {
-    "observation_id":"obs-0000000000000003",
-    "frame_id":"frame-0000000000000004"
-  },
-  "operation":{"type":"semantic","action":{"type":"invoke"}}
+  "operation":{"type":"semantic","element_id":"e-0000000000000005","action":{"type":"invoke"}}
 }
 ```
 
 Semantic operations include `invoke`, `focus`, advertised `named` actions, and
-`set_value`. Pointer operations use exact source-PNG coordinates. Keyboard
-operations are either 1 to 8 press-only events or one non-empty `type` event of
-at most 4,096 Unicode scalar values. Point focus, key events, synchronization,
-and cleanup stay in one EIS transaction. The click is sent and flushed before
-keys are dispatched.
+`set_value`. When a control exposes both numeric Value and EditableText, the
+native numeric property is preferred to avoid leaving uncommitted spin-box text.
+Pointer operations require that source's `frame_id` and use exact
+source-PNG coordinates. Keyboard
+operations contain 1 to 8 ordered `press` or `type` events, with at most 4,096
+Unicode scalar values across all typed text. For example, text followed by
+Enter may share one transaction. Every event is resolved before emission;
+invalid later input cannot leave an earlier event dispatched. Point focus,
+ordered key events, synchronization, and cleanup stay in one EIS transaction.
+The click is sent and flushed before keys are dispatched; high-level events
+have protocol barriers between them. This does not establish application-level
+completion between events. Keep navigation requiring new UI evidence separate.
 
 `paste` focus-clicks an exact source-PNG point. The session requests Clipboard
 before `RemoteDesktop.Start`; when the portal returns `clipboard_enabled`, it
@@ -336,13 +460,74 @@ A successfully dispatched click may grant one 15-second focus grace for the
 same accessibility app and window when the mapped point lies inside current KDE
 geometry. It is best effort, consumed once, and invalidated by focus or
 geometry changes. Unknown focus state is reported as unavailable or null.
-Semantic typing requires a fresh exact focused-element and active-window
-verification. A false `Component.GrabFocus` result is accepted only when that
-fresh verification succeeds.
+Semantic typing requires fresh exact focused-element and active-window
+verification after EIS preparation. Already verified focus avoids a redundant
+`Component.GrabFocus`; this matters for providers such as the tested GTK4 bridge
+that can expose valid editing while rejecting focus requests. Otherwise focus
+is requested and reverified. A false or failed request is accepted only when
+that fresh exact verification succeeds. Text replacement similarly skips a
+redundant focus request only after a fresh focused/non-defunct read, and still
+requires exact full-text readback.
+
+Keyboard keymap/device resolution precedes any semantic focus mutation,
+not just key emission. Typed text prefers physical keys; otherwise it can use
+negotiated EIS Text keysym events on the same exact seat. Both the physical
+keyboard and Text device must retain their exact object and resume generation.
+Shortcuts remain physical-keymap-only. Text UTF-8/input-method insertion is
+never substituted for key events. Unsupported keysyms detected in preparation return
+`unsupported_input`, `not_started`, non-retryable for the same typing. A later
+device/keymap change still follows the actual mutation-progress outcome rules.
+Portal paste is an alternative
+only when negotiated and the application accepts paste; it is not a general
+Unicode key-event synthesis mechanism for a custom drawing canvas.
 
 Action results separate dispatch, cleanup, and post-visual or
 post-accessibility evidence. They do not prove text delivery, application
 effect, seat focus, or client delivery.
+
+Actions return fresh post-action state when available. Use its replacement
+observation, element IDs, and target for the next action; inspect that state
+before requesting another observation. A freshly active same-application modal,
+or the sole exact surviving window after a modal disappears, can become the
+**read-only replacement observation target**. The result explicitly returns
+`replacement_target` and the full replacement observation. Selection requires
+the same opaque application identity and exact AT-SPI app object/PID; it never
+joins by title/PID alone, crosses compositor identities, or retargets input.
+Ambiguous survivors remain a refresh error. An already-active sibling must not
+steal the source window's replacement state. A replacement is not evidence that
+the preceding action caused the transition.
+
+A successful action's text readback lists only elements that are new or whose
+rendered line differs from what this session last showed for that element ID,
+plus the acted-on element. One line counts the omitted unchanged elements, whose
+IDs remain valid, and another describes by role and name, without IDs, the
+previously shown elements that are no longer listed. `observe` and `wait_for` always return the full requested tree,
+`list_desktop` resets the comparison, structured content is never reduced, and
+readbacks attached to uncertain-outcome errors stay complete.
+
+When an action leaves a new window of the same application that is not the
+replacement target, such as a context menu or a non-modal dialog, the result
+appends up to two `Opened window` blocks. Each gives that window's exact target
+and up to 24 interactive elements, and `opened_windows` in structured content
+carries the target, title, and observation ID. Elements listed there act on
+that window's target, never on the source window. The blocks are charged
+against the same response budget: a cut list ends with `(more elements; observe
+it)`, and a window that does not fit is only announced. A reported window
+counts as the window last observed, so keyboard input that names no window
+goes to it while it is active. Untitled windows without
+interactive elements, such as tooltips, are not reported. This is read-only
+evidence and does not prove the action caused the window.
+
+The readback follows the action when the source window is gone: after input
+closes a dialog, it describes the same application's single active or single
+remaining window and names that target, for screenshot-sourced input as well
+as semantic actions. Ambiguous survivors are never chosen.
+
+When this changes an interactive observation's exact target, its automatic
+readback is capped at 24 detailed nodes and clears old-window search filters.
+This keeps dialog navigation concise, not complete. Truncation remains explicit;
+request a scoped search or larger explicit observation if the needed control is
+missing. The cap does not apply to full-scope or same-target readbacks.
 
 ### `wait_for`
 
@@ -439,6 +624,13 @@ Known-tool argument and runtime failures are normal tool results with
 | `not_started` | Dispatch was blocked before the action. | Follow `recovery`; observe before retrying if needed. |
 | `unknown` | Dispatch may have started or completed. | Observe current state; do not retry blindly. |
 | `completed` | Dispatch completed but later evidence or cleanup is incomplete. | Observe current state before acting again. |
+
+An unknown semantic-action or semantic-focus error can include a fresh
+`replacement_observation`. This is read-only recovery evidence, not proof that
+the failed call completed. Its target may be a newly opened modal in the exact
+same native application. Use its new IDs when explicitly continuing; never
+replay the failed action merely because readback exists. Truncated evidence
+still requires an appropriately scoped observation before selecting a control.
 
 `retryable` is advisory. The recovery text is the next-step authority.
 `ProtectedSurfaceRefused` is non-retryable.

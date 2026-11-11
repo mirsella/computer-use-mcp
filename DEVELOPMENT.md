@@ -141,7 +141,7 @@ python3 scripts/isolated-mcp-smoke.py --compact-mcp "$PWD/target/debug/computer-
 
 This invokes the binary directly, without an outer isolated-session wrapper or
 injected private environment.
-The compact variant fetches each action schema once, then dispatches all calls
+The compact variant fetches each action reference once, then dispatches all calls
 through the compact transport.
 
 For optional model-driven smoke tests, use the checkout build described above:
@@ -216,12 +216,216 @@ targeted `NewFile`, and both readback strings matched. It exited successfully
 with the target gone and no owned descendants. The window-close case was
 unavailable because the AT-SPI target had no KDE authority.
 
-The installed Rust 1.97.0 workspace verification passed 370 tests: 334 library,
-3 cancellation, 5 contract, 6 isolated, 3 process, 4 readiness, and 15
-validation tests, with 1 ignored. Clippy passed. This is evidence for the tested
-Linux/KDE environment, not a claim of support for every platform.
+The 2026-11-11 Rust 1.97.0 workspace verification passed 432 tests: 385 library,
+3 cancellation, 8 contract, 11 isolated, 3 process, 4 readiness, and 18
+validation tests, with 1 ignored. Clippy and 28 package tests passed. The reviewed
+13 internal-client and 14 normal Python accounting tests remain valid; the
+private GTK receiver regression covers five real callback scenarios. These checks and the private
+Wayland live regressions cover the tested Linux/KDE environment, not every app
+or platform. Model error-rate and timing claims require the separate recorded
+benchmark trials below.
 
 ## Entry points
+
+### Matched model benchmarks
+
+For the larger seeded comparison, use `--suite expanded --repetitions 4
+--seed-base 101 --provider-timing --systems updated upstream`. The twenty-two
+families cover GTK3, GTK4, a Qt widget form, a real KWrite saved document,
+asynchronous validation, hidden notebook pages, cancellation, filtering,
+modal transitions, and screenshot-only click/type and drag. Ten harder
+GTK3 families add a menu bar with a submenu that opens a dialog, a collapsed
+tree with a same-named decoy row, a second non-modal editor window, a
+right-click context menu on a long list with a destructive sibling item, a
+slider with a spin button, a long checklist with pre-checked decoys, an
+editable table cell, a multi-page wizard with gated navigation, two
+same-titled windows, and a form revealed only by a keyboard shortcut.
+This creates 176 trials, each in a fresh private Wayland session. Pixel-only
+trials have a 90-second cap; other expanded workloads cap at 180 seconds.
+Adding a family must not change the seeded parameters of existing ones;
+`scripts/test_bench_desktops.py` pins one frozen value.
+
+The provider timing proxy forwards request and response bodies unchanged;
+it logs only timestamps, byte counts, SSE event counts, and numeric usage.
+Its private model-level endpoint override is necessary because a catalog
+model endpoint can override a provider-level endpoint. Account credentials,
+the requested model, and the max reasoning variant remain unchanged.
+First streamed reasoning and first output delta are separate measurements,
+not interchangeable definitions of time to first token. The unassigned
+remainder includes startup, local work, and any uninstrumented services;
+it is not presented as CPU time. A per-trial capture-completeness flag
+checks observed streams against completed model steps.
+
+Expanded reports require the complete recorded schedule. They retain
+goal failures and distinguish clean completion from a recovered goal:
+clean means no tool errors, wrong submissions, unsafe receiver action,
+deadline, or unfinished call. Cost comparisons use only same-seed semantic
+pairs where both succeeded, and list the resulting coverage explicitly.
+All-attempt medians/p90s, failures, provider/native timing, and a separate
+deadline-penalized completion score remain visible. Descriptive paired
+bootstrap ranges describe this fixed workload mix, not all applications.
+
+The deterministic large-collection regression also runs the internal stdio client
+against a real GTK app, including targeted search, replacement IDs, and an
+independently checked button callback:
+
+```sh
+scripts/run-isolated-session.sh --width 1280 --height 800 -- node scripts/observation-smoke.mjs
+scripts/run-isolated-session.sh --width 1280 --height 800 -- node scripts/observation-smoke.mjs hard
+scripts/run-isolated-session.sh --width 1280 --height 800 -- node scripts/expanded-observation-smoke.mjs qt_invoice
+scripts/run-isolated-session.sh --width 1280 --height 800 -- node scripts/expanded-observation-smoke.mjs gtk4_form
+scripts/run-isolated-session.sh --width 1280 --height 800 -- node scripts/expanded-observation-smoke.mjs settings
+scripts/run-isolated-session.sh --width 1280 --height 800 -- node scripts/expanded-observation-smoke.mjs unicode-preflight
+scripts/run-isolated-session.sh --width 1280 --height 800 -- node scripts/expanded-observation-smoke.mjs kwrite
+```
+
+The expanded toolkit checks use `target/release/computer-use-mcp`. They verify
+native Qt top-level-container discovery and exact modal replacements, GTK4
+replacement without redundant unsupported focus, real tab navigation, and
+Unicode key-event delivery through negotiated EIS Text. The Qt and
+settings checks also run the opt-in stateful workflow helper; native-MCP model
+comparison trials do not use that helper. The removed adapter's frozen cohort
+remains historical evidence only.
+
+`scripts/bench-desktops.py` runs receiver-verified synthetic tasks against an
+unchanged checkout, the current executable, and upstream open-computer-use.
+Each trial owns a fresh private KWin Wayland session. Both native MCP servers
+use their normal foreground route inside that session; no trial uses the
+physical desktop. This compares the backends in a common environment, not
+their ability to provision that environment. Use the normal-MCP smoke above
+to test our broker-managed background desktop separately.
+
+The pinned model is `opencode-go/deepseek-v4.1-flash#max`. The runner exports
+existing Go and active Console credentials into a private temporary directory,
+imports them into a disposable OpenCode database, and removes them afterward.
+It does not change account credentials or global configuration. Raw model
+events contain synthetic task data and are retained in the private output
+directory, never alongside exported credentials.
+
+```sh
+python3 -B scripts/bench-desktops.py \
+  --systems baseline updated upstream --tasks easy medium hard visual \
+  --repetitions 2 --timeout 180 --output target/desktop-bench-example
+```
+
+The default is the eager direct-tool surface used by the initial comparison.
+Pass `--ours-transport compact` to measure our plugin's default help/dispatch
+surface, including its inline common-operation templates. This applies to our
+selected checkouts; upstream remains on its native direct surface. Keep the
+transport explicit when comparing runs: reducing catalog overhead is an
+interface improvement, not a backend CPU-speed claim.
+
+Each proxy writes a separate `.usage.json` sidecar with child-process
+user/system CPU seconds and maximum RSS. These process-tree measurements exclude
+KWin and the fixture. RPC elapsed time remains a different metric.
+
+The final frozen 144-trial follow-up used four variants of each expanded family.
+Our Rust server verified 44/48 goals with 35 clean runs and 19/427 model-tool errors;
+Open Computer Use verified 22/48 with 17 clean runs and 103/683 errors, including
+host rejections. The separate adapter verified 44/48 with 34 clean runs and
+17/403 errors. Its cumulative input context was 23.7% higher than our compact
+interface. That experimental adapter is not part of the package; its frozen
+source and results remain in the historical benchmark evidence.
+Older frozen cohorts predate the receiver guards for unsaved Personal-tab edits
+and inventory-row selection. Their zero recorded unsafe-action counts do not
+establish compliance with those constraints. Current collection also records
+nonzero model-process exits explicitly and excludes them from clean runs.
+All 144 provider captures were complete and private runtimes were removed.
+KWrite's final files were correct in all native runs, but each had a wrong
+intermediate save and three agents hit the deadline. All Unicode canvas cases
+failed. These results do not establish a general before/after speed improvement.
+
+Set `COMPUTER_USE_MCP_PROFILE_EIS_CAPABILITIES=1` only for capability diagnostics.
+It logs fixed keyboard/Text interface booleans, not input or server strings.
+The backend now binds EIS Text when advertised. It uses Text keysym events only
+for typed characters absent from the physical keymap, with exact same-seat,
+keyboard and Text-device generation checks. Shortcuts remain physical-only.
+A socket-pair protocol test verifies actual keysym press/release messages and
+rejects consumed Text-device generations without emitting more input. Four
+private canvas probes (seeds 101–104) verified exact Unicode via the receiver's
+key events, with no wrong submission. KWin Text UTF-8 uses the input method;
+the backend never substitutes that for keyboard events. Do not rewrite a
+received keymap or substitute clipboard insertion for the canvas requirement.
+
+After removing the experimental adapter, two new frozen Rust-only expanded
+cohorts each reached 48/48 receiver goals. The final cohort had 38 clean runs,
+20 errors in 454 finished model-tool attempts, six wrong intermediate
+submissions, and three deadlines. All four canvas and all four GTK4-form cases
+were clean. Fourteen errors came from KWrite, including blocking modal actions
+and malformed/stale agent requests. Cumulative reported input was 4,879,068
+tokens, not lower than the earlier 4,298,229-token Rust cohort. Do not claim
+zero errors or a general context improvement. All 96 new timing captures and
+private-runtime teardown checks completed. Frozen historical adapter evidence
+remains separate and is not shipped or runnable through the current harness.
+
+A fresh 2026-11-11 before/after pair used the reviewed receivers and unchanged
+model, harness, workloads, seeds, schedule and time caps. Both builds are ours;
+Open Computer Use was not rerun. Baseline: 46/48 goals, 38 clean runs, 10 errors
+in 408 finished tool attempts and six wrong submissions. Changed build: 48/48
+goals, 35 clean runs, 12 errors in 416 attempts and zero wrong submissions.
+Blocking modal timeouts disappeared, but cumulative input increased from
+3,094,697 to 3,284,431 and model wall time did not improve. All 96 provider
+captures and private teardown checks completed. Do not describe this as an
+overall token, speed or error-rate win. No transient read-only failures occurred
+in the baseline, so no retry mechanism was added.
+
+The KWrite regression now opens Configure with one click identified from the
+actual returned PNG, then changes the saving option before the first file save.
+It requires Tesseract for test-only OCR; production has no OCR dependency.
+All four seeds saved exact contents with zero wrong submissions and no blocking
+semantic invoke. Initialize visual input before opening the menu, because
+portal setup can dismiss it. Discover a newly published native modal read-only
+if it is absent from immediate post-click evidence; never repeat the click.
+
+For production-cost measurements, build with `cargo +1.97.0 build --locked
+--release -p computer-use-mcp` (using the host codegen settings above), then pass
+`--updated target/release/computer-use-mcp --updated-build-profile release`.
+The flag records the declared profile; it does not build or optimize the binary.
+The default path/profile is debug. Reports show the profile and reject mixed
+profiles within one system, as they do mixed transports or executable hashes.
+
+See the script's binary-path options for alternate checkouts. Baseline builds
+must have their own Cargo target directories. Keep every measured executable
+unchanged throughout its trials. The upstream Linux executable is built with
+Go from `apps/OpenComputerUseLinux`; the runner needs Python GTK 3, OpenCode,
+Bun, and the same private-session dependencies as our normal smoke.
+
+Tasks cover exact text replacement, a footer after 2,000 rows, a multi-step
+Unicode form and confirmation dialog, and screenshot-grounded pointer plus
+generated keyboard input. Fixture callbacks write independent success state.
+The model's final prose is not an acceptance criterion. System order rotates
+between tasks and repetitions. A small synthetic pilot is not a statistical
+ranking or a platform-wide reliability claim.
+
+Each summary records tool calls/errors, cumulative MCP RPC time, UTF-8 tool
+text, decoded image and wire bytes, catalog bytes, model steps, provider token
+counts, wall time, native binary hashes, and runtime-directory teardown.
+Finished model-side attempt/error counts also include host schema rejections
+that never reached native MCP. In-flight model calls and native help calls are
+reported separately; repeated state updates do not double-count an attempt.
+`peak_reported_input_context_tokens` is the maximum provider-reported step
+input plus cache read/write tokens; the cumulative field sums those values.
+These are not independent local tokenization or image-context measurements.
+MCP time includes response transport and is not backend CPU time. Setup and
+provider errors must be reported separately from receiver/backend failures.
+
+After the run, `python3 -B scripts/bench-report.py target/desktop-bench-pilot`
+writes `report.json` and a self-contained `report.html` chart. It separates
+semantic-task costs from pixel-only capability failures and rejects mixed
+binary snapshots. Check accounting with `python3 -B scripts/test_bench_desktops.py`.
+
+To compare a complete pre/post expanded experiment, use:
+
+```sh
+python3 -B scripts/bench_expanded_compare.py target/expanded-before target/expanded-after --output target/expanded-comparison
+```
+
+This requires identical schedules, workload/fixture/instrumentation hashes and
+the same reference executable. It retains all goal/clean/error outcomes and
+shows temporal before/after costs only with explicit joint-success coverage.
+The four-way cost view uses identical seed/task pairs successful in both
+implementations in both phases. Provider conditions can still change between
+phases; neither this conditioning nor bootstrap ranges make timing causal.
 
 ### npm packaging and releases
 

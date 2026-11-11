@@ -118,6 +118,33 @@ fn list_desktop_pagination_defaults_and_bounds_are_explicit() {
 }
 
 #[test]
+fn targeted_search_is_bounded_and_separate_from_the_compatibility_filter() {
+    valid(
+        "observe",
+        json!({"target": target(), "view": "accessibility", "accessibility": {"search": {"name": "Save", "role": "push button", "exact": true}}}),
+    );
+    for search in [
+        json!({}),
+        json!({"name": " "}),
+        json!({"role": 1}),
+        json!({"name": "x", "limit": 0}),
+        json!({"name": "x", "max_nodes": 5001}),
+        json!({"name": "x", "timeout_ms": 2001}),
+        json!({"name": "x", "exact": "yes"}),
+        json!({"name": "x", "unknown": 1}),
+    ] {
+        invalid(
+            "observe",
+            json!({"target": target(), "view": "accessibility", "accessibility": {"search": search}}),
+        );
+    }
+    invalid(
+        "observe",
+        json!({"target": target(), "view": "accessibility", "accessibility": {"query": "x", "search": {"name": "x"}}}),
+    );
+}
+
+#[test]
 fn accessibility_defaults_and_limits_are_bounded() {
     let call = valid(
         "observe",
@@ -247,6 +274,13 @@ fn bounded_strings_count_raw_unicode_scalars_before_normalizing() {
             "state" => "wait_for",
             _ => unreachable!(),
         };
+        if name == "key" {
+            // Key chords are parsed at validation time, so a long nonsense key
+            // is rejected as an unknown key only once it is inside the length bound.
+            assert!(invalid(tool, accepted_call).contains("unknown key name"));
+            assert!(invalid(tool, rejected_call).contains("at most"));
+            continue;
+        }
         let call = valid(tool, accepted_call);
         invalid(tool, rejected_call);
 
@@ -268,15 +302,6 @@ fn bounded_strings_count_raw_unicode_scalars_before_normalizing() {
                 },
             ) => {
                 assert_eq!(request.query.expect("query").chars().count(), maximum - 2);
-            }
-            (
-                "key",
-                ToolCall::Act {
-                    operation: ActOperation::Keyboard { events, .. },
-                    ..
-                },
-            ) => {
-                assert_eq!(events[0], KeyboardEvent::Press("界".repeat(maximum - 2)));
             }
             (
                 "state",
@@ -495,7 +520,7 @@ fn pointer_drag_and_keyboard_transactions_preserve_all_events() {
                 }
             })
         )
-        .contains("must be a point")
+        .contains("use {\"type\":\"semantic\"")
     );
     assert!(
         invalid(
@@ -614,6 +639,32 @@ fn pointer_drag_and_keyboard_transactions_preserve_all_events() {
         }),
     );
     assert!(matches!(semantic_without_frame, ToolCall::Act { .. }));
+    let mut source_bound = json!({
+        "source_observation": {"observation_id":"obs-0000000000000003"},
+        "operation": {"type":"semantic","element_id":"e-0000000000000005","action":{"type":"invoke"}}
+    });
+    assert!(matches!(
+        valid("act", source_bound.clone()),
+        ToolCall::Act { target: None, .. }
+    ));
+    source_bound["target"] = Value::Null;
+    assert!(invalid("act", source_bound.clone()).contains("object"));
+    source_bound.as_object_mut().unwrap().remove("target");
+    source_bound["operation"] = json!({"type":"pointer","action":{"type":"move","x":1,"y":2}});
+    assert!(invalid("act", source_bound).contains("frame_id is required"));
+    let element_bound = json!({"operation":{"type":"semantic","element_id":"e-0000000000000004","action":{"type":"invoke"}}});
+    assert!(matches!(
+        valid("act", element_bound.clone()),
+        ToolCall::Act { source: None, .. }
+    ));
+    let mut missing_source = element_bound;
+    missing_source["operation"] = json!({"type":"keyboard","focus":{"type":"semantic","element_id":"e-0000000000000004"},"events":[{"type":"press","key":"Return"}]});
+    assert!(matches!(
+        valid("act", missing_source.clone()),
+        ToolCall::Act { source: None, .. }
+    ));
+    missing_source["source_observation"] = Value::Null;
+    assert!(invalid("act", missing_source).contains("object"));
 }
 
 #[test]
@@ -653,8 +704,21 @@ fn keyboard_event_grammar_is_strict_and_bounded() {
         vec![press("F6"), type_event("hello")],
         vec![type_event("hello"), press("Enter")],
     ] {
-        assert!(invalid("act", call(events)).contains("mixed"));
+        let expected_len = events.len();
+        assert!(matches!(valid("act", call(events)), ToolCall::Act {
+            operation: ActOperation::Keyboard { events, .. }, ..
+        } if events.len() == expected_len));
     }
+    assert!(
+        invalid(
+            "act",
+            call(vec![
+                type_event(&"é".repeat(2048)),
+                type_event(&"🙂".repeat(2049))
+            ])
+        )
+        .contains("in total")
+    );
     assert!(invalid("act", call(vec![type_event("")])).contains("must not be empty"));
     assert!(invalid("act", call(vec![type_event("\0")])).contains("NUL"));
     assert!(invalid("act", call(vec![type_event(&"x".repeat(4_097))])).contains("4096"));
@@ -1058,4 +1122,208 @@ fn observation_with_frame(frame_id: Option<&str>) -> Value {
         }),
         None => json!({"observation_id": "obs-0000000000000003"}),
     }
+}
+
+#[test]
+fn keyboard_without_focus_targets_the_windows_current_focus() {
+    let target = json!({"app_instance_id": "app-0000000000000001", "window_instance_id": "win-0000000000000002"});
+    let events = json!([{"type": "press", "key": "ctrl+s"}]);
+    for arguments in [
+        json!({"target": target, "operation": {"type": "keyboard", "events": events}}),
+        json!({"source_observation": {"observation_id": "obs-0000000000000003"}, "operation": {"type": "keyboard", "events": events}}),
+    ] {
+        let ToolCall::Act { operation, .. } =
+            validate_call("act", arguments.as_object().unwrap().clone()).unwrap()
+        else {
+            panic!("act expected");
+        };
+        assert!(matches!(
+            operation,
+            ActOperation::Keyboard {
+                focus: KeyboardFocus::Window,
+                ..
+            }
+        ));
+    }
+    let ToolCall::Act { operation, .. } = validate_call(
+        "act",
+        json!({"target": target, "operation": {"type": "paste", "text": "two\nlines"}})
+            .as_object()
+            .unwrap()
+            .clone(),
+    )
+    .unwrap() else {
+        panic!("act expected");
+    };
+    assert!(matches!(
+        operation,
+        ActOperation::Paste {
+            focus: KeyboardFocus::Window,
+            ..
+        }
+    ));
+    // Naming no window at all is valid: the runtime binds the window this
+    // session last observed or acted on and still requires it to be active.
+    let ToolCall::Act {
+        target: unnamed,
+        source,
+        operation,
+    } = validate_call(
+        "act",
+        json!({"operation": {"type": "keyboard", "events": events}})
+            .as_object()
+            .unwrap()
+            .clone(),
+    )
+    .unwrap()
+    else {
+        panic!("act expected");
+    };
+    assert!(unnamed.is_none() && source.is_none());
+    assert!(matches!(
+        operation,
+        ActOperation::Keyboard {
+            focus: KeyboardFocus::Window,
+            ..
+        }
+    ));
+    // There is one spelling for it: omission.
+    let spelled = validate_call(
+        "act",
+        json!({"target": target, "operation": {"type": "keyboard", "focus": {"type": "window"}, "events": events}})
+            .as_object()
+            .unwrap()
+            .clone(),
+    )
+    .unwrap_err();
+    assert!(
+        spelled.message.contains("omit \"focus\""),
+        "{}",
+        spelled.message
+    );
+}
+
+#[test]
+fn common_agent_spellings_are_accepted_without_weakening_strictness() {
+    // A bare observation_id beside operation is the source observation.
+    let call = valid(
+        "act",
+        json!({
+            "target": target(),
+            "observation_id": "obs-0000000000000003",
+            "operation": {"type": "semantic", "element_id": "e-0000000000000005", "action": {"type": "invoke"}}
+        }),
+    );
+    assert!(matches!(
+        call,
+        ToolCall::Act { source: Some(source), .. } if source.observation_id == "obs-0000000000000003" && source.frame_id.is_none()
+    ));
+    // invoke carrying a name is the named action, never a silently ignored field.
+    let call = valid(
+        "act",
+        json!({
+            "target": target(),
+            "operation": {"type": "semantic", "element_id": "e-0000000000000005", "action": {"type": "invoke", "name": "Show Menu"}}
+        }),
+    );
+    assert!(matches!(
+        call,
+        ToolCall::Act { operation: ActOperation::Semantic { action: ElementAction::Named(name), .. }, .. } if name == "Show Menu"
+    ));
+    let call = valid(
+        "act",
+        json!({
+            "target": target(),
+            "operation": {"type": "semantic", "element_id": "e-0000000000000005", "action": {"type": "invoke", "named_action": "Show Menu"}}
+        }),
+    );
+    assert!(matches!(
+        call,
+        ToolCall::Act { operation: ActOperation::Semantic { action: ElementAction::Named(name), .. }, .. } if name == "Show Menu"
+    ));
+    // A semantic action written as the operation type is the semantic operation.
+    for operation in [
+        json!({"type": "set_value", "element_id": "e-0000000000000005", "action": {"type": "set_value", "value": "SKU-1"}}),
+        json!({"type": "set_value", "element_id": "e-0000000000000005", "value": "SKU-1"}),
+    ] {
+        let call = valid("act", json!({"target": target(), "operation": operation}));
+        assert!(matches!(
+            call,
+            ToolCall::Act { operation: ActOperation::Semantic { action: ElementAction::SetValue(value), .. }, .. } if value == "SKU-1"
+        ));
+    }
+    // Without an element it is still an unknown operation type.
+    assert!(
+        invalid(
+            "act",
+            json!({"target": target(), "operation": {"type": "invoke"}})
+        )
+        .contains("operation.type must be")
+    );
+    // Key names are checked before any state is consumed.
+    let error = invalid(
+        "act",
+        json!({
+            "target": target(),
+            "operation": {"type": "keyboard", "focus": {"type": "semantic", "element_id": "e-0000000000000005"}, "events": [{"type": "press", "key": "ctrl+shift+komma"}]}
+        }),
+    );
+    assert!(
+        error.contains("unknown key name") && error.contains("comma"),
+        "{error}"
+    );
+    valid(
+        "act",
+        json!({
+            "target": target(),
+            "operation": {"type": "keyboard", "focus": {"type": "semantic", "element_id": "e-0000000000000005"}, "events": [{"type": "press", "key": "ctrl+shift+comma"}]}
+        }),
+    );
+    let error = invalid(
+        "wait_for",
+        json!({"condition": {"type": "delay", "duration_ms": 400}, "timeout_ms": 2000}),
+    );
+    assert!(error.contains("frame_stable"), "{error}");
+    // One operation per call: name the fix instead of a generic unknown argument.
+    let error = invalid(
+        "act",
+        json!({
+            "target": target(),
+            "operations": [{"type": "semantic", "element_id": "e-0000000000000005", "action": {"type": "invoke"}}]
+        }),
+    );
+    assert!(
+        error.contains("one \"operation\" object per call"),
+        "{error}"
+    );
+    // Bare window IDs beside the arguments are the target object.
+    let mut bare = target().as_object().unwrap().clone();
+    bare.insert("action".into(), json!("activate"));
+    assert_eq!(
+        valid("activate_window", Value::Object(bare.clone())),
+        valid(
+            "activate_window",
+            json!({"target": target(), "action": "activate"})
+        )
+    );
+    // One bare ID is still an incomplete target, not a silently accepted one.
+    bare.remove("window_instance_id");
+    assert!(invalid("activate_window", Value::Object(bare)).contains("target"));
+    // source_observation nested inside operation is hoisted beside it.
+    let nested = valid(
+        "act",
+        json!({
+            "target": target(),
+            "operation": {
+                "type": "semantic",
+                "element_id": "e-0000000000000005",
+                "action": {"type": "invoke"},
+                "source_observation": {"observation_id": "obs-0000000000000003"}
+            }
+        }),
+    );
+    assert!(matches!(
+        nested,
+        ToolCall::Act { source: Some(source), .. } if source.observation_id == "obs-0000000000000003"
+    ));
 }

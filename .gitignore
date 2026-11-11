@@ -3,3 +3,4 @@
 /skills/
 /node_modules/
 /*.tgz
+__pycache__/

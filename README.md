@@ -141,7 +141,7 @@ It is enabled by default.
 
 When enabled, the model sees `computer_use_help` and
 `computer_use_dispatch`. Help lists operation names or returns one
-operation's full schema; dispatch executes it through the same validation
+operation's compact argument reference; dispatch executes it through the same validation
 and desktop broker. The skill loads on demand.
 
 Settings:
@@ -273,6 +273,12 @@ interface uses production validation and runtime; see
   the first baseline is unknown. A complete baseline can still be returned if
   a new stream has not produced a newer frame during startup capture.
 - Protected-surface detection remains heuristic.
+- Generated typing prefers the physical keyboard keymap and uses EIS Text
+  keysym events for other characters when negotiated on the same exact seat.
+  Four private KWin canvas probes verified Unicode through actual key events.
+  Compositors without that capability still reject unrepresentable characters
+  before focus mutation. Text UTF-8 insertion is not used, and paste is not a
+  substitute for an application that requires keyboard events.
 
 KDE Plasma Wayland is the maintained target. X11, macOS, Windows, browser
 automation, and a standalone desktop UI are not supported.

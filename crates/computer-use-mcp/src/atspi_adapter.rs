@@ -1,9 +1,10 @@
-use std::{collections::BTreeSet, future::Future};
+use std::{collections::BTreeSet, future::Future, sync::Mutex};
 
 use atspi::{CoordType, Interface, InterfaceSet};
 use atspi_proxies::{
     accessible::AccessibleProxy,
     action::ActionProxy,
+    application::ApplicationProxy,
     bus::{BusProxy, StatusProxy},
     component::ComponentProxy,
     editable_text::EditableTextProxy,
@@ -38,6 +39,9 @@ macro_rules! proxy_builder {
 pub struct AtspiAdapter {
     connection: OnceCell<Connection>,
     enable_accessibility: bool,
+    // Negative capability evidence only; never used to authorize an action.
+    unsupported_focus: Mutex<BTreeSet<ObjectId>>,
+    unsupported_focus_apps: Mutex<BTreeSet<ObjectId>>,
 }
 
 impl AtspiAdapter {
@@ -153,7 +157,7 @@ impl AtspiAdapter {
                     continue;
                 }
             };
-            match Self::discover_app(connection, &dbus, object).await {
+            match self.discover_app(connection, &dbus, object).await {
                 Ok(Some(app)) => apps.push(app),
                 Ok(None) => {}
                 Err(error) => {
@@ -167,11 +171,45 @@ impl AtspiAdapter {
     }
 
     async fn discover_app(
+        &self,
         connection: &Connection,
         dbus: &DBusProxy<'_>,
         object: ObjectId,
     ) -> Result<Option<AppInfo>, RuntimeError> {
         let proxy = Self::accessible(connection, &object).await?;
+        // This exact release implements GrabFocus as unconditional NotSupported.
+        // Restrict the workaround to verified native toolkit/version metadata;
+        // never infer toolkit identity from a title, PID or object-path pattern.
+        // https://github.com/GNOME/gtk/blob/4.24.1/gtk/a11y/gtkatspicomponent.c
+        let known_unsupported = self
+            .unsupported_focus_apps
+            .lock()
+            .expect("focus capability lock poisoned")
+            .contains(&object);
+        if !known_unsupported
+            && let Ok(application) = proxy_builder!(
+                ApplicationProxy,
+                connection,
+                object.bus_name.as_str(),
+                object.path.as_str()
+            )
+            .await
+        {
+            let (toolkit, version) =
+                tokio::join!(application.toolkit_name(), application.version());
+            if matches!((toolkit, version), (Ok(toolkit), Ok(version)) if known_missing_grab_focus(&toolkit, &version))
+            {
+                let mut known = self
+                    .unsupported_focus_apps
+                    .lock()
+                    .expect("focus capability lock poisoned");
+                if remember_focus_rejection(&mut known, &object) {
+                    eprintln!(
+                        "computer-use-mcp: suppressing unimplemented GrabFocus for verified GTK 4.24.1 application"
+                    );
+                }
+            }
+        }
         let name = proxy.name().await.map_err(atspi_call_error)?;
         let bus_name = BusName::try_from(object.bus_name.as_str()).map_err(|error| {
             runtime_error(format!("invalid AT-SPI application bus name: {error}"))
@@ -223,20 +261,36 @@ impl AtspiAdapter {
         let proxy = Self::accessible(connection, &object).await?;
         let role = proxy.get_role().await.map_err(atspi_call_error)?;
         let role = role.name().to_owned();
-        if !matches!(
+        let is_window = matches!(
             role.as_str(),
             "frame" | "dialog" | "window" | "alert" | "file chooser"
-        ) {
+        );
+        let is_container = matches!(role.as_str(), "filler" | "panel");
+        if !is_window && !is_container {
             return Ok(None);
         }
         let title = proxy.name().await.map_err(atspi_call_error)?;
-        let states = proxy
+        let states: std::collections::BTreeSet<String> = proxy
             .get_state()
             .await
             .map_err(atspi_call_error)?
             .into_iter()
             .map(|state| state.to_string())
             .collect();
+        if is_container {
+            // Called only for exact direct children enumerated by the native
+            // application root. Qt QWidget exposes its top-level client as a
+            // filler, not a frame. This is an accessibility scope, not a join
+            // to any compositor window or a source of pixel authority.
+            let interfaces = proxy.get_interfaces().await.map_err(atspi_call_error)?;
+            if !visible_application_container(
+                &role,
+                &states,
+                interfaces.contains(Interface::Component),
+            ) {
+                return Ok(None);
+            }
+        }
         Ok(Some(WindowInfo {
             object,
             title,
@@ -249,126 +303,208 @@ impl AtspiAdapter {
         object: &ObjectId,
         text_limit: usize,
     ) -> Result<NodeInfo, RuntimeError> {
+        self.read_node_mode(object, text_limit, true).await
+    }
+
+    async fn read_node_mode(
+        &self,
+        object: &ObjectId,
+        text_limit: usize,
+        details: bool,
+    ) -> Result<NodeInfo, RuntimeError> {
         let connection = self.connection().await?;
         let proxy = Self::accessible(connection, object).await?;
-        let role = proxy
-            .get_role()
-            .await
-            .map_err(atspi_call_error)?
-            .name()
-            .to_owned();
-        let name = proxy.name().await.map_err(atspi_call_error)?;
-        let states: BTreeSet<_> = proxy
-            .get_state()
-            .await
-            .map_err(atspi_call_error)?
+        let (role, name, states, children) = tokio::try_join!(
+            async { proxy.get_role().await.map_err(atspi_call_error) },
+            async { proxy.name().await.map_err(atspi_call_error) },
+            async { proxy.get_state().await.map_err(atspi_call_error) },
+            async { proxy.get_children().await.map_err(atspi_call_error) },
+        )?;
+        let role = role.name().to_owned();
+        let states: BTreeSet<_> = states.into_iter().map(|state| state.to_string()).collect();
+        let children = children
             .into_iter()
-            .map(|state| state.to_string())
-            .collect();
+            .filter(|child| !child.is_null())
+            .map(|child| object_id(&child))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let node = NodeInfo {
+            object: object.clone(),
+            role,
+            name,
+            states,
+            children,
+            value: None,
+            text: None,
+            text_truncated: None,
+            selected_text: None,
+            window_frame: None,
+            capabilities: NodeCapabilities::InspectionFailed,
+        };
+        if !details {
+            return Ok(node);
+        }
+        self.enrich_node_inner(node, text_limit).await
+    }
+
+    async fn enrich_node_inner(
+        &self,
+        node: NodeInfo,
+        text_limit: usize,
+    ) -> Result<NodeInfo, RuntimeError> {
+        let connection = self.connection().await?;
+        let object = &node.object;
+        let proxy = Self::accessible(connection, object).await?;
         let interface_set = optional(
             object,
             "Accessible",
             "GetInterfaces",
             proxy.get_interfaces().await,
         );
-        let children = proxy
-            .get_children()
-            .await
-            .map_err(atspi_call_error)?
-            .into_iter()
-            .filter(|child| !child.is_null())
-            .map(|child| object_id(&child))
-            .collect::<Result<Vec<_>, _>>()?;
 
-        let actions = if interface_set
-            .as_ref()
-            .is_some_and(|interfaces| interfaces.contains(Interface::Action))
-        {
-            match optional(
-                object,
-                "Action",
-                "proxy",
-                action_proxy(connection, object).await,
-            ) {
-                Some(action) => {
-                    match optional(object, "Action", "GetActions", action.get_actions().await) {
-                        Some(actions) => ActionCapabilities::Inspected(
-                            actions
-                                .into_iter()
-                                .map(|action| ActionInfo {
-                                    name: action.name,
-                                    description: action.description,
-                                })
-                                .collect(),
-                        ),
-                        None => ActionCapabilities::InspectionFailed,
+        let actions_future = async {
+            if interface_set
+                .as_ref()
+                .is_some_and(|interfaces| interfaces.contains(Interface::Action))
+            {
+                match optional(
+                    object,
+                    "Action",
+                    "proxy",
+                    action_proxy(connection, object).await,
+                ) {
+                    Some(action) => {
+                        match optional(object, "Action", "GetActions", action.get_actions().await) {
+                            Some(actions) => ActionCapabilities::Inspected(
+                                actions
+                                    .into_iter()
+                                    .map(|action| ActionInfo {
+                                        name: action.name,
+                                        description: action.description,
+                                        keybinding: action.keybinding,
+                                    })
+                                    .collect(),
+                            ),
+                            None => ActionCapabilities::InspectionFailed,
+                        }
                     }
+                    None => ActionCapabilities::InspectionFailed,
                 }
-                None => ActionCapabilities::InspectionFailed,
+            } else {
+                ActionCapabilities::Unsupported
             }
-        } else {
-            ActionCapabilities::Unsupported
         };
         let has_component = interface_set
             .as_ref()
             .is_some_and(|interfaces| interfaces.contains(Interface::Component));
-        let window_frame = if has_component {
-            match optional(
+        let focus_future = async {
+            if !has_component
+                || self
+                    .unsupported_focus
+                    .lock()
+                    .expect("focus capability lock poisoned")
+                    .contains(object)
+            {
+                return false;
+            }
+            let known_application = self
+                .unsupported_focus_apps
+                .lock()
+                .expect("focus capability lock poisoned")
+                .iter()
+                .any(|app| app.bus_name == object.bus_name);
+            if !known_application {
+                return true;
+            }
+            // Only the native GetApplication relation establishes membership.
+            let application = optional(
                 object,
-                "Component",
-                "proxy",
-                component_proxy(connection, object).await,
-            ) {
-                Some(component) => optional(
+                "Accessible",
+                "GetApplication",
+                proxy.get_application().await,
+            )
+            .and_then(|reference| {
+                optional(
+                    object,
+                    "Accessible",
+                    "application identity",
+                    object_id(&reference),
+                )
+            });
+            !application.is_some_and(|app| {
+                self.unsupported_focus_apps
+                    .lock()
+                    .expect("focus capability lock poisoned")
+                    .contains(&app)
+            })
+        };
+        let frame_future = async {
+            if has_component {
+                match optional(
                     object,
                     "Component",
-                    "GetExtents(Window)",
-                    component.get_extents(CoordType::Window).await,
-                )
-                .map(rect),
-                None => None,
+                    "proxy",
+                    component_proxy(connection, object).await,
+                ) {
+                    Some(component) => optional(
+                        object,
+                        "Component",
+                        "GetExtents(Window)",
+                        component.get_extents(CoordType::Window).await,
+                    )
+                    .map(rect),
+                    None => None,
+                }
+            } else {
+                None
             }
-        } else {
-            None
         };
-        let (text, text_truncated, selected_text) = if interface_set
-            .as_ref()
-            .is_some_and(|interfaces| interfaces.contains(Interface::Text))
-        {
-            read_text_metadata(connection, object, text_limit).await
-        } else {
-            (None, None, None)
+        let text_future = async {
+            if interface_set
+                .as_ref()
+                .is_some_and(|interfaces| interfaces.contains(Interface::Text))
+            {
+                read_text_metadata(connection, object, text_limit).await
+            } else {
+                (None, None, None)
+            }
         };
         let has_value = interface_set
             .as_ref()
             .is_some_and(|interfaces| interfaces.contains(Interface::Value));
-        let value = if has_value {
-            read_value_metadata(connection, object).await
-        } else {
-            None
+        let value_future = async {
+            if has_value {
+                read_value_metadata(connection, object).await
+            } else {
+                None
+            }
         };
+        let (actions, window_frame, (text, text_truncated, selected_text), value, focus) = tokio::join!(
+            actions_future,
+            frame_future,
+            text_future,
+            value_future,
+            focus_future
+        );
 
         let capabilities = match interface_set {
             Some(interfaces) => NodeCapabilities::Inspected(InspectedCapabilities {
                 actions,
                 component: has_component,
+                focus,
                 editable_text: has_text_editing_interfaces(&interfaces),
                 value: has_value,
             }),
             None => NodeCapabilities::InspectionFailed,
         };
         Ok(NodeInfo {
-            object: object.clone(),
-            role,
-            name,
             value,
             text,
             text_truncated,
             selected_text,
-            states,
             capabilities,
             window_frame,
-            children,
+            ..node
         })
     }
 
@@ -388,8 +524,18 @@ impl AtspiAdapter {
             }
             SemanticAction::GrabFocus => {
                 let proxy = component_proxy(connection, object).await?;
+                let response = proxy.grab_focus().await;
+                // A false reply can be transient; only an explicit unsupported
+                // operation establishes negative capability evidence.
+                if grab_focus_unsupported(&response) {
+                    let mut known = self
+                        .unsupported_focus
+                        .lock()
+                        .expect("focus capability lock poisoned");
+                    remember_focus_rejection(&mut known, object);
+                }
                 reported_ok(
-                    proxy.grab_focus().await.map_err(atspi_call_error)?,
+                    response.map_err(atspi_call_error)?,
                     "AT-SPI Component.GrabFocus reported failure",
                 )?;
             }
@@ -413,19 +559,43 @@ impl AtspiAdapter {
         Ok(())
     }
 
-    async fn activate_inner(&self, object: &ObjectId) -> Result<(), RuntimeError> {
+    async fn activate_inner(&self, object: &ObjectId) -> Result<bool, RuntimeError> {
         let connection = self.connection().await?;
         let proxy = component_proxy(connection, object).await?;
-        if !proxy.grab_focus().await.map_err(atspi_call_error)? {
-            return Err(runtime_error(
-                "AT-SPI Component.GrabFocus did not activate the window",
-            ));
-        }
-        Ok(())
+        proxy.grab_focus().await.map_err(atspi_call_error)
     }
 }
 
+fn known_missing_grab_focus(toolkit: &str, version: &str) -> bool {
+    toolkit == "GTK" && version == "4.24.1"
+}
+
+fn grab_focus_unsupported(response: &zbus::Result<bool>) -> bool {
+    matches!(response, Err(zbus::Error::MethodError(name, ..))
+        if name.as_str() == "org.freedesktop.DBus.Error.NotSupported")
+}
+
+fn remember_focus_rejection(known: &mut BTreeSet<ObjectId>, object: &ObjectId) -> bool {
+    if known.contains(object) {
+        return false;
+    }
+    if known.len() == 1024 {
+        eprintln!(
+            "computer-use-mcp: focus negative-capability cache full; further failures will not be retained"
+        );
+        return false;
+    }
+    known.insert(object.clone())
+}
+
 impl AccessibilityAdapter for AtspiAdapter {
+    async fn enrich_summary(
+        &self,
+        node: NodeInfo,
+        text_limit: usize,
+    ) -> Result<NodeInfo, RuntimeError> {
+        self.enrich_node_inner(node, text_limit).await
+    }
     fn discover(&self) -> impl Future<Output = Result<Vec<AppInfo>, RuntimeError>> + Send + '_ {
         self.discover_inner()
     }
@@ -436,6 +606,22 @@ impl AccessibilityAdapter for AtspiAdapter {
         text_limit: usize,
     ) -> impl Future<Output = Result<NodeInfo, RuntimeError>> + Send + 'a {
         self.read_node_inner(object, text_limit)
+    }
+
+    async fn read_summary<'a>(
+        &'a self,
+        object: &'a ObjectId,
+        _text_limit: usize,
+        child_limit: usize,
+    ) -> Result<crate::accessibility::NodeSummary, RuntimeError> {
+        let mut node = self.read_node_mode(object, 0, false).await?;
+        let children_truncated = node.children.len() > child_limit;
+        node.children.truncate(child_limit);
+        Ok(crate::accessibility::NodeSummary {
+            node,
+            details_ready: false,
+            children_truncated,
+        })
     }
 
     fn act<'a>(
@@ -449,7 +635,7 @@ impl AccessibilityAdapter for AtspiAdapter {
     fn activate<'a>(
         &'a self,
         object: &'a ObjectId,
-    ) -> impl Future<Output = Result<(), RuntimeError>> + Send + 'a {
+    ) -> impl Future<Output = Result<bool, RuntimeError>> + Send + 'a {
         self.activate_inner(object)
     }
 }
@@ -723,7 +909,10 @@ pub(crate) async fn replace_text(
     editor: &mut impl TextEditor,
     expected: &str,
 ) -> Result<(), RuntimeError> {
-    if !editor.grab_focus().await? {
+    // GTK4 can expose valid EditableText while Component.GrabFocus returns
+    // NotSupported. A fresh exact focused/non-defunct read already establishes
+    // the required element focus; do not mutate focus redundantly.
+    if !editor.read_focused().await? && !editor.grab_focus().await? {
         // KWrite can refuse GrabFocus while the exact editor already has focus.
         // Confirm its current state rather than trusting the source observation.
         reported_ok(
@@ -763,6 +952,18 @@ pub(crate) async fn replace_text(
     } else {
         Err(text_replacement_error(readback.character_count))
     }
+}
+
+fn visible_application_container(
+    role: &str,
+    states: &std::collections::BTreeSet<String>,
+    component: bool,
+) -> bool {
+    matches!(role, "filler" | "panel")
+        && component
+        && states.contains("showing")
+        && !states.contains("defunct")
+        && !states.contains("stale")
 }
 
 fn text_replacement_error(character_count: i32) -> RuntimeError {
@@ -885,6 +1086,78 @@ mod tests {
     use crate::accessibility::{AccessibilityAdapter, ObjectId};
 
     #[test]
+    fn only_explicit_unsupported_focus_is_negative_capability_evidence() {
+        assert!(!super::grab_focus_unsupported(&Ok(false)));
+        assert!(!super::grab_focus_unsupported(&Ok(true)));
+        let request = zbus::Message::method_call("/object/0", "GrabFocus")
+            .unwrap()
+            .build(&())
+            .unwrap();
+        let unsupported = zbus::Error::MethodError(
+            "org.freedesktop.DBus.Error.NotSupported"
+                .try_into()
+                .unwrap(),
+            None,
+            request,
+        );
+        assert!(super::grab_focus_unsupported(&Err(unsupported)));
+    }
+
+    #[test]
+    fn focus_rejections_are_bounded_without_evicting_prior_evidence() {
+        let mut known = std::collections::BTreeSet::new();
+        let object = |index| ObjectId {
+            bus_name: ":1.42".into(),
+            path: format!("/object/{index}"),
+        };
+        for index in 0..1024 {
+            assert!(super::remember_focus_rejection(&mut known, &object(index)));
+        }
+        assert!(!super::remember_focus_rejection(&mut known, &object(0)));
+        assert!(!super::remember_focus_rejection(&mut known, &object(1024)));
+        assert_eq!(known.len(), 1024);
+        assert!(known.contains(&object(0)));
+        assert!(!known.contains(&object(1024)));
+    }
+
+    #[test]
+    fn focus_workaround_requires_exact_verified_toolkit_release() {
+        assert!(super::known_missing_grab_focus("GTK", "4.24.1"));
+        for (toolkit, version) in [
+            ("GTK", "3.24.1"),
+            ("GTK", "4.24.2"),
+            ("GTK", "5.0.0"),
+            ("Qt", "4.24.1"),
+            ("", ""),
+            ("GTK", "4.24.1-custom"),
+        ] {
+            assert!(!super::known_missing_grab_focus(toolkit, version));
+        }
+    }
+
+    #[test]
+    fn qt_application_client_container_requires_showing_component_and_live_state() {
+        let mut states = std::collections::BTreeSet::from(["showing".to_owned()]);
+        assert!(super::visible_application_container(
+            "filler", &states, true
+        ));
+        assert!(!super::visible_application_container(
+            "filler", &states, false
+        ));
+        assert!(!super::visible_application_container(
+            "label", &states, true
+        ));
+        states.insert("defunct".into());
+        assert!(!super::visible_application_container(
+            "filler", &states, true
+        ));
+        states.clear();
+        assert!(!super::visible_application_container(
+            "panel", &states, true
+        ));
+    }
+
+    #[test]
     fn inconsistent_advertised_interfaces_are_optional_metadata_loss() {
         let object = ObjectId {
             bus_name: ":1.2".into(),
@@ -969,6 +1242,7 @@ mod tests {
         assert_eq!(
             editor.steps,
             [
+                "focus_verify",
                 "focus",
                 "set",
                 "verify",
@@ -982,6 +1256,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn freshly_focused_replacement_skips_focus_and_false_reply_is_reverified() {
+        let mut focused = IgnoredSetEditor {
+            focused: true,
+            ..Default::default()
+        };
+        replace_text(&mut focused, "café").await.unwrap();
+        assert_eq!(
+            focused.steps,
+            [
+                "focus_verify",
+                "set",
+                "verify",
+                "delete_insert",
+                "insert",
+                "verify"
+            ]
+        );
+        let mut refused = IgnoredSetEditor {
+            focus_refused: true,
+            focus_on_refusal: true,
+            ..Default::default()
+        };
+        replace_text(&mut refused, "café").await.unwrap();
+        assert_eq!(
+            &refused.steps[..3],
+            ["focus_verify", "focus", "focus_verify"]
+        );
+        assert_eq!(refused.actual, "café");
+    }
+
+    #[tokio::test]
     async fn text_replacement_refuses_when_focus_state_cannot_be_read() {
         let mut editor = IgnoredSetEditor {
             focus_refused: true,
@@ -992,7 +1297,7 @@ mod tests {
             .await
             .expect_err("a failed fresh focus query must stop replacement");
         assert_eq!(error.message, "focus state unavailable");
-        assert_eq!(editor.steps, ["focus", "focus_verify"]);
+        assert_eq!(editor.steps, ["focus_verify"]);
         assert!(editor.actual.is_empty());
     }
 
@@ -1029,6 +1334,8 @@ mod tests {
         actual: String,
         reads: VecDeque<TextReadback>,
         focus_refused: bool,
+        focus_on_refusal: bool,
+        focused: bool,
         focus_error: Option<crate::errors::RuntimeError>,
         insert_lengths: Vec<i32>,
     }
@@ -1036,12 +1343,13 @@ mod tests {
     impl TextEditor for IgnoredSetEditor {
         async fn grab_focus(&mut self) -> Result<bool, crate::errors::RuntimeError> {
             self.steps.push("focus");
+            self.focused = !self.focus_refused || self.focus_on_refusal;
             Ok(!self.focus_refused)
         }
 
         async fn read_focused(&mut self) -> Result<bool, crate::errors::RuntimeError> {
             self.steps.push("focus_verify");
-            self.focus_error.take().map_or(Ok(true), Err)
+            self.focus_error.take().map_or(Ok(self.focused), Err)
         }
 
         async fn set_text<'a>(

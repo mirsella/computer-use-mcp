@@ -492,6 +492,8 @@ mod tests {
         let snapshot = Snapshot {
             view: crate::validation::AccessibilityScope::Full,
             element_query: None,
+            search: None,
+            traversal: Default::default(),
             app: AppInfo {
                 object: ObjectId {
                     bus_name: ":1.2".into(),

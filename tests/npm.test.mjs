@@ -61,7 +61,9 @@ test("Codex entry point starts the server with the recovered session environment
     assert.match(stdout, /^Desktop: KDE$/m);
   });
 });
-test("native adapter registers its server and skill", async () => {
+test("OpenCode plugin registers the Rust server and canonical skill only", async () => {
+  assert.deepEqual(Object.keys(manifest.exports).sort(), [".", "./server"]);
+  assert.ok(!manifest.files.some(path => /^(agent|client)\.mjs$/.test(path)));
   const {server, skills} = await configure();
   assert.deepEqual(server.command, ["bash", launcher, "mcp", "--compact-tools"]);
   assert.equal(server.timeout.execution,150000);
@@ -214,7 +216,7 @@ async function connect(t, compact, protocolVersion = "2025-11-25") {
   };
 }
 
-test("compact MCP discovers exact schemas and preserves direct validation without a desktop", { timeout: 15_000 }, async (t) => {
+test("compact MCP discovers action references and preserves direct validation without a desktop", { timeout: 15_000 }, async (t) => {
   const direct = await connect(t, false);
   const compact = await connect(t, true);
   const { result: { tools } } = await direct.request("tools/list");
@@ -241,9 +243,16 @@ test("compact MCP discovers exact schemas and preserves direct validation withou
     const { result: help } = await call(compact, "help", { action: tool.name });
     assert.equal(help.content.length, 1);
     assert.equal(help.structuredContent, undefined, "help must not duplicate schemas");
-    assert.deepEqual(JSON.parse(help.content[0].text), tool);
-    const original = await call(direct, tool.name, {});
-    const wrapped = await call(compact, "dispatch", { action: tool.name, arguments: {} });
+    // Help is a compact reference: the description plus validated templates.
+    const reference = help.content[0].text;
+    assert.ok(reference.startsWith(tool.description), reference);
+    assert.ok(reference.includes(`\n${tool.name} {`), reference);
+    assert.ok(reference.length < JSON.stringify(tool).length * 0.75, "reference must stay compact");
+    // Empty list_desktop arguments are valid (default window discovery), so
+    // use an invalid scope: this validation-only test must not reach a desktop.
+    const invalid = tool.name === "list_desktop" ? { scope: "invalid" } : {};
+    const original = await call(direct, tool.name, invalid);
+    const wrapped = await call(compact, "dispatch", { action: tool.name, arguments: invalid });
     assert.equal(wrapped.result.isError, true);
     assert.deepEqual(wrapped.result, original.result);
   }

@@ -52,11 +52,19 @@ is useful defense in depth, not a complete classifier.
 - Physical shortcut modifiers cause keyboard input to fail closed. Point focus
   and keys share one cleanup-safe transaction. Protocol synchronization proves
   progress only; it does not prove seat focus, application delivery, or effect.
-- Semantic focus requires an AT-SPI focus grab followed by fresh exact
-  element-focused and window-active reads. A false or failed `GrabFocus` is
+- Semantic focus requires fresh exact element-focused and window-active reads
+  after EIS preparation. Already verified focus avoids a redundant grab;
+  otherwise an AT-SPI focus request is made and reverified. A false or failed `GrabFocus` is
   accepted only when those fresh reads verify the same element and active
   window. One-shot click grace is separate best-effort evidence and never proves
   seat focus.
+- Semantic calls and semantic-focus keyboard/paste may omit redundant source/target only through their exact live
+  element ID's unique retained observation binding. This does not authorize
+  stale IDs, unbound targets, name/PID/geometry joins or implicit spatial input.
+- Keyboard/paste with omitted focus types into the current focus of one exact
+  window: the named target, or with neither source nor target the window this
+  session last observed or acted on. It is refused before input unless a fresh
+  read shows that window active, and never follows the foreground window.
 - `paste` uses the portal Clipboard capability when `clipboard_enabled` is
   returned. It accepts bounded `text/plain` transfer, sends `Ctrl+V`, waits for
   completion, and clears the selection. It never reads or restores the user's

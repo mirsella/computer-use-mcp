@@ -12,6 +12,10 @@ use crate::{
 
 pub const MAX_MODEL_TEXT_BYTES: usize = 16_000;
 pub const MAX_MODEL_STRUCTURED_BYTES: usize = 16_000;
+/// Headroom for fixed-width desktop/session routing metadata. Observation
+/// builders must leave this space before the broker annotates their output,
+/// otherwise the generic fallback loses their priority-aware projection.
+pub(crate) const ROUTING_OUTPUT_RESERVE: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchStage {
@@ -387,8 +391,16 @@ pub fn tool_error_result(error: &RuntimeError) -> CallToolResult {
         error.retryable,
         error.recovery
     );
-    let text = bound_text_with_suffix(&error.message, &suffix, MAX_MODEL_TEXT_BYTES);
-    let mut result = CallToolResult::error(vec![ContentBlock::text(text)]);
+    let observation = error.recovery_observation.as_deref();
+    let message = observation.map_or_else(
+        || error.message.clone(),
+        |observation| {
+            format!(
+                "{}\n\nUncertain action: {}",
+                observation.text, error.message
+            )
+        },
+    );
     let mut structured = serde_json::json!({
         "code": error.code,
         "message": error.message,
@@ -399,7 +411,20 @@ pub fn tool_error_result(error: &RuntimeError) -> CallToolResult {
     if let Some(action_progress) = &error.action_progress {
         structured["action_progress"] = action_progress.clone();
     }
-    result.structured_content = Some(bound_structured(structured, MAX_MODEL_STRUCTURED_BYTES));
+    if let Some(observation) = observation {
+        structured["replacement_observation"] = observation
+            .structured_content
+            .clone()
+            .unwrap_or(serde_json::Value::Null);
+    }
+    let mut result = ToolOutput {
+        text: bound_text_with_suffix(&message, &suffix, MAX_MODEL_TEXT_BYTES),
+        png_base64: observation.and_then(|output| output.png_base64.clone()),
+        structured_content: Some(structured),
+        element_ids: observation.map_or_else(Vec::new, |output| output.element_ids.clone()),
+    }
+    .into_mcp_result();
+    result.is_error = Some(true);
     result
 }
 
@@ -466,7 +491,8 @@ fn bound_text(text: String, maximum: usize) -> String {
     if OUTPUT_TRUNCATION_MARKER.len() >= maximum {
         return String::new();
     }
-    let mut end = maximum - OUTPUT_TRUNCATION_MARKER.len();
+    // A word boundary can end in a space, requiring one newline before the marker.
+    let mut end = maximum - OUTPUT_TRUNCATION_MARKER.len() - 1;
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
@@ -510,6 +536,7 @@ fn bound_structured(value: serde_json::Value, maximum: usize) -> serde_json::Val
     let keys = [
         "desktop",
         "session_id",
+        "observation_id",
         "code",
         "message",
         "outcome",
@@ -524,6 +551,7 @@ fn bound_structured(value: serde_json::Value, maximum: usize) -> serde_json::Val
         "replacement_observation_id",
         "replacement_frame_id",
         "replacement_element_id",
+        "replacement_observation",
     ];
     if let serde_json::Value::Object(object) = &value {
         for key in keys.into_iter().chain(object.keys().map(String::as_str)) {
@@ -533,7 +561,15 @@ fn bound_structured(value: serde_json::Value, maximum: usize) -> serde_json::Val
             let Some(original) = object.get(key) else {
                 continue;
             };
-            let candidate = if keys.contains(&key) {
+            let candidate = if key == "replacement_observation" {
+                // Preserve exact fresh readback handles even when embedding a
+                // full observation in an error exceeds the combined budget.
+                // Generic JSON prefix projection can omit target/observation_id.
+                let available = maximum.saturating_sub(
+                    json_size(&serde_json::Value::Object(bounded.clone())) + key.len() + 4,
+                );
+                bound_structured(original.clone(), available)
+            } else if keys.contains(&key) {
                 original.clone()
             } else {
                 compact_json(original, 1_024)
@@ -607,6 +643,81 @@ fn json_size(value: &serde_json::Value) -> usize {
 #[cfg(test)]
 mod progress_tests {
     use super::*;
+
+    #[test]
+    fn text_budget_reserves_the_marker_separator_and_preserves_critical_suffix() {
+        let message = "word ".repeat(MAX_MODEL_TEXT_BYTES);
+        assert!(bound_text(message.clone(), MAX_MODEL_TEXT_BYTES).len() <= MAX_MODEL_TEXT_BYTES);
+        let suffix = "Code: backend_failed\nOutcome: unknown";
+        let text = bound_text_with_suffix(&message, suffix, MAX_MODEL_TEXT_BYTES);
+        assert!(text.len() <= MAX_MODEL_TEXT_BYTES);
+        assert!(text.ends_with(suffix));
+        assert_eq!(bound_text(text.clone(), MAX_MODEL_TEXT_BYTES), text);
+    }
+
+    #[test]
+    fn uncertain_readback_preserves_error_and_exact_routing_with_bounded_output() {
+        let mut error = RuntimeError::not_started("backend_timeout", "semantic call timed out")
+            .with_execution_status(ToolOutcome::Unknown, false, "inspect, never replay");
+        let observation = serde_json::json!({"observation_id":"obs-new", "target":{"app_instance_id":"app-a","window_instance_id":"win-modal"},"elements":[{"element_id":"e-new","name":"Confirm"}]});
+        error.recovery_observation = Some(Box::new(ToolOutput {
+            text: "Fresh modal".into(),
+            png_base64: Some("AA==".into()),
+            structured_content: Some(observation.clone()),
+            element_ids: vec!["e-new".into()],
+        }));
+        let mut result = tool_error_result(&error);
+        assert_eq!(result.is_error, Some(true));
+        assert!(matches!(&result.content[1], ContentBlock::Image(image) if image.data == "AA=="));
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["outcome"],
+            "unknown"
+        );
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["replacement_observation"],
+            observation
+        );
+        assert_eq!(
+            take_element_ids(&mut result),
+            Some(serde_json::json!(["e-new"]))
+        );
+        assert!(
+            !serde_json::to_string(&result)
+                .unwrap()
+                .contains(ELEMENT_IDS_META)
+        );
+        error.recovery_observation.as_mut().unwrap().text = "large evidence ".repeat(10_000);
+        error
+            .recovery_observation
+            .as_mut()
+            .unwrap()
+            .structured_content
+            .as_mut()
+            .unwrap()["context"] = serde_json::json!("x".repeat(40_000));
+        let result = tool_error_result(&error);
+        assert!(result.content[0].as_text().unwrap().text.len() <= MAX_MODEL_TEXT_BYTES);
+        assert!(
+            result.content[0]
+                .as_text()
+                .unwrap()
+                .text
+                .ends_with("Recovery: inspect, never replay")
+        );
+        assert!(
+            serde_json::to_vec(result.structured_content.as_ref().unwrap())
+                .unwrap()
+                .len()
+                <= MAX_MODEL_STRUCTURED_BYTES
+        );
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["outcome"],
+            "unknown"
+        );
+        let replacement = &result.structured_content.as_ref().unwrap()["replacement_observation"];
+        assert_eq!(replacement["observation_id"], "obs-new");
+        assert_eq!(replacement["target"]["window_instance_id"], "win-modal");
+        assert_eq!(replacement["truncated"], true);
+    }
 
     #[test]
     fn repeated_dispatch_start_preserves_partial_and_completed_outcomes() {

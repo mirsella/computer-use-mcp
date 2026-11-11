@@ -70,7 +70,8 @@ class Client:
             return
         self.process.stdin.close()
         try:
-            self.process.wait(timeout=8)
+            # The broker owns 20s graceful worker cleanup plus 5s escalation.
+            self.process.wait(timeout=35)
         except subprocess.TimeoutExpired:
             self.process.kill()
             self.process.wait()
@@ -93,10 +94,10 @@ def call(client, name, arguments):
             )
             if "error" in help_response or help_response["result"].get("isError"):
                 raise RuntimeError(f"help for {name} failed: {help_response}")
-            schema = json.loads(help_response["result"]["content"][0]["text"])
-            assert schema["name"] == name
+            reference = help_response["result"]["content"][0]["text"]
+            assert f"\n{name} {{" in reference, reference
             client.known_actions.add(name)
-            print(f"schema_loaded={name}")
+            print(f"reference_loaded={name}")
         params = {
             "name": "dispatch",
             "arguments": {"action": name, "arguments": arguments},
@@ -316,18 +317,26 @@ def descendants(root_pid):
 
 
 def native_worker_evidence(client, expected=None):
+    def same_native_executable(pid):
+        try:
+            return os.path.samefile(
+                f"/proc/{pid}/exe", f"/proc/{client.process.pid}/exe"
+            )
+        except OSError:
+            return False
+
     workers = [
         pid
         for pid in descendants(client.process.pid)
         if (arguments := process_arguments(pid))
-        and arguments[0].endswith("/computer-use-mcp")
+        and same_native_executable(pid)
         and "__background_worker" in arguments[1:]
     ]
     foreground = [
         pid
         for pid in descendants(client.process.pid)
         if (arguments := process_arguments(pid))
-        and arguments[0].endswith("/computer-use-mcp")
+        and same_native_executable(pid)
         and "__desktop_worker" in arguments[1:]
     ]
     print(f"foreground_worker_count={len(foreground)}")
@@ -386,17 +395,23 @@ def wait_for_accessible_editor(client, initial_ids, catalog, timeout=5):
     deadline = time.monotonic() + timeout
     while True:
         candidates = [
-            window for window in windows(catalog)
+            window
+            for window in windows(catalog)
             if window.get("target", {}).get("window_instance_id") not in initial_ids
-            and window.get("capabilities", {}).get("accessibility", {}).get("status") == "supported"
+            and window.get("capabilities", {}).get("accessibility", {}).get("status")
+            == "supported"
             and not window.get("is_protected_surface")
         ]
         if len(candidates) > 1:
-            raise RuntimeError(f"expected one new accessible editor, found {len(candidates)}")
+            raise RuntimeError(
+                f"expected one new accessible editor, found {len(candidates)}"
+            )
         if candidates:
             return candidates[0]
         if time.monotonic() >= deadline:
-            raise RuntimeError("editor did not register an accessibility target before the deadline")
+            raise RuntimeError(
+                "editor did not register an accessibility target before the deadline"
+            )
         # Compositor window_opened cannot wait for AT-SPI registration; only
         # independent catalog discovery can establish this target's readiness.
         _, catalog = call(client, "list_desktop", {"scope": "windows", "limit": 100})
@@ -853,6 +868,49 @@ def main():
                 )
                 return 2
         if text_element is None:
+            # New File can open a different exact window while the welcome
+            # object's empty hierarchy remains alive. Discover it explicitly;
+            # never transplant the old window or element identity by PID/title.
+            _, catalog = call(client, "list_desktop", {"scope": "windows"})
+            for window in windows(catalog):
+                candidate = window.get("target") or {}
+                if (
+                    candidate == target
+                    or candidate.get("app_instance_id") != target["app_instance_id"]
+                ):
+                    continue
+                candidate_result, candidate_observed = call(
+                    client,
+                    "observe",
+                    {
+                        "target": candidate,
+                        "view": "both",
+                        "accessibility": {
+                            "scope": "full",
+                            "limits": {"max_nodes": 500},
+                        },
+                    },
+                )
+                candidate_text = element(
+                    candidate_observed,
+                    lambda value: (
+                        value.get("capabilities", {}).get("set_value") == "text"
+                    ),
+                )
+                if candidate_text and (candidate_observed.get("screenshot") or {}).get(
+                    "ready"
+                ):
+                    target, observed, text_element = (
+                        candidate,
+                        candidate_observed,
+                        candidate_text,
+                    )
+                    screenshot = observed["screenshot"]
+                    print_observation_response(
+                        candidate_result, observed, "rediscovered_editor_window"
+                    )
+                    break
+        if text_element is None:
             print("no_advertised_text_set_value=true")
             return 2
 
@@ -1058,11 +1116,15 @@ def main():
         client.close()
         print(f"mcp_process_exit={client.process.returncode}")
         if client.native_runner:
-            cleanup_deadline = time.monotonic() + 10
-            while target_pid is not None and os.path.exists(f"/proc/{target_pid}"):
-                if time.monotonic() >= cleanup_deadline:
-                    break
-                time.sleep(0.1)
+            if target_pid is not None and os.path.exists(f"/proc/{target_pid}"):
+                try:
+                    subprocess.run(
+                        ["tail", f"--pid={target_pid}", "-f", "/dev/null"],
+                        timeout=10,
+                        check=True,
+                    )
+                except subprocess.TimeoutExpired:
+                    print("native_target_exit_deadline_exceeded=true")
             print(
                 "native_target_gone="
                 + str(target_pid is None or not os.path.exists(f"/proc/{target_pid}"))
@@ -1082,6 +1144,10 @@ def main():
                 terminate_private_process(target_pid)
             else:
                 print("private_process_already_exited=true")
+        if client.process.returncode != 0:
+            raise RuntimeError(
+                f"MCP did not shut down cleanly: exit {client.process.returncode}"
+            )
 
 
 if __name__ == "__main__":

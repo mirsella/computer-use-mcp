@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     panic::AssertUnwindSafe,
     sync::{
@@ -32,10 +32,11 @@ use crate::{
     },
     takeover::{HumanInputGeneration, TakeoverMonitor, is_physical_input_refusal},
     validation::{
-        AccessibilityRequest, AccessibilityScope, ActOperation, DEFAULT_ACCESSIBILITY_MAX_DEPTH,
-        DEFAULT_ACCESSIBILITY_MAX_NODES, DEFAULT_ACCESSIBILITY_TEXT_LIMIT, DesktopScope,
-        ElementAction, KeyboardFocus, MAX_TEXT_LIMIT, ObservationRef, ObserveCrop, ObserveView,
-        PointerAction, TargetRef, TextLimit, ToolCall, WaitCondition, WindowAction,
+        AccessibilityRequest, AccessibilityScope, AccessibilitySearch, ActOperation,
+        DEFAULT_ACCESSIBILITY_MAX_DEPTH, DEFAULT_ACCESSIBILITY_MAX_NODES,
+        DEFAULT_ACCESSIBILITY_TEXT_LIMIT, DesktopScope, ElementAction, KeyboardFocus,
+        MAX_TEXT_LIMIT, ObservationRef, ObserveCrop, ObserveView, PointerAction, TargetRef,
+        TextLimit, ToolCall, WaitCondition, WindowAction,
     },
     virtual_desktop::{
         DesktopProbe, VirtualDesktopProvider, WindowDesktop, locate_window, switch_target,
@@ -53,10 +54,13 @@ pub const EMPTY_APPS_MESSAGE: &str = "No running applications with accessible wi
 /// budgets for UTF-8 text and serialized structured JSON respectively; the
 /// implementation below trims complete elements or individual text fields,
 /// never an already-serialized JSON byte slice.
-pub const MAX_MODEL_TEXT_BYTES: usize = crate::runtime::MAX_MODEL_TEXT_BYTES;
-pub const MAX_MODEL_STRUCTURED_BYTES: usize = crate::runtime::MAX_MODEL_STRUCTURED_BYTES;
+pub const MAX_MODEL_TEXT_BYTES: usize =
+    crate::runtime::MAX_MODEL_TEXT_BYTES - crate::runtime::ROUTING_OUTPUT_RESERVE;
+pub const MAX_MODEL_STRUCTURED_BYTES: usize =
+    crate::runtime::MAX_MODEL_STRUCTURED_BYTES - crate::runtime::ROUTING_OUTPUT_RESERVE;
 
 const MAX_MODEL_FIELD_CHARS: usize = 1_024;
+const MAX_MODEL_CONTEXT_BYTES: usize = 1_024;
 const MAX_MODEL_ACTIONS: usize = 16;
 const MAX_MODEL_STATES: usize = 32;
 /// Bytes reserved in the action fit check for the trailing truncation object
@@ -139,6 +143,7 @@ impl Rect {
 pub struct ActionInfo {
     pub name: String,
     pub description: String,
+    pub keybinding: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,6 +172,7 @@ pub enum ActionCapabilities {
 pub struct InspectedCapabilities {
     pub actions: ActionCapabilities,
     pub component: bool,
+    pub focus: bool,
     pub editable_text: bool,
     pub value: bool,
 }
@@ -212,14 +218,16 @@ impl NodeCapabilities {
 
     fn set_value_kind(&self) -> Option<SetValueKind> {
         match self {
+            // Numeric widgets can expose their line editor too. Set the native
+            // Value, not uncommitted editor text (for example Qt QSpinBox).
+            Self::Inspected(InspectedCapabilities { value: true, .. }) => {
+                Some(SetValueKind::Number)
+            }
             Self::Inspected(InspectedCapabilities {
                 component: true,
                 editable_text: true,
                 ..
             }) => Some(SetValueKind::Text),
-            Self::Inspected(InspectedCapabilities { value: true, .. }) => {
-                Some(SetValueKind::Number)
-            }
             _ => None,
         }
     }
@@ -255,6 +263,7 @@ impl NodeInfo {
                 &self.capabilities,
                 NodeCapabilities::Inspected(InspectedCapabilities {
                     component: true,
+                    focus: true,
                     ..
                 })
             )
@@ -276,21 +285,64 @@ pub trait AccessibilityAdapter: Send + Sync + 'static {
         object: &'a ObjectId,
         text_limit: usize,
     ) -> impl Future<Output = Result<NodeInfo, RuntimeError>> + Send + 'a;
+    fn read_summary<'a>(
+        &'a self,
+        object: &'a ObjectId,
+        text_limit: usize,
+        child_limit: usize,
+    ) -> impl Future<Output = Result<NodeSummary, RuntimeError>> + Send + 'a {
+        async move {
+            let mut node = self.read_node(object, text_limit).await?;
+            let children_truncated = node.children.len() > child_limit;
+            node.children.truncate(child_limit);
+            Ok(NodeSummary {
+                node,
+                details_ready: true,
+                children_truncated,
+            })
+        }
+    }
+    fn enrich_summary(
+        &self,
+        node: NodeInfo,
+        text_limit: usize,
+    ) -> impl Future<Output = Result<NodeInfo, RuntimeError>> + Send {
+        async move { self.read_node(&node.object, text_limit).await }
+    }
     fn act<'a>(
         &'a self,
         object: &'a ObjectId,
         action: SemanticAction,
     ) -> impl Future<Output = Result<(), RuntimeError>> + Send + 'a;
+    /// Ask the toolkit to activate a window. `false` is the toolkit's own
+    /// reply that it declined, which is common: Wayland clients cannot raise
+    /// themselves.
     fn activate<'a>(
         &'a self,
         _object: &'a ObjectId,
-    ) -> impl Future<Output = Result<(), RuntimeError>> + Send + 'a {
+    ) -> impl Future<Output = Result<bool, RuntimeError>> + Send + 'a {
         async {
             Err(capability_error(
                 "the accessibility backend does not advertise window activation",
             ))
         }
     }
+}
+
+/// Discovery metadata never authorizes an action. Only fully read retained
+/// nodes enter snapshots; semantic actions still perform fresh revalidation.
+pub struct NodeSummary {
+    pub node: NodeInfo,
+    pub details_ready: bool,
+    pub children_truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TraversalEvidence {
+    pub visited_nodes: usize,
+    pub detailed_nodes: usize,
+    pub truncated: bool,
+    pub stop_reason: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -358,6 +410,7 @@ struct VisualSnapshotOptions {
     view: ObserveView,
     accessibility_scope: AccessibilityScope,
     element_query: Option<String>,
+    search: Option<AccessibilitySearch>,
     limits: SnapshotLimits,
     accessibility_ready: bool,
     accessibility_reason: Option<String>,
@@ -368,6 +421,8 @@ struct VisualSnapshotOptions {
 pub struct Snapshot {
     pub view: AccessibilityScope,
     pub element_query: Option<String>,
+    pub search: Option<AccessibilitySearch>,
+    pub traversal: TraversalEvidence,
     pub app: AppInfo,
     pub window: WindowInfo,
     pub generation: u64,
@@ -451,9 +506,44 @@ struct Cache {
     input_generation: HumanInputGeneration,
     observations: Vec<CachedObservation>,
     human_input_invalidated: bool,
+    /// Element IDs stay bound to one exact AT-SPI object across consecutive
+    /// observations, so an ID from the previous readback of the same window
+    /// still names the same object in the replacement. Acting still requires a
+    /// retained snapshot containing the ID plus fresh exact-object revalidation.
+    element_registry: HashMap<ObjectId, RegisteredElement>,
+    /// Hash of each element line as last returned to the caller, by element
+    /// ID. An action readback omits lines the caller already holds verbatim;
+    /// `observe` always returns the full tree and `list_desktop` forgets all.
+    shown_lines: HashMap<String, u64>,
+}
+
+/// The element ID and content hash of one rendered element line.
+fn shown_element_line(line: &str) -> Option<(&str, u64)> {
+    use std::hash::{Hash, Hasher};
+    let content = line.trim_start_matches('\t').trim_end_matches('\n');
+    let id = content.get(..18)?;
+    let hex = id.strip_prefix("e-")?;
+    if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) || !content[18..].starts_with(": ") {
+        return None;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    Some((id, hasher.finish()))
+}
+
+#[derive(Debug)]
+struct RegisteredElement {
+    id: String,
+    last_seen: u64,
 }
 
 const MAX_CACHED_OBSERVATIONS: usize = 8;
+/// Bounded stable-ID memory: beyond this, the least recently observed bindings
+/// are forgotten and those objects receive fresh IDs when observed again.
+const MAX_REGISTERED_ELEMENTS: usize = 4096;
+/// Opened-window readbacks are a hint, not a full observation.
+const MAX_OPENED_WINDOW_READBACKS: usize = 2;
+const OPENED_WINDOW_READBACK_NODES: usize = 24;
 const MAX_CACHED_SNAPSHOT_STRING_BYTES: usize = 8 * 1024 * 1024;
 
 impl Cache {
@@ -468,20 +558,59 @@ impl Cache {
             .checked_add(1)
             .ok_or_else(|| operational_error("snapshot generation overflow"))?;
         snapshot.generation = self.generation;
-        let mut element_ids = Vec::with_capacity(snapshot.elements.len());
-        for _ in &snapshot.elements {
-            let id = format!("e-{:016x}", self.element_generation);
-            self.element_generation = self
-                .element_generation
-                .checked_add(1)
-                .ok_or_else(|| operational_error("element ID generation overflow"))?;
+        let generation = self.generation;
+        let mut element_ids: Vec<String> = Vec::with_capacity(snapshot.elements.len());
+        for element in &snapshot.elements {
+            let id = match self.element_registry.get_mut(&element.node.object) {
+                Some(registered) if registered.last_seen != generation => {
+                    registered.last_seen = generation;
+                    registered.id.clone()
+                }
+                registered => {
+                    // A binding already seen in this generation means the
+                    // traversal listed one object twice, which its seen-set
+                    // forbids. Keep IDs unique and the first binding intact.
+                    let duplicate = registered.is_some();
+                    let id = format!("e-{:016x}", self.element_generation);
+                    self.element_generation = self
+                        .element_generation
+                        .checked_add(1)
+                        .ok_or_else(|| operational_error("element ID generation overflow"))?;
+                    if duplicate {
+                        eprintln!(
+                            "computer-use-mcp: snapshot lists one AT-SPI object twice; the repeat gets an unregistered element ID"
+                        );
+                    } else {
+                        self.element_registry.insert(
+                            element.node.object.clone(),
+                            RegisteredElement {
+                                id: id.clone(),
+                                last_seen: generation,
+                            },
+                        );
+                    }
+                    id
+                }
+            };
             element_ids.push(id);
         }
         snapshot.element_ids = element_ids;
+        if self.element_registry.len() > MAX_REGISTERED_ELEMENTS {
+            let mut seen = self
+                .element_registry
+                .values()
+                .map(|registered| registered.last_seen)
+                .collect::<Vec<_>>();
+            seen.sort_unstable();
+            // Never forget a binding this snapshot just used: its IDs must
+            // stay stable even when one observation fills most of the registry.
+            let cutoff = seen[seen.len() / 2].min(generation - 1);
+            self.element_registry
+                .retain(|_, registered| registered.last_seen > cutoff);
+        }
         let snapshot = Arc::new(snapshot);
         self.human_input_invalidated = false;
-        self.observations
-            .retain(|cached| !same_target(&cached.snapshot, &snapshot));
+        self.supersede_same_target(&snapshot);
         self.observations.push(CachedObservation {
             snapshot: Arc::clone(&snapshot),
             screenshot_mapping: None,
@@ -497,6 +626,181 @@ impl Cache {
             self.observations.remove(0);
         }
         Ok(snapshot)
+    }
+
+    /// A newer observation of the same window replaces only the authority it
+    /// carries. An older snapshot stays while it still names elements that no
+    /// newer retained snapshot of that window lists (a screenshot-only look or
+    /// a narrow search must not strand IDs from a wider observation), or while
+    /// it holds a frame the new observation did not replace. Mutations still
+    /// remove their source and clear every frame before dispatch, and element
+    /// actions revalidate the exact live object, so a kept snapshot grants
+    /// identity only, never freshness.
+    fn supersede_same_target(&mut self, new: &Snapshot) {
+        let new_has_frame = new.screenshot_requested;
+        let mut covered: std::collections::HashSet<String> =
+            new.element_ids.iter().cloned().collect();
+        for index in (0..self.observations.len()).rev() {
+            let cached = &mut self.observations[index];
+            if !same_target(&cached.snapshot, new) {
+                continue;
+            }
+            if new_has_frame {
+                cached.screenshot_mapping = None;
+            }
+            let names_uncovered = cached
+                .snapshot
+                .element_ids
+                .iter()
+                .any(|id| !covered.contains(id));
+            if names_uncovered {
+                covered.extend(cached.snapshot.element_ids.iter().cloned());
+            } else if cached.screenshot_mapping.is_none() {
+                self.observations.remove(index);
+            }
+        }
+    }
+
+    /// Remember the element lines of a full observation returned to the caller.
+    fn record_shown(&mut self, text: &str) {
+        if self.shown_lines.len() > MAX_REGISTERED_ELEMENTS {
+            // Forgetting only makes the next readback complete again.
+            self.shown_lines.clear();
+        }
+        for line in text.lines() {
+            if let Some((id, hash)) = shown_element_line(line) {
+                self.shown_lines.insert(id.to_owned(), hash);
+            }
+        }
+    }
+
+    /// Reduce an action readback to what changed: element lines the caller
+    /// already holds verbatim are replaced by one count, and earlier elements
+    /// of the same window that are absent now are named. `keep` is always
+    /// listed, so the acted-on element's state is explicit.
+    fn changes_only(
+        &mut self,
+        text: &str,
+        keep: Option<&str>,
+        source: &Snapshot,
+        replacement: Option<&Snapshot>,
+    ) -> String {
+        let mut output = String::with_capacity(text.len());
+        let mut unchanged = 0_usize;
+        let mut in_elements = false;
+        let mut summarized = false;
+        let gone: Vec<(&String, String)> = replacement
+            .filter(|next| same_target(source, next) && !next.elements.is_empty())
+            .map(|next| {
+                let present: std::collections::HashSet<&str> =
+                    next.element_ids.iter().map(String::as_str).collect();
+                source
+                    .element_ids
+                    .iter()
+                    .zip(&source.elements)
+                    .filter(|(id, _)| {
+                        self.shown_lines.contains_key(id.as_str()) && !present.contains(id.as_str())
+                    })
+                    .map(|(id, element)| {
+                        (
+                            id,
+                            format!(
+                                "{} \"{}\"",
+                                escape(&truncate(&element.node.role, 24)),
+                                escape(&truncate(&element.node.name, 32))
+                            ),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // A departed ID cannot be acted on and is absent from the routing
+        // manifest, so departures are described by role and name only.
+        let mut departed: Vec<(&str, usize)> = Vec::new();
+        for (id, label) in &gone {
+            self.shown_lines.remove(id.as_str());
+            match departed.iter_mut().find(|(known, _)| known == label) {
+                Some((_, count)) => *count += 1,
+                None => departed.push((label, 1)),
+            }
+        }
+        let summary = |output: &mut String, unchanged: usize| {
+            if unchanged > 0 {
+                output.push_str(&format!(
+                    "Unchanged elements omitted: {unchanged} (same IDs, same state as last shown; observe returns the full tree)\n"
+                ));
+            }
+            if !departed.is_empty() {
+                const LISTED: usize = 8;
+                let listed = departed
+                    .iter()
+                    .take(LISTED)
+                    .map(|(label, count)| {
+                        if *count > 1 {
+                            format!("{label} x{count}")
+                        } else {
+                            (*label).to_owned()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let more = departed.len().saturating_sub(LISTED);
+                output.push_str(&format!(
+                    "No longer listed ({} earlier elements): {listed}{}\n",
+                    gone.len(),
+                    if more > 0 {
+                        format!("; +{more} more kinds")
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
+        };
+        for line in text.split_inclusive('\n') {
+            match shown_element_line(line) {
+                Some((id, hash)) => {
+                    in_elements = true;
+                    if self.shown_lines.get(id) == Some(&hash) && keep != Some(id) {
+                        unchanged += 1;
+                    } else {
+                        self.shown_lines.insert(id.to_owned(), hash);
+                        output.push_str(line);
+                    }
+                }
+                None => {
+                    if in_elements && !summarized {
+                        summarized = true;
+                        summary(&mut output, unchanged);
+                    }
+                    output.push_str(line);
+                }
+            }
+        }
+        if !summarized {
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            summary(&mut output, unchanged);
+        }
+        output
+    }
+
+    /// The newest retained snapshot of exactly `target`.
+    fn target_source(&self, target: &TargetRef) -> Option<&Arc<Snapshot>> {
+        self.observations
+            .iter()
+            .rev()
+            .map(|cached| &cached.snapshot)
+            .find(|snapshot| snapshot.target_ref.as_ref() == Some(target))
+    }
+
+    /// The newest retained snapshot that presents `element_id`.
+    fn element_source(&self, element_id: &str) -> Option<&Arc<Snapshot>> {
+        self.observations
+            .iter()
+            .rev()
+            .map(|cached| &cached.snapshot)
+            .find(|snapshot| snapshot.element_ids.iter().any(|id| id == element_id))
     }
 
     fn required(&self, observation_id: &str) -> Result<&CachedObservation, RuntimeError> {
@@ -625,7 +929,7 @@ fn node_string_bytes(node: &NodeInfo) -> usize {
             .capabilities
             .actions()
             .iter()
-            .map(|action| action.name.len() + action.description.len())
+            .map(|action| action.name.len() + action.description.len() + action.keybinding.len())
             .sum::<usize>()
         + node.children.iter().map(object_string_bytes).sum::<usize>()
         + node.states.len() * std::mem::size_of::<String>()
@@ -635,6 +939,10 @@ fn node_string_bytes(node: &NodeInfo) -> usize {
 
 fn snapshot_string_bytes(snapshot: &Snapshot) -> usize {
     snapshot.element_query.as_ref().map_or(0, String::len)
+        + snapshot
+            .search
+            .as_ref()
+            .map_or(0, AccessibilitySearch::string_bytes)
         + app_string_bytes(&snapshot.app)
         + window_string_bytes(&snapshot.window)
         + snapshot
@@ -1336,6 +1644,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         let accessibility = accessibility.unwrap_or_else(|| AccessibilityRequest {
             scope: AccessibilityScope::default(),
             query: None,
+            search: None,
             limits: crate::validation::AccessibilityLimits {
                 text: TextLimit::Count(self.config.default_text_limit),
                 nodes: self.config.default_max_nodes,
@@ -1366,6 +1675,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                     view,
                     accessibility_scope: accessibility.scope,
                     element_query: accessibility.query,
+                    search: accessibility.search,
                     limits: snapshot_limits,
                     accessibility_ready: false,
                     accessibility_reason: Some(reason.into()),
@@ -1385,6 +1695,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 accessibility.scope,
                 accessibility.query,
                 snapshot_limits,
+                accessibility.search,
             )
             .await?;
         snapshot.target_ref = Some(target.clone());
@@ -1429,6 +1740,8 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         Snapshot {
             view: options.accessibility_scope,
             element_query: options.element_query,
+            search: options.search,
+            traversal: TraversalEvidence::default(),
             app,
             window,
             generation: 0,
@@ -1543,6 +1856,21 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                     true,
                 )
             }
+        } else if before_active {
+            // Fresh catalog evidence already shows this exact window active.
+            // Qt windows answer GrabFocus with false, so dispatching would only
+            // produce an unknown outcome for a state that is already reached.
+            (
+                "atspi",
+                "already_active",
+                true,
+                "already_active",
+                true,
+                false,
+                false,
+                false,
+                false,
+            )
         } else {
             let binding = entry.atspi.clone().ok_or_else(|| {
                 capability_error(
@@ -1557,15 +1885,24 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             .await
             .map_err(|_| timeout_error("AT-SPI activation dispatch timed out"))
             .and_then(|result| result);
-            if let Err(error) = dispatch {
-                return Err(map_attempt_error(error, progress.snapshot()));
-            }
+            let accepted = match dispatch {
+                Ok(accepted) => accepted,
+                Err(error) => return Err(map_attempt_error(error, progress.snapshot())),
+            };
             progress.mark_completed();
 
+            // A declined request is the toolkit's final answer, so one fresh
+            // read settles it instead of waiting out the activation deadline.
+            let activation_deadline = if accepted {
+                activation_deadline
+            } else {
+                tokio::time::Instant::now()
+            };
             let mut after_active = false;
-            while tokio::time::Instant::now() < activation_deadline {
-                let remaining =
-                    activation_deadline.saturating_duration_since(tokio::time::Instant::now());
+            loop {
+                let remaining = activation_deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .max(Duration::from_millis(1));
                 let apps = match timeout(remaining, self.adapter.discover()).await {
                     Ok(Ok(apps)) => apps,
                     Ok(Err(error)) => {
@@ -1587,6 +1924,19 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                     break;
                 }
                 sleep(Duration::from_millis(25).min(remaining)).await;
+            }
+            if !after_active && !accepted {
+                progress.mark_post_accessibility(PostStatus::Observed);
+                return Err(with_action_progress_snapshot(
+                    RuntimeError::new(
+                        "capability_unavailable",
+                        "the application declined AT-SPI activation and a fresh read shows the window still inactive",
+                        ToolOutcome::Completed,
+                        false,
+                        "This toolkit cannot raise its own window. Activate the source=kde-plasma-window-management entry list_desktop shows for the same window, or click inside it from a fresh screenshot.",
+                    ),
+                    progress.snapshot(),
+                ));
             }
             if !after_active {
                 // Bounded hunt for windows on other virtual desktops: AT-SPI
@@ -1976,28 +2326,83 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
 
     async fn act_new(
         &self,
-        target: &TargetRef,
-        source: &ObservationRef,
+        target: Option<&TargetRef>,
+        source: Option<&ObservationRef>,
         operation: ActOperation,
         progress: Arc<ActionProgress>,
     ) -> Result<ToolOutput, RuntimeError> {
         self.refuse_takeover_with_cleanup(progress.as_ref()).await?;
         self.refresh_window_catalog().await?;
-        let observation_id = self.observation_id_for_source(source, target)?;
-        let source_snapshot = self.required_cached(&observation_id)?;
+        let inferred_source;
+        let source = if let Some(source) = source {
+            source
+        } else {
+            let cache = self.lock_cache()?;
+            let snapshot = match (operation.source_element_id(), target) {
+                // Stable IDs can appear in two retained snapshots of one window
+                // (elements kept beside a newer frame); the newest one is the source.
+                (Some(element_id), _) => cache.element_source(element_id).ok_or_else(|| {
+                    stale_observation_error(
+                        "semantic element has no retained source; observe with accessibility again",
+                    )
+                })?,
+                // Window focus names no element: the newest retained
+                // observation of the exact target is the source.
+                (None, Some(target)) if operation.window_focus() => {
+                    cache.target_source(target).ok_or_else(|| {
+                        stale_observation_error(
+                            "no retained observation of this window; observe it first",
+                        )
+                    })?
+                }
+                // With no window named either, it is the window this session
+                // last observed or acted on. Input is still refused unless a
+                // fresh read shows that exact window active.
+                (None, None) if operation.window_focus() => cache
+                    .observations
+                    .last()
+                    .map(|cached| &cached.snapshot)
+                    .ok_or_else(|| {
+                        stale_observation_error(
+                            "no retained observation names a window; observe it or pass \"target\"",
+                        )
+                    })?,
+                _ => {
+                    return Err(RuntimeError::invalid_arguments(
+                        "source observation is required for point input",
+                    ));
+                }
+            };
+            inferred_source = ObservationRef {
+                observation_id: observation_id_for_snapshot(snapshot),
+                frame_id: None,
+            };
+            &inferred_source
+        };
+        let (target, source_snapshot) = self.action_source(source, target)?;
+        let observation_id = source.observation_id.clone();
         // Refresh first, then resolve the exact opaque target. The catalog
         // guarantees that this ID remains bound to one backend object,
         // authority, and PID for its entire lifetime. Protected surfaces are
         // refused here, before any semantic, pointer, or keyboard dispatch.
-        let entry = self.target_entry(target)?;
+        let entry = self.target_entry(&target)?;
         if entry.is_protected_surface {
             return Err(protected_surface_error());
         }
+        let windows_before = self.application_windows(&target)?;
         let action_result = match operation.clone() {
             ActOperation::Semantic { element_id, action } => {
-                let snapshot = self
+                let snapshot = match self
                     .element_action(&observation_id, &element_id, action, progress.as_ref())
-                    .await?;
+                    .await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        return Err(self
+                            .uncertain_action_readback(error, &source_snapshot, progress.as_ref())
+                            .await);
+                    }
+                };
                 let output = self
                     .post_action_observation(Arc::clone(&snapshot), Arc::clone(&progress))
                     .await?;
@@ -2010,59 +2415,34 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 }
             }
             ActOperation::Pointer { action } => {
-                self.require_fresh_frame(&observation_id, source, "spatial")?;
-                self.perform_generated_with_progress(
+                self.dispatch_generated_action(
                     &observation_id,
+                    source,
+                    &source_snapshot,
                     GeneratedInputAction::Pointer(action),
                     Arc::clone(&progress),
                 )
                 .await?
             }
             ActOperation::Keyboard { focus, events } => {
-                if matches!(&focus, KeyboardFocus::Semantic { .. }) {
-                    // Coordinate-free typing for windows AT-SPI can see but
-                    // screenshots cannot (e.g. another virtual desktop): no
-                    // frame_id, no pointer, no mapping. Focus is grabbed and
-                    // verified before any keystroke.
-                    self.perform_focused_typing_with_progress(
-                        &observation_id,
-                        GeneratedInputAction::KeyboardTransaction { focus, events },
-                        Arc::clone(&progress),
-                    )
-                    .await?
-                } else {
-                    self.require_fresh_frame(&observation_id, source, "keyboard")?;
-                    self.perform_generated_with_progress(
-                        &observation_id,
-                        GeneratedInputAction::KeyboardTransaction { focus, events },
-                        Arc::clone(&progress),
-                    )
-                    .await?
-                }
+                self.dispatch_generated_action(
+                    &observation_id,
+                    source,
+                    &source_snapshot,
+                    GeneratedInputAction::KeyboardTransaction { focus, events },
+                    Arc::clone(&progress),
+                )
+                .await?
             }
             ActOperation::Paste { focus, text } => {
-                if matches!(&focus, KeyboardFocus::Semantic { .. }) {
-                    // Use the session-bound portal clipboard when granted;
-                    // otherwise verify AT-SPI focus and use bounded EIS typing.
-                    // The text itself is never logged.
-                    self.perform_focused_typing_with_progress(
-                        &observation_id,
-                        GeneratedInputAction::Paste { focus, text },
-                        Arc::clone(&progress),
-                    )
-                    .await?
-                } else {
-                    self.require_fresh_frame(&observation_id, source, "paste")?;
-                    // Use the session-bound portal clipboard when granted;
-                    // otherwise focus-click and use bounded EIS typing. The
-                    // text itself is never logged.
-                    self.perform_generated_with_progress(
-                        &observation_id,
-                        GeneratedInputAction::Paste { focus, text },
-                        Arc::clone(&progress),
-                    )
-                    .await?
-                }
+                self.dispatch_generated_action(
+                    &observation_id,
+                    source,
+                    &source_snapshot,
+                    GeneratedInputAction::Paste { focus, text },
+                    Arc::clone(&progress),
+                )
+                .await?
             }
         };
         let GeneratedActionResult {
@@ -2072,9 +2452,9 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             eis_region,
             focus_grace,
         } = action_result;
-        Ok(annotate_action_output_with_progress(
+        let mut output = annotate_action_output_with_progress(
             output,
-            target,
+            &target,
             source,
             &operation,
             &source_snapshot,
@@ -2086,23 +2466,282 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 focus_grace,
                 paste_delivery: self.screenshots.paste_delivery_mechanism(),
             },
-        ))
+        );
+        // The caller already holds the unchanged lines under the same stable
+        // IDs. Structured content stays complete.
+        output.text = self.lock_cache()?.changes_only(
+            &output.text,
+            operation.source_element_id(),
+            &source_snapshot,
+            replacement_snapshot.as_deref(),
+        );
+        let reported = replacement_snapshot
+            .as_deref()
+            .and_then(|snapshot| snapshot.target_ref.as_ref())
+            .unwrap_or(&target);
+        self.append_opened_windows(&mut output, &target, reported, &windows_before)
+            .await;
+        Ok(output)
     }
 
-    fn observation_id_for_source(
+    fn application_windows(&self, target: &TargetRef) -> Result<BTreeSet<String>, RuntimeError> {
+        Ok(self
+            .lock_catalog()?
+            .entries()
+            .filter(|entry| entry.target.app_instance_id == target.app_instance_id)
+            .map(|entry| entry.target.window_instance_id.clone())
+            .collect())
+    }
+
+    /// A context menu or secondary window is its own toplevel: the readback of
+    /// the acted-on window never contains it. Reading it is not input, and
+    /// its elements carry their own exact target.
+    async fn append_opened_windows(
+        &self,
+        output: &mut ToolOutput,
+        target: &TargetRef,
+        reported: &TargetRef,
+        before: &BTreeSet<String>,
+    ) {
+        if let Err(error) = self.refresh_window_catalog().await {
+            eprintln!(
+                "computer-use-mcp: opened-window readback skipped: catalog refresh failed: code={}",
+                error.code
+            );
+            return;
+        }
+        let opened: Vec<(TargetRef, String)> = match self.lock_catalog() {
+            Ok(catalog) => catalog
+                .entries()
+                .filter(|entry| {
+                    entry.target.app_instance_id == target.app_instance_id
+                        && entry.target != *reported
+                        && !before.contains(&entry.target.window_instance_id)
+                        && entry
+                            .atspi
+                            .as_ref()
+                            .is_some_and(|binding| window_is_viable(&binding.window))
+                })
+                .take(MAX_OPENED_WINDOW_READBACKS)
+                .map(|entry| (entry.target.clone(), entry.title.clone()))
+                .collect(),
+            Err(error) => {
+                eprintln!("computer-use-mcp: opened-window readback skipped: {error}");
+                return;
+            }
+        };
+        // The action output already fits its budgets. Everything appended
+        // here is charged against what is left, and a window is reported in
+        // text only together with its structured target: the broker
+        // translates a window ID in text only when structured content names it.
+        let Some(structured) = output.structured_content.as_ref() else {
+            eprintln!("computer-use-mcp: opened-window readback skipped: no structured content");
+            return;
+        };
+        const MORE: &str = "\n\t(more elements; observe it)";
+        const OMITTED: &str = "\nAnother window opened; list_desktop shows it.";
+        // Key, brackets, and separators around the reports.
+        let mut structured_left = MAX_MODEL_STRUCTURED_BYTES
+            .saturating_sub(json_size(structured))
+            .saturating_sub(32);
+        let mut text_left = MAX_MODEL_TEXT_BYTES
+            .saturating_sub(output.text.len())
+            .saturating_sub(OMITTED.len());
+        let mut reports = Vec::new();
+        for (opened_target, title) in opened {
+            let request = AccessibilityRequest {
+                limits: crate::validation::AccessibilityLimits {
+                    nodes: OPENED_WINDOW_READBACK_NODES,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let observed = match self
+                .requested_target_snapshot(
+                    &opened_target,
+                    ObserveView::Accessibility,
+                    Some(request),
+                    ObserveCrop::Monitor,
+                )
+                .await
+            {
+                Ok(snapshot) => self.observe(snapshot, Ok(())).await,
+                Err(error) => Err(error),
+            };
+            let label = format!(
+                "\nOpened window {title:?} target=app_instance_id={} window_instance_id={}",
+                opened_target.app_instance_id, opened_target.window_instance_id
+            );
+            let mut report = json!({"target": opened_target.as_json(), "title": title});
+            let mut block = label;
+            let mut listed = String::new();
+            match &observed {
+                Ok(observed) => {
+                    let lines: Vec<&str> = observed
+                        .text
+                        .lines()
+                        .filter(|line| shown_element_line(line).is_some())
+                        .collect();
+                    if lines.is_empty() && title.is_empty() {
+                        // An untitled toplevel without interactive elements
+                        // (a tooltip) offers nothing to act on.
+                        continue;
+                    }
+                    report["observation_id"] = observed
+                        .structured_content
+                        .as_ref()
+                        .map_or(Value::Null, |data| data["observation_id"].clone());
+                    block.push_str(" (same application; its elements act on that window):");
+                    if lines.is_empty() {
+                        block.push_str("\n\t(no interactive elements read; observe it)");
+                    }
+                    for (index, line) in lines.iter().enumerate() {
+                        let rest = if index + 1 == lines.len() {
+                            0
+                        } else {
+                            MORE.len()
+                        };
+                        if block.len() + 1 + line.len() + rest > text_left {
+                            block.push_str(MORE);
+                            break;
+                        }
+                        block.push('\n');
+                        block.push_str(line);
+                        listed.push_str(line);
+                        listed.push('\n');
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "computer-use-mcp: opened-window readback failed: code={}",
+                        error.code
+                    );
+                    block.push_str(" (not read; observe it)");
+                }
+            }
+            let report_size = json_size(&report) + 1;
+            if block.len() > text_left || report_size > structured_left {
+                eprintln!("computer-use-mcp: opened window omitted: response byte budget");
+                output.text.push_str(OMITTED);
+                break;
+            }
+            text_left -= block.len();
+            structured_left -= report_size;
+            output.text.push_str(&block);
+            if let Ok(observed) = &observed {
+                // The broker publishes only IDs named in this manifest.
+                output
+                    .element_ids
+                    .extend(observed.element_ids.iter().cloned());
+                // Only lines the caller received count as shown.
+                match self.lock_cache() {
+                    Ok(mut cache) => cache.record_shown(&listed),
+                    Err(error) => {
+                        eprintln!("computer-use-mcp: opened-window lines not recorded: {error}")
+                    }
+                }
+            }
+            reports.push(report);
+        }
+        if !reports.is_empty()
+            && let Some(structured) = output.structured_content.as_mut()
+        {
+            structured["opened_windows"] = Value::Array(reports);
+        }
+    }
+
+    async fn dispatch_generated_action(
+        &self,
+        observation_id: &str,
+        source: &ObservationRef,
+        source_snapshot: &Arc<Snapshot>,
+        action: GeneratedInputAction,
+        progress: Arc<ActionProgress>,
+    ) -> Result<GeneratedActionResult, RuntimeError> {
+        if action.uses_focused_path() {
+            // Semantic and window focus need exact element or active-window
+            // authority, not screenshot pixels.
+            return match self
+                .perform_focused_typing_with_progress(observation_id, action, Arc::clone(&progress))
+                .await
+            {
+                Ok(result) => Ok(result),
+                Err(error) => Err(self
+                    .uncertain_action_readback(error, source_snapshot, progress.as_ref())
+                    .await),
+            };
+        }
+        let operation = match &action {
+            GeneratedInputAction::Pointer(_) => "spatial",
+            GeneratedInputAction::KeyboardTransaction { .. } => "keyboard",
+            GeneratedInputAction::Paste { .. } => "paste",
+        };
+        self.require_fresh_frame(observation_id, source, operation)?;
+        self.perform_generated_with_progress(observation_id, action, progress)
+            .await
+    }
+
+    async fn uncertain_action_readback(
+        &self,
+        mut error: RuntimeError,
+        source: &Arc<Snapshot>,
+        progress: &ActionProgress,
+    ) -> RuntimeError {
+        // Modal toolkits can leave DoAction pending. Read evidence, never
+        // reinterpret the missing RPC reply as success or replay the request.
+        if error.outcome != ToolOutcome::Unknown {
+            return error;
+        }
+        match self.settle_and_refresh(Arc::clone(source)).await {
+            Ok(snapshot) => match self.observe_with_status(snapshot, Ok(())).await {
+                Ok((output, visual)) => {
+                    progress.mark_post_accessibility(
+                        if output
+                            .structured_content
+                            .as_ref()
+                            .is_some_and(|data| data["accessibility"]["ready"] == true)
+                        {
+                            PostStatus::Observed
+                        } else {
+                            PostStatus::NotRun
+                        },
+                    );
+                    if source.screenshot_requested {
+                        progress.mark_post_visual(visual);
+                    }
+                    error.recovery_observation = Some(Box::new(output));
+                    error.recovery = "Inspect the included fresh replacement observation and its exact target. The prior action's outcome remains unknown; do not replay it blindly.".into();
+                }
+                Err(read_error) => eprintln!(
+                    "computer-use-mcp: uncertain action readback unavailable: code={}",
+                    read_error.code
+                ),
+            },
+            Err(read_error) => eprintln!(
+                "computer-use-mcp: uncertain action refresh unavailable: code={}",
+                read_error.code
+            ),
+        }
+        with_action_progress(error, progress)
+    }
+
+    fn action_source(
         &self,
         source: &ObservationRef,
-        target: &TargetRef,
-    ) -> Result<String, RuntimeError> {
+        supplied_target: Option<&TargetRef>,
+    ) -> Result<(TargetRef, Arc<Snapshot>), RuntimeError> {
         parse_opaque_counter(&source.observation_id, "obs")?;
         let snapshot = self.required_cached(&source.observation_id)?;
-        if snapshot.target_ref.as_ref() != Some(target) {
+        let target = snapshot.target_ref.as_ref().ok_or_else(|| {
+            stale_observation_error("source observation has no exact target binding; observe again")
+        })?;
+        if supplied_target.is_some_and(|supplied| supplied != target) {
             eprintln!("computer-use-mcp: source observation target does not match act target");
             return Err(stale_observation_error(
                 "source observation belongs to another target",
             ));
         }
-        Ok(source.observation_id.clone())
+        Ok((target.clone(), snapshot))
     }
 
     async fn wait_for_new(
@@ -2772,7 +3411,12 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 scope,
                 limit,
                 cursor,
-            } => self.list_desktop(scope, limit, cursor.as_deref()).await,
+            } => {
+                // Rediscovery is how a caller starts over, possibly without its
+                // earlier readbacks: the next action readback is complete again.
+                self.lock_cache()?.shown_lines.clear();
+                self.list_desktop(scope, limit, cursor.as_deref()).await
+            }
             ToolCall::LaunchApplication { desktop_id } => {
                 self.check_takeover()?;
                 self.clear_click_grace();
@@ -2818,7 +3462,9 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 let snapshot = self
                     .requested_target_snapshot(&target, view, accessibility, crop)
                     .await?;
-                self.observe(snapshot, visual_session).await
+                let output = self.observe(snapshot, visual_session).await?;
+                self.lock_cache()?.record_shown(&output.text);
+                Ok(output)
             }
             ToolCall::Act {
                 target,
@@ -2828,10 +3474,10 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 if !matches!(
                     &operation,
                     ActOperation::Keyboard {
-                        focus: KeyboardFocus::Semantic { .. },
+                        focus: KeyboardFocus::Semantic { .. } | KeyboardFocus::Window,
                         ..
                     } | ActOperation::Paste {
-                        focus: KeyboardFocus::Semantic { .. },
+                        focus: KeyboardFocus::Semantic { .. } | KeyboardFocus::Window,
                         ..
                     }
                 ) {
@@ -2839,7 +3485,8 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 }
                 self.ensure_no_launch_in_progress()?;
                 let progress = required_action_progress(progress, "act")?;
-                self.act_new(&target, &source, operation, progress).await
+                self.act_new(target.as_ref(), source.as_ref(), operation, progress)
+                    .await
             }
             ToolCall::WaitFor {
                 target,
@@ -2847,7 +3494,9 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 timeout_ms,
             } => {
                 self.ensure_no_launch_in_progress()?;
-                self.wait_for_new(target, condition, timeout_ms).await
+                let output = self.wait_for_new(target, condition, timeout_ms).await?;
+                self.lock_cache()?.record_shown(&output.text);
+                Ok(output)
             }
         }
     }
@@ -2903,6 +3552,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         view: AccessibilityScope,
         element_query: Option<String>,
         limits: SnapshotLimits,
+        search: Option<AccessibilitySearch>,
     ) -> Result<Snapshot, RuntimeError> {
         let matching_apps = apps
             .iter()
@@ -2931,6 +3581,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             )));
         }
         let metadata_bytes = element_query.as_ref().map_or(0, String::len)
+            + search.as_ref().map_or(0, AccessibilitySearch::string_bytes)
             + app_string_bytes(app)
             + window_string_bytes(window);
         let element_budget = MAX_CACHED_SNAPSHOT_STRING_BYTES
@@ -2940,10 +3591,14 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                     "observation metadata exceeds the retained-state byte limit; use a narrower target",
                 )
             })?;
-        let elements = self.traverse(window, view, limits, element_budget).await?;
+        let elements = self
+            .traverse(window, view, limits, element_budget, search.as_ref())
+            .await?;
         Ok(Snapshot {
             view,
             element_query,
+            search,
+            traversal: elements.evidence,
             app: (*app).clone(),
             window: window.clone(),
             generation: 0,
@@ -2967,76 +3622,219 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         view: AccessibilityScope,
         limits: SnapshotLimits,
         string_byte_budget: usize,
+        search: Option<&AccessibilitySearch>,
     ) -> Result<Traversal, RuntimeError> {
-        let mut stack = vec![(window.object.clone(), 0_usize)];
-        let mut elements = Vec::new();
-        let mut node_limit_reached = false;
+        let scan_limit = search.map_or(limits.nodes.saturating_mul(4).clamp(64, 10_000), |s| {
+            s.max_nodes
+        });
+        let result_limit = search.map_or(limits.nodes, |s| s.limit.min(limits.nodes));
+        let deadline = tokio::time::Instant::now()
+            + search.map_or(self.config.snapshot_timeout, |s| {
+                Duration::from_millis(s.timeout_ms)
+            });
+        let mut evidence = TraversalEvidence::default();
+        let mut pending = BTreeMap::new();
+        let mut seen = BTreeSet::from([window.object.clone()]);
+        let root = self
+            .read_summary(&window.object, limits.text, scan_limit, deadline)
+            .await?;
+        let mut discovery_bytes = node_string_bytes(&root.node);
+        pending.insert((0, 0, vec![]), (root, false));
+        evidence.visited_nodes = 1;
+        let mut selected = Vec::new();
+        let mut retained_bytes = 0_usize;
         let mut depth_limit_reached = false;
-        let mut string_bytes = 0_usize;
-        while let Some((object, depth)) = stack.pop() {
-            if elements.len() >= limits.nodes {
+        let mut node_limit_reached = false;
+        while let Some(((_, _, path), (summary, in_collection))) = pending.pop_first() {
+            let depth = path.len();
+            if tokio::time::Instant::now() >= deadline {
+                evidence.stop("timeout");
+                break;
+            }
+            if selected.len() >= result_limit {
+                node_limit_reached = true;
+                evidence.stop(if search.is_some() {
+                    "result_limit"
+                } else {
+                    "node_limit"
+                });
+                break;
+            }
+            let object = summary.node.object.clone();
+            if summary.node.is_defunct() {
+                if depth == 0 {
+                    return Err(operational_error("selected window is defunct or stale"));
+                }
+                continue;
+            }
+            if depth > 0
+                && view != AccessibilityScope::Full
+                && (is_hidden_document(&summary.node)
+                    || (is_collection(&summary.node.role)
+                        && !summary.node.states.contains("showing")
+                        && !summary.node.states.contains("visible")))
+            {
+                // Search must not interpret an intentionally unvisited subtree as absence.
+                if search.is_some() {
+                    evidence.stop("scope_omitted");
+                }
+                continue;
+            }
+            if discovery_bytes.saturating_add(retained_bytes) > string_byte_budget {
+                return Err(operational_error(
+                    "observation exceeds the retained-state byte limit; lower text_limit or max_tree_nodes",
+                ));
+            }
+            let children = summary.node.children.clone();
+            let omit_tab_contents = view != AccessibilityScope::Full
+                && summary.node.role == "page tab"
+                && summary.node.states.contains("selectable")
+                && !summary.node.states.contains("selected");
+            // Defer large inventories, not a short dialog navigation list.
+            let collection =
+                in_collection || (is_collection(&summary.node.role) && children.len() > 16);
+            if summary.children_truncated {
+                evidence.stop("scan_limit");
+            }
+            if search.is_none_or(|s| search_matches(s, &summary.node)) {
+                let mut node = if summary.details_ready {
+                    summary.node
+                } else {
+                    match tokio::time::timeout_at(
+                        deadline.min(tokio::time::Instant::now() + self.config.call_timeout),
+                        self.adapter.enrich_summary(summary.node, limits.text),
+                    )
+                    .await
+                    {
+                        Ok(Ok(node)) => node,
+                        Ok(Err(error)) if depth == 0 => return Err(error),
+                        Ok(Err(_)) => {
+                            evidence.stop("read_error");
+                            continue;
+                        }
+                        Err(_) => {
+                            evidence.stop("timeout");
+                            break;
+                        }
+                    }
+                };
+                if node.object != object {
+                    return Err(operational_error(
+                        "AT-SPI object identity changed while reading",
+                    ));
+                }
+                if !node.is_defunct() && search.is_none_or(|s| search_matches(s, &node)) {
+                    // Retain only bounded discovery edges, never expand a later
+                    // full read's potentially changed child list implicitly.
+                    node.children.clone_from(&children);
+                    node.window_frame = normalize_frame(&node);
+                    if search.is_none()
+                        || element_is_presented_with_query(
+                            view,
+                            None,
+                            &ElementSnapshot {
+                                depth,
+                                node: node.clone(),
+                            },
+                        )
+                    {
+                        retained_bytes = retained_bytes.saturating_add(node_string_bytes(&node));
+                        if retained_bytes > string_byte_budget {
+                            return Err(operational_error(
+                                "observation exceeds the retained-state byte limit; lower text_limit or max_tree_nodes",
+                            ));
+                        }
+                        selected.push((path.clone(), ElementSnapshot { depth, node }));
+                        evidence.detailed_nodes += 1;
+                    }
+                }
+            }
+            if search.is_some() && selected.len() >= result_limit {
+                evidence.stop("result_limit");
                 node_limit_reached = true;
                 break;
             }
-            let mut node = match self.read_node(&object, limits.text).await {
-                Ok(node) => node,
-                Err(error) if depth > 0 => {
-                    eprintln!(
-                        "computer-use-mcp: skipping stale AT-SPI child: object={}{} error={error}",
-                        object.bus_name, object.path
-                    );
-                    continue;
+            if omit_tab_contents {
+                if search.is_some() && !children.is_empty() {
+                    evidence.stop("scope_omitted");
                 }
-                Err(error) => return Err(error),
-            };
-            if node.object != object {
-                eprintln!("computer-use-mcp: AT-SPI adapter returned mismatched object identity");
-                return Err(operational_error(
-                    "AT-SPI object identity changed while reading",
-                ));
+                continue; // Keep the tab itself for navigation, not its inactive page.
             }
-            if node.is_defunct() {
-                if depth == 0 {
-                    return Err(operational_error(format!(
-                        "selected window {}{} is defunct or stale",
-                        object.bus_name, object.path
-                    )));
-                }
-                eprintln!(
-                    "computer-use-mcp: skipping defunct AT-SPI child: object={}{}",
-                    object.bus_name, object.path
-                );
-                continue;
-            }
-            if depth > 0 && view != AccessibilityScope::Full && is_hidden_document(&node) {
-                continue;
-            }
-            string_bytes = string_bytes
-                .checked_add(node_string_bytes(&node))
-                .filter(|bytes| *bytes <= string_byte_budget)
-                .ok_or_else(|| {
-                    operational_error(
-                        "observation exceeds the retained-state byte limit; lower text_limit or max_tree_nodes",
-                    )
-                })?;
-            node.window_frame = normalize_frame(&node);
-            let children = node.children.clone();
-            elements.push(ElementSnapshot { depth, node });
             if depth >= limits.depth {
                 if !children.is_empty() {
                     depth_limit_reached = true;
+                    evidence.stop("depth_limit");
                 }
                 continue;
             }
-            for child in children.into_iter().rev() {
-                stack.push((child, depth + 1));
+            for (index, child) in children.into_iter().enumerate() {
+                if seen.contains(&child) {
+                    continue;
+                }
+                if evidence.visited_nodes >= scan_limit {
+                    evidence.stop("scan_limit");
+                    break;
+                }
+                seen.insert(child.clone());
+                evidence.visited_nodes += 1;
+                let child_summary = match self
+                    .read_summary(&child, limits.text, scan_limit, deadline)
+                    .await
+                {
+                    Ok(summary) => summary,
+                    Err(_) if tokio::time::Instant::now() >= deadline => {
+                        evidence.stop("timeout");
+                        break;
+                    }
+                    Err(_) => {
+                        evidence.stop("read_error");
+                        continue;
+                    }
+                };
+                discovery_bytes =
+                    discovery_bytes.saturating_add(node_string_bytes(&child_summary.node));
+                if discovery_bytes.saturating_add(retained_bytes) > string_byte_budget {
+                    return Err(operational_error(
+                        "observation discovery exceeds the retained-state byte limit; use a narrower search",
+                    ));
+                }
+                let rank = discovery_rank(&child_summary.node, collection);
+                let mut child_path = path.clone();
+                child_path.push(index);
+                pending.insert(
+                    (rank, child_path.len(), child_path),
+                    (child_summary, collection),
+                );
             }
         }
+        selected.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(Traversal {
-            elements,
+            elements: selected.into_iter().map(|(_, node)| node).collect(),
             node_limit_reached,
             depth_limit_reached,
+            evidence,
         })
+    }
+
+    async fn read_summary(
+        &self,
+        object: &ObjectId,
+        text_limit: usize,
+        child_limit: usize,
+        deadline: tokio::time::Instant,
+    ) -> Result<NodeSummary, RuntimeError> {
+        let summary = tokio::time::timeout_at(
+            deadline.min(tokio::time::Instant::now() + self.config.call_timeout),
+            self.adapter.read_summary(object, text_limit, child_limit),
+        )
+        .await
+        .map_err(|_| operational_error("AT-SPI discovery timed out"))??;
+        if summary.node.object != *object {
+            return Err(operational_error(
+                "AT-SPI object identity changed while reading",
+            ));
+        }
+        Ok(summary)
     }
 
     async fn element_action(
@@ -3106,7 +3904,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             }
             Err(error) => return Err(map_attempt_error(error, progress.snapshot())),
         }
-        match self.settle_and_refresh(cached).await {
+        match self.settle_and_refresh(Arc::new(current)).await {
             Ok(snapshot) => {
                 progress.mark_post_accessibility(post_accessibility_status(&snapshot));
                 Ok(snapshot)
@@ -3170,6 +3968,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 cached.view,
                 cached.element_query.clone(),
                 limits,
+                cached.search.clone(),
             )
             .await?;
         snapshot.target_ref = cached.target_ref.clone();
@@ -3342,24 +4141,17 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         action: GeneratedInputAction,
         progress: Arc<ActionProgress>,
     ) -> Result<GeneratedActionResult, RuntimeError> {
-        let element_id = match &action {
-            GeneratedInputAction::KeyboardTransaction {
-                focus: KeyboardFocus::Semantic { element_id },
-                ..
-            }
-            | GeneratedInputAction::Paste {
-                focus: KeyboardFocus::Semantic { element_id },
-                ..
-            } => element_id.clone(),
-            _ => {
-                return Err(with_action_progress(
-                    operational_error(
-                        "focused-element typing requires semantic focus; point focus must take the mapped path",
-                    ),
-                    progress.as_ref(),
-                ));
-            }
-        };
+        if !action.uses_focused_path() {
+            return Err(with_action_progress(
+                operational_error(
+                    "focused typing requires semantic or window focus; point focus must take the mapped path",
+                ),
+                progress.as_ref(),
+            ));
+        }
+        // `None` is window focus: the active target window's current focus.
+        let element_id = action.semantic_focus().map(str::to_owned);
+        let element_id = element_id.as_deref();
         self.refuse_takeover_with_cleanup(progress.as_ref()).await?;
         let cached = self
             .required_cached(observation_id)
@@ -3371,10 +4163,20 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             .fresh_for_action(&cached)
             .await
             .map_err(|error| with_action_progress(error, progress.as_ref()))?;
-        let target = relocate(cached_element(&cached, &element_id)?, &current.elements)
-            .map_err(|error| with_action_progress(error, progress.as_ref()))?;
-        ensure_element_presented(&current, target, &element_id)
-            .map_err(|error| with_action_progress(error, progress.as_ref()))?;
+        if let Some(element_id) = element_id {
+            let target = relocate(cached_element(&cached, element_id)?, &current.elements)
+                .map_err(|error| with_action_progress(error, progress.as_ref()))?;
+            ensure_element_presented(&current, target, element_id)
+                .map_err(|error| with_action_progress(error, progress.as_ref()))?;
+        } else if !current.window.states.contains("active")
+            && self.click_grace_for(&current, CLICK_GRACE_TTL).is_none()
+        {
+            // Refused before invalidation: the caller's observations stay valid.
+            return Err(with_action_progress(
+                inactive_window_focus_error(),
+                progress.as_ref(),
+            ));
+        }
         self.lock_cache()
             .map_err(|error| with_action_progress(error, progress.as_ref()))?
             .invalidate_for_mutation(&cached)
@@ -3409,62 +4211,101 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         self.refuse_takeover_with_cleanup(progress.as_ref()).await?;
         // Preparation can await portal/EIS setup. Grab and verify focus only
         // after it completes, using fresh window evidence after GrabFocus.
-        progress.mark_started();
-        let focus_result = timeout(
-            self.config.call_timeout,
-            self.adapter
-                .act(&target.node.object, SemanticAction::GrabFocus),
-        )
-        .await
-        .map_err(|_| timeout_error("AT-SPI focus timed out before focused typing"))
-        .and_then(|result| result);
-        if let Err(focus_error) = focus_result {
-            // Some Qt/KDE accessibles return false when the target already
-            // owns focus. Accept that idempotent refusal only with a fresh
-            // element and active-window readback; never use click grace as a
-            // substitute for this verification.
-            let focused = self
+        if let Some(element_id) = element_id {
+            let pre_focus = self
                 .fresh_for_action(&cached)
                 .await
-                .map_err(|error| map_attempt_error(error, progress.snapshot()))?;
-            let element = relocate(cached_element(&cached, &element_id)?, &focused.elements)
-                .map_err(|error| map_attempt_error(error, progress.snapshot()))?;
-            if element.node.is_defunct()
-                || !element.node.states.contains("focused")
-                || !focused.window.states.contains("active")
-            {
-                return Err(map_attempt_error(focus_error, progress.snapshot()));
-            }
-            eprintln!(
-                "computer-use-mcp: AT-SPI GrabFocus refused an already-focused element; fresh element/window focus verified"
-            );
-            focus_grace = None;
-        }
-        focus_grace = focus_grace
-            .map(|age| age + focus_checked_at.elapsed())
-            .filter(|age| *age <= CLICK_GRACE_TTL);
-        if focus_grace.is_none() {
-            let focused = self
-                .fresh_for_action(&cached)
+                .map_err(|error| with_action_progress(error, progress.as_ref()))?;
+            let pre_element = relocate(cached_element(&cached, element_id)?, &pre_focus.elements)
+                .map_err(|error| with_action_progress(error, progress.as_ref()))?;
+            let already_focused = pre_element.node.states.contains("focused")
+                && pre_focus.window.states.contains("active")
+                && !pre_element.node.is_defunct();
+            let focus_result = if already_focused {
+                // Fresh exact element/window state is stronger than a redundant
+                // GrabFocus request. GTK4 can reject that request even while focused.
+                focus_grace = None;
+                Ok(())
+            } else {
+                let focus_action = focus_dispatch(&pre_element.node)
+                    .map_err(|error| with_action_progress(error, progress.as_ref()))?;
+                progress.mark_started();
+                timeout(
+                    self.config.call_timeout,
+                    self.adapter.act(&pre_element.node.object, focus_action),
+                )
                 .await
-                .map_err(|error| map_attempt_error(error, progress.snapshot()))?;
-            let element = relocate(cached_element(&cached, &element_id)?, &focused.elements)
-                .map_err(|error| map_attempt_error(error, progress.snapshot()))?;
-            if element.node.is_defunct() || !element.node.states.contains("focused") {
-                return Err(map_attempt_error(
-                    operational_error(
-                        "AT-SPI focus was not granted to the target element; refusing to type into an unverified window",
-                    ),
-                    progress.snapshot(),
-                ));
+                .map_err(|_| timeout_error("AT-SPI focus timed out before focused typing"))
+                .and_then(|result| result)
+            };
+            if let Err(focus_error) = focus_result {
+                // Some Qt/KDE accessibles return false when the target already
+                // owns focus. Accept that idempotent refusal only with a fresh
+                // element and active-window readback; never use click grace as a
+                // substitute for this verification.
+                let focused = self
+                    .fresh_for_action(&cached)
+                    .await
+                    .map_err(|error| map_attempt_error(error, progress.snapshot()))?;
+                let element = relocate(cached_element(&cached, element_id)?, &focused.elements)
+                    .map_err(|error| map_attempt_error(error, progress.snapshot()))?;
+                if element.node.is_defunct()
+                    || !element.node.states.contains("focused")
+                    || !focused.window.states.contains("active")
+                {
+                    return Err(map_attempt_error(focus_error, progress.snapshot()));
+                }
+                eprintln!(
+                    "computer-use-mcp: AT-SPI GrabFocus refused an already-focused element; fresh element/window focus verified"
+                );
+                focus_grace = None;
             }
-            if !focused.window.states.contains("active") {
-                return Err(map_attempt_error(
-                    operational_error(
-                        "target window is not active; refusing to type into a background window",
-                    ),
-                    progress.snapshot(),
-                ));
+            focus_grace = focus_grace
+                .map(|age| age + focus_checked_at.elapsed())
+                .filter(|age| *age <= CLICK_GRACE_TTL);
+            if focus_grace.is_none() {
+                let focused = self
+                    .fresh_for_action(&cached)
+                    .await
+                    .map_err(|error| map_attempt_error(error, progress.snapshot()))?;
+                let element = relocate(cached_element(&cached, element_id)?, &focused.elements)
+                    .map_err(|error| map_attempt_error(error, progress.snapshot()))?;
+                if element.node.is_defunct() || !element.node.states.contains("focused") {
+                    return Err(map_attempt_error(
+                        operational_error(
+                            "AT-SPI focus was not granted to the target element; refusing to type into an unverified window",
+                        ),
+                        progress.snapshot(),
+                    ));
+                }
+                if !focused.window.states.contains("active") {
+                    return Err(map_attempt_error(
+                        operational_error(
+                            "target window is not active; refusing to type into a background window",
+                        ),
+                        progress.snapshot(),
+                    ));
+                }
+            }
+        } else {
+            // Window focus sends no focus request. Preparation may have
+            // awaited a portal dialog, so the active state is read again; a
+            // click just dispatched into this window stands in when toolkit
+            // states lag behind real input.
+            focus_grace = focus_grace
+                .map(|age| age + focus_checked_at.elapsed())
+                .filter(|age| *age <= CLICK_GRACE_TTL);
+            if focus_grace.is_none() {
+                let active = self
+                    .fresh_for_action(&cached)
+                    .await
+                    .map_err(|error| map_attempt_error(error, progress.snapshot()))?;
+                if !active.window.states.contains("active") {
+                    return Err(map_attempt_error(
+                        inactive_window_focus_error(),
+                        progress.snapshot(),
+                    ));
+                }
             }
         }
         self.refuse_takeover_with_cleanup(progress.as_ref()).await?;
@@ -3649,9 +4490,9 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
         let (apps, _) = self.refresh_window_catalog().await?;
         let refreshed = if let Some(target) = old.target_ref.as_ref() {
             let entry = self
-                .target_entry(target)
+                .post_action_entry(&old, target)
                 .map_err(completed_without_observation)?;
-            let future = self.replacement_snapshot(&old, target, &entry, &apps);
+            let future = self.replacement_snapshot(&old, &entry.target, &entry, &apps);
             timeout(self.config.snapshot_timeout, future)
                 .await
                 .map_err(|_| operational_error("snapshot timed out after action"))??
@@ -3667,6 +4508,71 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
             ));
         }
         self.commit_snapshot(refreshed)
+    }
+
+    /// Reading a newly active/remaining window does not authorize input to it.
+    /// Its exact target is returned explicitly for the caller's next decision.
+    fn post_action_entry(
+        &self,
+        old: &Snapshot,
+        target: &TargetRef,
+    ) -> Result<WindowEntry, RuntimeError> {
+        let catalog = self.lock_catalog()?;
+        let current = catalog.get(target).ok();
+        // A visual-only source keeps its window while it exists. When the
+        // input closed that window (a click on a dialog button), the readback
+        // moves like a semantic one: to the exact same application's single
+        // active or single remaining window. A visual source without an
+        // AT-SPI binding carries a placeholder application that matches none.
+        if !old.requires_atspi_revalidation
+            && let Some(current) = current
+        {
+            return Ok(current.clone());
+        }
+        let related: Vec<_> = catalog
+            .entries()
+            .filter(|entry| {
+                entry.target.app_instance_id == target.app_instance_id
+                    && entry.atspi.as_ref().is_some_and(|binding| {
+                        binding.app.object == old.app.object
+                            && binding.app.pid == old.app.pid
+                            && window_is_viable(&binding.window)
+                    })
+            })
+            .collect();
+        let active: Vec<_> = related
+            .iter()
+            .copied()
+            .filter(|entry| entry.states.contains("active"))
+            .collect();
+        let newly_active = active
+            .first()
+            .filter(|entry| {
+                active.len() == 1
+                    && (current.is_none()
+                        || entry.target == *target
+                        || entry.atspi.as_ref().is_some_and(|binding| {
+                            !old.app.windows.iter().any(|window| {
+                                window.object == binding.window.object
+                                    && window.states.contains("active")
+                            })
+                        }))
+            })
+            .copied();
+        let next = newly_active
+            .or(current)
+            .or_else(|| (related.len() == 1).then(|| related[0]));
+        let next = next.ok_or_else(|| {
+            catalog_error(crate::window_backend::CatalogError::StaleTarget(
+                target.clone(),
+            ))
+        })?;
+        if next.target != *target {
+            eprintln!(
+                "computer-use-mcp: post-action observation moved to a distinct exact same-application target; no input was retargeted"
+            );
+        }
+        Ok(next.clone())
     }
 
     async fn replacement_snapshot(
@@ -3689,6 +4595,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                     view,
                     accessibility_scope: old.view,
                     element_query: old.element_query.clone(),
+                    search: old.search.clone(),
                     limits: old.limits,
                     accessibility_ready: old.accessibility_ready && entry.atspi.is_some(),
                     accessibility_reason: old.accessibility_reason.clone(),
@@ -3710,6 +4617,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                     view,
                     accessibility_scope: old.view,
                     element_query: old.element_query.clone(),
+                    search: old.search.clone(),
                     limits: old.limits,
                     accessibility_ready: false,
                     accessibility_reason: Some(
@@ -3719,13 +4627,32 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                 },
             ));
         };
+        let target_changed = old
+            .target_ref
+            .as_ref()
+            .is_some_and(|previous| previous != target);
+        let mut limits = old.limits;
+        if target_changed && old.view == AccessibilityScope::Interactive {
+            // Start a new exact window with a concise navigation readback.
+            // Explicit observations can request more; normal truncation stays visible.
+            limits.nodes = limits.nodes.min(24);
+        }
         let mut snapshot = self
             .collect_snapshot_from_apps(
                 apps,
                 binding,
                 old.view,
-                old.element_query.clone(),
-                old.limits,
+                if target_changed {
+                    None
+                } else {
+                    old.element_query.clone()
+                },
+                limits,
+                if target_changed {
+                    None
+                } else {
+                    old.search.clone()
+                },
             )
             .await?;
         snapshot.target_ref = Some(target.clone());
@@ -4179,6 +5106,7 @@ impl<A: AccessibilityAdapter, S: ScreenshotProvider> SemanticRuntime<A, S> {
                     nodes: max_nodes.unwrap_or(self.config.default_max_nodes),
                     depth: max_depth.unwrap_or(self.config.default_max_depth),
                 },
+                None,
             )
             .await?;
         let mut snapshot = snapshot;
@@ -4306,6 +5234,79 @@ struct Traversal {
     elements: Vec<ElementSnapshot>,
     node_limit_reached: bool,
     depth_limit_reached: bool,
+    evidence: TraversalEvidence,
+}
+
+impl TraversalEvidence {
+    fn as_json(&self) -> Value {
+        json!({"visited_nodes": self.visited_nodes, "detailed_nodes": self.detailed_nodes,
+            "truncated": self.truncated, "stop_reason": self.stop_reason})
+    }
+
+    fn stop(&mut self, reason: &'static str) {
+        self.truncated = true;
+        // A deadline/result/output limit is the terminal stop, whereas skipped
+        // subtrees and unreadable children may be followed by useful matches.
+        if self.stop_reason.is_none() || matches!(reason, "timeout" | "result_limit" | "node_limit")
+        {
+            self.stop_reason = Some(reason);
+        }
+    }
+}
+
+fn is_collection(role: &str) -> bool {
+    matches!(
+        role.to_ascii_lowercase().as_str(),
+        "list" | "list box" | "table" | "tree" | "tree table" | "scroll pane"
+    )
+}
+
+fn discovery_rank(node: &NodeInfo, in_collection: bool) -> u8 {
+    if node.states.contains("focused") {
+        return 0;
+    }
+    if !node.states.contains("showing") {
+        return 5;
+    }
+    if !in_collection && is_collection(&node.role) && node.children.len() <= 16 {
+        return 1;
+    }
+    let interactive = node
+        .states
+        .iter()
+        .any(|s| matches!(s.as_str(), "focusable" | "editable" | "checkable"))
+        || matches!(
+            node.role.as_str(),
+            "push button"
+                | "button"
+                | "entry"
+                | "check box"
+                | "combo box"
+                | "radio button"
+                | "toggle button"
+                | "slider"
+                | "spin button"
+        );
+    match (in_collection, interactive) {
+        (false, true) => 1,
+        (false, false) => 2,
+        (true, true) => 3,
+        (true, false) => 4,
+    }
+}
+
+fn search_matches(search: &AccessibilitySearch, node: &NodeInfo) -> bool {
+    search
+        .role
+        .as_ref()
+        .is_none_or(|role| role.to_lowercase() == node.role.to_lowercase())
+        && search.name.as_ref().is_none_or(|name| {
+            if search.exact {
+                name.to_lowercase() == node.name.to_lowercase()
+            } else {
+                node.name.to_lowercase().contains(&name.to_lowercase())
+            }
+        })
 }
 
 fn window_is_viable(window: &WindowInfo) -> bool {
@@ -4386,14 +5387,12 @@ fn semantic_action(
                         "AT-SPI action capability inspection failed for the target element",
                     )
                 })?;
-            let matches: Vec<_> = named_actions(actions)
-                .filter(|(_, action)| action.name == requested)
-                .collect();
-            match matches.as_slice() {
-                [(index, _)] => i32::try_from(*index)
+            let mut matches = named_actions(actions).filter(|(_, action)| action.name == requested);
+            match (matches.next(), matches.next()) {
+                (Some((index, _)), None) => i32::try_from(index)
                     .map(SemanticAction::InvokeAction)
                     .map_err(|_| operational_error("AT-SPI action index overflow")),
-                [] => Err(operational_error(format!(
+                (None, _) => Err(operational_error(format!(
                     "named action {requested:?} is not exposed by the element"
                 ))),
                 _ => Err(operational_error(format!(
@@ -4404,10 +5403,10 @@ fn semantic_action(
         ElementAction::Focus => {
             if !element.node.supports_focus() {
                 return Err(capability_error(
-                    "element does not expose AT-SPI Component with the focusable state",
+                    "semantic focus is unavailable for this element; use a fresh screenshot-grounded point instead",
                 ));
             }
-            Ok(SemanticAction::GrabFocus)
+            focus_dispatch(&element.node)
         }
         ElementAction::SetValue(value) => {
             if !element.node.capabilities.interfaces_inspected() {
@@ -4433,6 +5432,33 @@ fn semantic_action(
                 )),
             }
         }
+    }
+}
+
+fn focus_dispatch(node: &NodeInfo) -> Result<SemanticAction, RuntimeError> {
+    // Select once from this exact object's fresh capabilities, before mutation.
+    // Qt can advertise Set Focus while refusing Component.GrabFocus.
+    let mut matches = node
+        .capabilities
+        .actions()
+        .iter()
+        .enumerate()
+        .filter(|(_, action)| action.name == "Set Focus");
+    match (matches.next(), matches.next()) {
+        (Some((index, _)), None) => i32::try_from(index)
+            .map(SemanticAction::InvokeAction)
+            .map_err(|_| operational_error("AT-SPI focus action index overflow")),
+        (None, _) => match &node.capabilities {
+            NodeCapabilities::Inspected(InspectedCapabilities { focus: true, .. }) => {
+                Ok(SemanticAction::GrabFocus)
+            }
+            _ => Err(capability_error(
+                "Component.GrabFocus is unavailable for this exact object; use a fresh screenshot-grounded point focus, not another semantic focus attempt",
+            )),
+        },
+        _ => Err(capability_error(
+            "element advertises ambiguous Set Focus actions",
+        )),
     }
 }
 
@@ -4468,29 +5494,7 @@ pub fn format_snapshot(snapshot: &Snapshot) -> String {
 }
 
 fn format_snapshot_with_budget(snapshot: &Snapshot, max_bytes: usize) -> TextProjection {
-    let mut presented = presented_element_indices(snapshot);
-    let first = build_snapshot_text(snapshot, &presented, max_bytes);
-    let Some(position) = presented.iter().position(|index| {
-        snapshot
-            .elements
-            .get(*index)
-            .is_some_and(|element| element.node.states.contains("focused"))
-    }) else {
-        return first;
-    };
-    if position <= 1
-        || first
-            .element_ids
-            .contains(&element_id_for_snapshot(snapshot, presented[position]))
-    {
-        return first;
-    }
-
-    // Preserve the root and focused element when a response budget forces a
-    // choice.  The normal order remains unchanged whenever the complete
-    // observation fits.
-    presented[1..=position].rotate_right(1);
-    build_snapshot_text(snapshot, &presented, max_bytes)
+    build_snapshot_text(snapshot, &prioritized_element_indices(snapshot), max_bytes)
 }
 
 fn build_snapshot_text(
@@ -4531,20 +5535,50 @@ fn build_snapshot_text(
     let mut selected = None;
     let mut element_ids = Vec::new();
     let mut fields_truncated = false;
+    let context = contextual_labels(snapshot);
+    if !context.is_empty() {
+        let line = format!(
+            "Visible text (fresh AT-SPI readback): {}\n",
+            serde_json::to_string(&context).expect("strings serialize")
+        );
+        if line.len() <= body_budget / 4 && output.len().saturating_add(line.len()) <= body_budget {
+            output.push_str(&line);
+        } else {
+            fields_truncated = true;
+        }
+    }
+    let mut lines = Vec::new();
+    let mut used_bytes = output.len();
+    // Advisory application guidance only, never target/input authority. Do not
+    // change user preferences or silently normalize exact requested contents.
+    if snapshot.app.name.eq_ignore_ascii_case("kwrite") {
+        let note = "Exact-save note: KWrite may append a final newline. Inspect Open/Save options before the first exact-content save. No preference changes are automatic.\n";
+        if used_bytes.saturating_add(note.len()) <= body_budget {
+            output.push_str(note);
+            used_bytes += note.len();
+        }
+    }
     for index in element_indexes {
         let Some(element) = snapshot.elements.get(*index) else {
             eprintln!("computer-use-mcp: snapshot element index disappeared during formatting");
             continue;
         };
-        let remaining = body_budget.saturating_sub(output.len());
+        let remaining = body_budget.saturating_sub(used_bytes);
         let Some((line, line_truncated)) =
             fit_element_text_line(snapshot, *index, element, remaining)
         else {
             break;
         };
-        output.push_str(&line);
-        element_ids.push(element_id_for_snapshot(snapshot, *index));
+        used_bytes += line.len();
+        lines.push((*index, line));
         fields_truncated |= line_truncated;
+    }
+    // Select by priority, but render the surviving exact elements in tree order.
+    lines.sort_by_key(|(index, _)| *index);
+    for (index, line) in lines {
+        let element = &snapshot.elements[index];
+        output.push_str(&line);
+        element_ids.push(element_id_for_snapshot(snapshot, index));
         if element.node.states.contains("focused") {
             focused = element_ids.last().cloned();
         }
@@ -4576,6 +5610,15 @@ fn build_snapshot_text(
     }
     if snapshot.depth_limit_reached {
         append_optional("Warning: accessibility tree depth limit reached.\n".into());
+    }
+    if snapshot.traversal.truncated || snapshot.search.is_some() {
+        append_optional(format!(
+            "Accessibility traversal: visited={} detailed={} incomplete={} stop_reason={}. An incomplete search does not establish absence.\n",
+            snapshot.traversal.visited_nodes,
+            snapshot.traversal.detailed_nodes,
+            snapshot.traversal.truncated,
+            snapshot.traversal.stop_reason.unwrap_or("complete")
+        ));
     }
 
     let elements_omitted = element_indexes.len().saturating_sub(element_ids.len());
@@ -4654,7 +5697,9 @@ fn element_text_line(
         .value
         .as_deref()
         .or(element.node.text.as_deref());
-    if let Some(value) = displayed {
+    if let Some(value) = displayed.filter(|value| {
+        *value != element.node.name || element.node.capabilities.set_value_kind().is_some()
+    }) {
         let (value, value_truncated) = value_field(value);
         truncated_fields |= value_truncated;
         output.push_str(&format!(" value=\"{value}\""));
@@ -4662,21 +5707,66 @@ fn element_text_line(
     if element.node.text_truncated == Some(true) {
         output.push_str(" text_truncated=true");
     }
+    if matches!(
+        element.node.role.as_str(),
+        "check box" | "radio button" | "toggle button" | "switch"
+    ) || element.node.states.contains("checkable")
+    {
+        output.push_str(&format!(
+            " checked={}",
+            element.node.states.contains("checked")
+        ));
+    }
+    for state in ["indeterminate", "selected", "expanded", "busy", "invalid"] {
+        if element.node.states.contains(state) {
+            output.push_str(&format!(" {state}=true"));
+        }
+    }
     let capabilities = text_capabilities(element);
     if !capabilities.is_empty() {
         output.push_str(" capabilities=[");
         output.push_str(&capabilities.join(", "));
         output.push(']');
     }
-    let actions = named_actions(element.node.capabilities.actions())
+    let primary = primary_action_index(element.node.capabilities.actions());
+    if let Some(action) = primary.and_then(|index| element.node.capabilities.actions().get(index))
+        && !action.keybinding.is_empty()
+    {
+        let binding = field(&action.keybinding, &mut truncated_fields);
+        output.push_str(&format!(" keybinding=\"{binding}\""));
+    }
+    if primary.is_none()
+        && matches!(
+            element.node.role.as_str(),
+            "page tab" | "check box" | "combo box"
+        )
+        && matches!(
+            &element.node.capabilities,
+            NodeCapabilities::Inspected(InspectedCapabilities {
+                actions: ActionCapabilities::Inspected(_) | ActionCapabilities::Unsupported,
+                ..
+            })
+        )
+    {
+        output.push_str(" invoke=unsupported");
+        if element.node.role == "page tab" {
+            output.push_str(" navigate=focused_parent_tab_list_keyboard");
+        }
+    }
+    let mut supplementary = supplementary_actions(
+        element.node.capabilities.actions(),
+        element.node.supports_focus(),
+    );
+    let actions = supplementary
+        .by_ref()
         .take(MAX_MODEL_ACTIONS)
-        .map(|(_, action)| {
+        .map(|action| {
             let name = field(&action.name, &mut truncated_fields);
-            let description = field(&action.description, &mut truncated_fields);
-            if description.is_empty() {
+            if action.keybinding.is_empty() {
                 format!("{{name=\"{name}\"}}")
             } else {
-                format!("{{name=\"{name}\", description=\"{description}\"}}")
+                let binding = field(&action.keybinding, &mut truncated_fields);
+                format!("{{name=\"{name}\", keybinding=\"{binding}\"}}")
             }
         })
         .collect::<Vec<_>>();
@@ -4685,12 +5775,50 @@ fn element_text_line(
         output.push_str(&actions.join(", "));
         output.push(']');
     }
-    if element.node.capabilities.actions().len() > MAX_MODEL_ACTIONS {
+    if supplementary.next().is_some() {
         output.push_str(" named_actions_truncated=true");
         truncated_fields = true;
     }
     output.push('\n');
     (output, truncated_fields)
+}
+
+fn contextual_labels(snapshot: &Snapshot) -> Vec<String> {
+    if snapshot.view != AccessibilityScope::Interactive
+        || snapshot.element_query.is_some()
+        || snapshot.search.is_some()
+    {
+        return Vec::new();
+    }
+    let mut names: BTreeSet<_> = presented_elements(snapshot)
+        .map(|(_, element)| element.node.name.as_str())
+        .collect();
+    // Supplemental labels must not crowd the structured envelope out before
+    // control selection. Count escaped JSON bytes, not Unicode scalars.
+    let mut bytes = 2;
+    snapshot
+        .elements
+        .iter()
+        .filter_map(|element| {
+            let node = &element.node;
+            (matches!(
+                node.role.as_str(),
+                "label" | "heading" | "status bar" | "notification"
+            ) && node.states.contains("showing")
+                && !node.name.is_empty()
+                && names.insert(node.name.as_str()))
+            .then(|| truncate(&node.name, MAX_MODEL_FIELD_CHARS))
+        })
+        .filter(|name| {
+            let cost = json!(name).to_string().len() + usize::from(bytes > 2);
+            if bytes + cost > MAX_MODEL_CONTEXT_BYTES {
+                return false;
+            }
+            bytes += cost;
+            true
+        })
+        .take(8)
+        .collect()
 }
 
 /// Outcome of the advisory observe crop. The model always receives a PNG
@@ -5061,13 +6189,22 @@ fn element_capabilities_for_snapshot_with_limit(
         field_limit,
         MAX_MODEL_STATES,
     );
-    let (named_actions, actions_truncated) = bounded_named_actions(actions, field_limit);
+    let (named_actions, actions_truncated) =
+        bounded_named_actions(actions, field_limit, element.node.supports_focus());
+    let (keybinding, binding_truncated) = primary_action_index(actions)
+        .and_then(|index| actions.get(index))
+        .filter(|action| !action.keybinding.is_empty())
+        .map_or((None, false), |action| {
+            let (binding, truncated) = response_field(&action.keybinding, field_limit);
+            (Some(binding), truncated)
+        });
     let fields_truncated = role_truncated
         || name_truncated
         || value_truncated
         || text_truncated
         || states_truncated
-        || actions_truncated;
+        || actions_truncated
+        || binding_truncated;
     let mut fields = json!({
         "element_id": element_id,
         "depth": element.depth,
@@ -5090,6 +6227,9 @@ fn element_capabilities_for_snapshot_with_limit(
     let object = fields
         .as_object_mut()
         .expect("element fields are an object");
+    if let Some(binding) = keybinding {
+        object.insert("keybinding".into(), json!(binding));
+    }
     object.retain(|_, value| !value.is_null());
     for key in [
         "text_truncated",
@@ -5139,20 +6279,42 @@ fn bounded_response_strings<'a>(
     (values, truncated)
 }
 
-fn bounded_named_actions(actions: &[ActionInfo], field_limit: usize) -> (Vec<Value>, bool) {
-    let mut truncated = actions.len() > MAX_MODEL_ACTIONS;
-    let actions = actions
-        .iter()
+fn supplementary_actions(actions: &[ActionInfo], focus: bool) -> impl Iterator<Item = &ActionInfo> {
+    let primary = primary_action_index(actions);
+    named_actions(actions)
+        .filter(move |(index, action)| {
+            Some(*index) != primary && !(focus && action.name == "Set Focus")
+        })
+        .map(|(_, action)| action)
+}
+
+fn bounded_named_actions(
+    actions: &[ActionInfo],
+    field_limit: usize,
+    focus: bool,
+) -> (Vec<Value>, bool) {
+    let mut supplementary = supplementary_actions(actions, focus);
+    let mut truncated = false;
+    let actions = supplementary
+        .by_ref()
         .take(MAX_MODEL_ACTIONS)
         .map(|action| {
             let (name, name_truncated) = response_field(&action.name, field_limit);
             let (description, description_truncated) =
                 response_field(&action.description, field_limit);
-            truncated |= name_truncated || description_truncated;
-            json!({"name": name, "description": description})
+            let (binding, binding_truncated) = response_field(&action.keybinding, field_limit);
+            truncated |= name_truncated || description_truncated || binding_truncated;
+            let mut fields = json!({"name": name});
+            if !description.is_empty() {
+                fields["description"] = json!(description);
+            }
+            if !binding.is_empty() {
+                fields["keybinding"] = json!(binding);
+            }
+            fields
         })
         .collect();
-    (actions, truncated)
+    (actions, truncated || supplementary.next().is_some())
 }
 
 #[cfg(test)]
@@ -5307,7 +6469,7 @@ fn build_observation_structured(
     };
     let accessibility_scope = snapshot.view.as_str();
     let text_limit = (snapshot.limits.text != usize::MAX).then_some(snapshot.limits.text);
-    let element_indexes = presented_element_indices(snapshot);
+    let element_indexes = prioritized_element_indices(snapshot);
     let build = |elements: &[Value], truncation: ResponseTruncation| {
         let truncation_json = truncation.json();
         json!({
@@ -5322,6 +6484,9 @@ fn build_observation_structured(
                 "reason": accessibility_reason,
                 "scope": accessibility_scope,
                 "query": snapshot.element_query,
+                "search": snapshot.search.as_ref().map(AccessibilitySearch::as_json),
+                "traversal": snapshot.traversal.as_json(),
+                "context": contextual_labels(snapshot),
                 "truncated": truncation.truncated,
                 "truncation_reason": truncation.truncated.then_some("response_byte_budget"),
                 "limits": {
@@ -5342,39 +6507,7 @@ fn build_observation_structured(
             "png": Value::Null
         })
     };
-    let (structured, truncation) =
-        fit_structured_elements(snapshot, &element_indexes, max_bytes, build);
-    let focused = element_indexes.iter().copied().find(|index| {
-        snapshot
-            .elements
-            .get(*index)
-            .is_some_and(|element| element.node.states.contains("focused"))
-    });
-    if truncation.truncated
-        && focused.is_some_and(|index| {
-            let element_id = element_id_for_snapshot(snapshot, index);
-            !structured["elements"].as_array().is_some_and(|elements| {
-                elements
-                    .iter()
-                    .any(|element| element["element_id"] == element_id)
-            })
-        })
-    {
-        let focused = focused.expect("focused element was checked");
-        let mut prioritized = Vec::with_capacity(element_indexes.len());
-        if let Some(root) = element_indexes.first().copied() {
-            prioritized.push(root);
-        }
-        prioritized.push(focused);
-        let rest = element_indexes
-            .iter()
-            .copied()
-            .filter(|index| !prioritized.contains(index))
-            .collect::<Vec<_>>();
-        prioritized.extend(rest);
-        return fit_structured_elements(snapshot, &prioritized, max_bytes, build).0;
-    }
-    structured
+    fit_structured_elements(snapshot, &element_indexes, max_bytes, build).0
 }
 
 fn fit_structured_elements<F>(
@@ -5407,7 +6540,10 @@ where
                 element,
                 candidate_limit,
             );
-            let mut candidate_elements = included.clone();
+            let mut candidate_elements = included
+                .iter()
+                .map(|(_, value): &(usize, Value)| value.clone())
+                .collect::<Vec<_>>();
             candidate_elements.push(element_value.clone());
             let provisional = ResponseTruncation {
                 truncated: true,
@@ -5434,8 +6570,13 @@ where
             break;
         };
         fields_truncated |= element_truncated;
-        included.push(element);
+        included.push((*index, element));
     }
+    included.sort_by_key(|(index, _)| *index);
+    let included = included
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect::<Vec<_>>();
     let truncation = ResponseTruncation {
         truncated: included.len() < element_indexes.len() || fields_truncated,
         fields_truncated,
@@ -5461,6 +6602,32 @@ fn presented_element_indices(snapshot: &Snapshot) -> Vec<usize> {
     presented_elements(snapshot)
         .map(|(index, _)| index)
         .collect()
+}
+
+fn prioritized_element_indices(snapshot: &Snapshot) -> Vec<usize> {
+    let mut ancestors: Vec<(usize, bool)> = Vec::new();
+    let mut ranks = Vec::with_capacity(snapshot.elements.len());
+    for (index, element) in snapshot.elements.iter().enumerate() {
+        while ancestors
+            .last()
+            .is_some_and(|(depth, _)| *depth >= element.depth)
+        {
+            ancestors.pop();
+        }
+        let in_collection = ancestors.last().is_some_and(|(_, collection)| *collection);
+        ranks.push(if index == 0 && element.depth == 0 {
+            0
+        } else {
+            1 + discovery_rank(&element.node, in_collection)
+        });
+        ancestors.push((
+            element.depth,
+            in_collection || is_collection(&element.node.role),
+        ));
+    }
+    let mut indexes = presented_element_indices(snapshot);
+    indexes.sort_by_key(|index| (ranks[*index], *index));
+    indexes
 }
 
 fn observation_id_for_snapshot(snapshot: &Snapshot) -> String {
@@ -5537,6 +6704,20 @@ fn element_is_presented_with_query(
 }
 
 fn is_interactive(element: &ElementSnapshot) -> bool {
+    let node = &element.node;
+    if matches!(node.role.as_str(), "filler" | "panel" | "section")
+        && node.name.is_empty()
+        && node.value.as_deref().is_none_or(str::is_empty)
+        && node.text.as_deref().is_none_or(str::is_empty)
+        && node.capabilities.set_value_kind().is_none()
+        && node
+            .capabilities
+            .actions()
+            .iter()
+            .all(|action| action.name == "Set Focus")
+    {
+        return false;
+    }
     if !element.node.capabilities.actions().is_empty()
         || element.node.capabilities.set_value_kind().is_some()
     {
@@ -5717,6 +6898,9 @@ fn same_snapshot_content(left: &Snapshot, right: &Snapshot) -> bool {
         && left.element_query == right.element_query
         && left.elements == right.elements
         && left.node_limit_reached == right.node_limit_reached
+        && left.search == right.search
+        && left.traversal.truncated == right.traversal.truncated
+        && left.traversal.stop_reason == right.traversal.stop_reason
         && left.depth_limit_reached == right.depth_limit_reached
         && left.limits == right.limits
 }
@@ -5903,6 +7087,39 @@ fn annotate_action_output_with_progress(
                     }
                     focus
                 }
+                // No focus was requested or moved: the target window was read
+                // active (or just clicked) and its own current focus received
+                // the keys. Which element that is was not verified.
+                KeyboardFocus::Window => {
+                    let mut focus = json!({
+                        "requested": false,
+                        "focus_kind": "window",
+                        "point": null,
+                        "element_focused": null,
+                        "window_active": true,
+                        "replacement_element_id": null,
+                        "seat_focus": "not_observable",
+                        "application_delivery": "not_observable",
+                        "text_delivery": "not_observable",
+                        "click": {
+                            "requested": false,
+                            "sent": false,
+                            "flushed": false
+                        },
+                        "barriers": {
+                            "focus_click_completed": false,
+                            "between_events_completed": phase_syncs,
+                            "cleanup_barrier_completed": true,
+                            "meaning": "protocol_synchronization_only"
+                        }
+                    });
+                    if let Some(age) = focus_grace {
+                        focus["window_active"] = Value::Null;
+                        focus["verification"] = Value::String("click_grace".into());
+                        focus["grace_age_ms"] = json!(age.as_millis());
+                    }
+                    focus
+                }
             }
         }
         _ => json!({
@@ -5934,6 +7151,10 @@ fn annotate_action_output_with_progress(
                     None => format!(
                         " focus=semantic({element_id}) focus_verified=element_focused,window_active",
                     ),
+                },
+                KeyboardFocus::Window => match focus_grace {
+                    Some(age) => format!(" focus=window focus_grace(age_ms={})", age.as_millis()),
+                    None => " focus=window focus_verified=window_active".to_owned(),
                 },
             };
             if let ActOperation::Keyboard { events, .. } = operation {
@@ -5968,6 +7189,14 @@ fn annotate_action_output_with_progress(
         replacement_element_id.unwrap_or("none"),
     );
     let mut suffix = action_line;
+    if replacement_snapshot
+        .and_then(|snapshot| snapshot.target_ref.as_ref())
+        .is_some_and(|next| next != target)
+    {
+        suffix.push_str(
+            " target_changed=true; use the replacement target above (no input was retargeted)",
+        );
+    }
     if matches!(operation, ActOperation::Paste { .. }) {
         suffix.push_str(&format!(
             " paste={}",
@@ -5982,6 +7211,29 @@ fn annotate_action_output_with_progress(
     let (prefix, text_truncated) = fit_text_prefix(&output.text, text_budget);
     output.text = format!("{prefix}{suffix}");
     let mut delivery = match operation {
+        ActOperation::Keyboard {
+            focus: KeyboardFocus::Window,
+            ..
+        }
+        | ActOperation::Paste {
+            focus: KeyboardFocus::Window,
+            ..
+        } => {
+            let mut delivery = json!({
+                "mechanism": "eis_type_into_active_window",
+                "focus_verified": false,
+                "window_active_verified": true,
+                "pointer_moved": false,
+                "application_delivery": "not_observable",
+                "text_delivery": "not_observable"
+            });
+            if let Some(age) = focus_grace {
+                delivery["window_active_verified"] = Value::Bool(false);
+                delivery["verification"] = Value::String("click_grace".into());
+                delivery["grace_age_ms"] = json!(age.as_millis());
+            }
+            delivery
+        }
         ActOperation::Keyboard {
             focus: KeyboardFocus::Semantic { .. },
             ..
@@ -6037,6 +7289,7 @@ fn annotate_action_output_with_progress(
         },
         "replacement_observation_id": replacement_observation_id,
         "replacement_frame_id": replacement_frame_id,
+        "replacement_target": replacement_snapshot.and_then(|snapshot| snapshot.target_ref.as_ref()).map(TargetRef::as_json),
         "replacement_element_id": replacement_element_id
     });
     action_structured["focus"] = focus;
@@ -6467,6 +7720,18 @@ fn desktop_session_error(code: &'static str, message: impl Into<String>) -> Runt
     )
 }
 
+/// Window-focus typing refuses a window that is not active: its keys would
+/// land in whatever other window holds the seat. Nothing was dispatched.
+fn inactive_window_focus_error() -> RuntimeError {
+    RuntimeError::new(
+        "target_unavailable",
+        "target window is not active, so its current focus cannot receive keys",
+        ToolOutcome::NotStarted,
+        true,
+        "activate_window this target and retry, or give focus {\"type\":\"semantic\",\"element_id\":…} to focus one element.",
+    )
+}
+
 /// Refusal for mutations targeting protected system surfaces (privilege
 /// escalation, permission portals, password askers, screen lockers,
 /// pinentry). Returned before any EIS/AT-SPI dispatch with outcome
@@ -6484,6 +7749,15 @@ fn protected_surface_error() -> RuntimeError {
 fn generated_input_error(message: String) -> RuntimeError {
     if is_physical_input_refusal(&message) {
         return RuntimeError::human_input_busy();
+    }
+    if message.contains("active EIS keymap cannot represent keysym") {
+        return RuntimeError::new(
+            "unsupported_input",
+            message,
+            ToolOutcome::NotStarted,
+            false,
+            "The negotiated EIS keymap cannot emit this text. Do not repeat the same typing. Portal paste is an alternative only if the application accepts paste; a raw key-event canvas may not. Observe before choosing another supported strategy.",
+        );
     }
     if message.starts_with(SESSION_UNAVAILABLE) {
         desktop_session_error("backend_failed", message)
@@ -6858,7 +8132,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn atspi_activation_dispatches_even_when_already_active_without_verified_claims() {
+    async fn atspi_activation_short_circuits_when_fresh_catalog_shows_the_window_active() {
         let fake = FakeAdapter::tree();
         let runtime = fake_runtime(fake.clone());
         let listed = runtime
@@ -6890,27 +8164,82 @@ pub(crate) mod tests {
             .unwrap();
         let structured = output.structured_content.expect("activation evidence");
         assert_eq!(structured["backend"], "atspi");
-        assert_eq!(structured["status"], "atspi_active_observed");
+        assert_eq!(structured["status"], "already_active");
         assert_eq!(structured["before_active"], true);
         assert_eq!(structured["after_active"], true);
         assert_eq!(structured["atspi_active_observed"], true);
         assert_eq!(structured["protocol_state_verified"], false);
         assert_eq!(structured["seat_focus"], "not_observable");
-        assert_eq!(structured["dispatch"]["request_accepted"], true);
-        assert_eq!(structured["dispatch"]["protocol_request_sent"], true);
-        assert_eq!(structured["dispatch"]["request_flushed"], false);
+        assert_eq!(structured["dispatch"]["request_accepted"], false);
+        assert_eq!(structured["dispatch"]["protocol_request_sent"], false);
         assert!(structured.get("verified").is_none());
-        assert!(output.text.contains("status=atspi_active_observed"));
-        assert_eq!(fake.state.lock().unwrap().activation_calls, [id("root")]);
+        assert!(output.text.contains("status=already_active"));
+        // No GrabFocus is dispatched for a state the fresh catalog already shows.
+        assert!(fake.state.lock().unwrap().activation_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn element_ids_stay_bound_to_the_same_object_across_same_window_observations() {
+        let fake = FakeAdapter::tree();
+        let runtime = fake_runtime(fake.clone());
+        let first = requested_snapshot(&runtime, ObserveView::Both, None).await;
+        let second = requested_snapshot(&runtime, ObserveView::Both, None).await;
+        assert_ne!(first.generation, second.generation);
+        assert_eq!(first.element_ids, second.element_ids);
+        assert_eq!(
+            first.element_ids.len(),
+            first.element_ids.iter().collect::<BTreeSet<_>>().len(),
+            "IDs are unique within one snapshot"
+        );
+        // The evicted older same-window snapshot is gone, but the retained one
+        // still binds the stable ID to the exact object.
+        assert!(
+            runtime
+                .required_cached(&observation_id_for_snapshot(&first))
+                .is_err()
+        );
+        let button = first
+            .elements
+            .iter()
+            .position(|element| element.node.object == id("button"))
+            .unwrap();
+        assert_eq!(
+            cached_element(&second, &first.element_ids[button])
+                .unwrap()
+                .node
+                .object,
+            id("button")
+        );
+        // A newly published object gets a fresh ID; existing bindings persist.
+        {
+            let mut state = fake.state.lock().unwrap();
+            let mut fresh = node("fresh", "button", "Fresh");
+            fresh.states.insert("showing".into());
+            state
+                .nodes
+                .get_mut(&id("root"))
+                .unwrap()
+                .children
+                .push(fresh.object.clone());
+            state.nodes.insert(fresh.object.clone(), fresh);
+        }
+        let third = requested_snapshot(&runtime, ObserveView::Both, None).await;
+        let fresh = third
+            .elements
+            .iter()
+            .position(|element| element.node.object == id("fresh"))
+            .unwrap();
+        assert!(!first.element_ids.contains(&third.element_ids[fresh]));
+        assert_eq!(third.element_ids[button], first.element_ids[button]);
     }
 
     fn paste_call(observation_id: String, frame_id: Option<String>, text: &str) -> ToolCall {
         ToolCall::Act {
-            target: test_target(),
-            source: ObservationRef {
+            target: Some(test_target()),
+            source: Some(ObservationRef {
                 observation_id,
                 frame_id,
-            },
+            }),
             operation: ActOperation::Paste {
                 focus: KeyboardFocus::Point(KeyboardPoint { x: 1.0, y: 2.0 }),
                 text: text.into(),
@@ -7629,16 +8958,20 @@ pub(crate) mod tests {
             ActionInfo {
                 name: String::new(),
                 description: String::new(),
+                keybinding: String::new(),
             },
             ActionInfo {
                 name: "menu".into(),
                 description: "Show\nmenu".into(),
+                keybinding: String::new(),
             },
         ]));
         let snapshot = Snapshot {
             view: AccessibilityScope::Full,
             element_query: None,
             app: app("Editor", 1, "Main"),
+            search: None,
+            traversal: TraversalEvidence::default(),
             window: window("Main", &["active"]),
             generation: 2,
             elements: vec![ElementSnapshot { depth: 0, node }],
@@ -7660,7 +8993,8 @@ pub(crate) mod tests {
         let text = format_snapshot(&snapshot);
         assert!(text.contains("line\\r\\n\\\"name"));
         assert!(text.contains("value=\"é🙂…\""));
-        assert!(text.contains("named_actions=[{name=\"menu\", description=\"Show\\nmenu\"}]"));
+        assert!(text.contains("named_actions=[{name=\"menu\"}]"));
+        assert!(!text.contains("Show\\nmenu"));
         assert!(text.contains("Focused element: e-0000000000000000"));
         assert!(text.contains("Selected text: \"a\\n…\""));
         assert!(text.contains("node limit"));
@@ -7981,10 +9315,12 @@ pub(crate) mod tests {
             ActionInfo {
                 name: "show menu".into(),
                 description: String::new(),
+                keybinding: String::new(),
             },
             ActionInfo {
                 name: "activate".into(),
                 description: String::new(),
+                keybinding: String::new(),
             },
         ]));
         assert_eq!(
@@ -7994,6 +9330,7 @@ pub(crate) mod tests {
         target.node.capabilities = inspected(ActionCapabilities::Inspected(vec![ActionInfo {
             name: String::new(),
             description: String::new(),
+            keybinding: String::new(),
         }]));
         assert_eq!(
             semantic_action(ElementAction::Invoke, &target).unwrap(),
@@ -8003,16 +9340,19 @@ pub(crate) mod tests {
             ActionInfo {
                 name: String::new(),
                 description: String::new(),
+                keybinding: String::new(),
             },
             ActionInfo {
                 name: String::new(),
                 description: String::new(),
+                keybinding: String::new(),
             },
         ]));
         assert!(semantic_action(ElementAction::Invoke, &target).is_err());
         target.node.capabilities = inspected(ActionCapabilities::Inspected(vec![ActionInfo {
             name: "custom".into(),
             description: String::new(),
+            keybinding: String::new(),
         }]));
         assert!(semantic_action(ElementAction::Invoke, &target).is_err());
         target.node.capabilities = inspected(ActionCapabilities::Inspected(vec![]));
@@ -8020,6 +9360,7 @@ pub(crate) mod tests {
         target.node.capabilities = NodeCapabilities::Inspected(InspectedCapabilities {
             actions: ActionCapabilities::InspectionFailed,
             component: true,
+            focus: true,
             editable_text: false,
             value: false,
         });
@@ -8038,6 +9379,31 @@ pub(crate) mod tests {
         assert!(semantic_action(ElementAction::Invoke, &target).is_err());
         target.node.capabilities = NodeCapabilities::InspectionFailed;
         assert!(semantic_action(ElementAction::Focus, &target).is_err());
+    }
+
+    #[test]
+    fn native_value_commits_numeric_widgets_instead_of_their_line_editor() {
+        let mut info = node("spin", "spin button", "Units");
+        info.capabilities = NodeCapabilities::Inspected(InspectedCapabilities {
+            actions: ActionCapabilities::Unsupported,
+            component: true,
+            focus: true,
+            editable_text: true,
+            value: true,
+        });
+        let element = ElementSnapshot {
+            depth: 0,
+            node: info,
+        };
+        assert_eq!(
+            element.node.capabilities.set_value_kind(),
+            Some(SetValueKind::Number)
+        );
+        assert_eq!(
+            semantic_action(ElementAction::SetValue("6".into()), &element).unwrap(),
+            SemanticAction::SetNumericValue(6.0)
+        );
+        assert!(semantic_action(ElementAction::SetValue("NaN".into()), &element).is_err());
     }
 
     #[test]
@@ -8070,7 +9436,251 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn traversal_is_depth_first_deterministic_and_bounded() {
+    async fn inactive_tab_contents_are_scoped_out_but_tabs_remain_for_navigation() {
+        let fake = FakeAdapter::tree();
+        {
+            let mut state = fake.state.lock().unwrap();
+            for (path, child, selected) in
+                [("first-tab", "edit", true), ("second-tab", "button", false)]
+            {
+                let mut tab = node(path, "page tab", path);
+                tab.states.extend(["showing".into(), "selectable".into()]);
+                if selected {
+                    tab.states.insert("selected".into());
+                }
+                tab.children.push(id(child));
+                state.nodes.insert(tab.object.clone(), tab);
+            }
+            state.nodes.get_mut(&id("root")).unwrap().children =
+                vec![id("first-tab"), id("second-tab")];
+        }
+        let window = fake.state.lock().unwrap().app.windows[0].clone();
+        let runtime = fake_runtime(fake.clone());
+        let limits = SnapshotLimits {
+            text: 50,
+            nodes: 40,
+            depth: 64,
+        };
+        let visible = runtime
+            .traverse(
+                &window,
+                AccessibilityScope::Visible,
+                limits,
+                MAX_CACHED_SNAPSHOT_STRING_BYTES,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            visible
+                .elements
+                .iter()
+                .any(|e| e.node.object == id("second-tab"))
+        );
+        assert!(visible.elements.iter().any(|e| e.node.object == id("edit")));
+        assert!(
+            !visible
+                .elements
+                .iter()
+                .any(|e| e.node.object == id("button"))
+        );
+        let full = runtime
+            .traverse(
+                &window,
+                AccessibilityScope::Full,
+                limits,
+                MAX_CACHED_SNAPSHOT_STRING_BYTES,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(full.elements.iter().any(|e| e.node.object == id("button")));
+        {
+            let mut state = fake.state.lock().unwrap();
+            state
+                .nodes
+                .get_mut(&id("first-tab"))
+                .unwrap()
+                .states
+                .remove("selected");
+            state
+                .nodes
+                .get_mut(&id("second-tab"))
+                .unwrap()
+                .states
+                .insert("selected".into());
+        }
+        let switched = runtime
+            .traverse(
+                &window,
+                AccessibilityScope::Interactive,
+                limits,
+                MAX_CACHED_SNAPSHOT_STRING_BYTES,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            switched
+                .elements
+                .iter()
+                .any(|e| e.node.object == id("button"))
+        );
+        assert!(
+            !switched
+                .elements
+                .iter()
+                .any(|e| e.node.object == id("edit"))
+        );
+        let search = AccessibilitySearch {
+            name: Some("Editor".into()),
+            role: None,
+            exact: true,
+            limit: 20,
+            max_nodes: 40,
+            timeout_ms: 2000,
+        };
+        let missing = runtime
+            .traverse(
+                &window,
+                AccessibilityScope::Interactive,
+                limits,
+                MAX_CACHED_SNAPSHOT_STRING_BYTES,
+                Some(&search),
+            )
+            .await
+            .unwrap();
+        assert!(missing.elements.is_empty());
+        assert_eq!(missing.evidence.stop_reason, Some("scope_omitted"));
+    }
+
+    #[tokio::test]
+    async fn short_navigation_survives_deep_pages_and_closed_popups_are_scoped() {
+        let fake = FakeAdapter::tree();
+        {
+            let mut state = fake.state.lock().unwrap();
+            let mut page = node("page", "panel", "Page");
+            page.states.insert("showing".into());
+            for index in 0..25 {
+                let mut control = node(&format!("control-{index}"), "button", "Setting");
+                control.states.insert("showing".into());
+                page.children.push(control.object.clone());
+                state.nodes.insert(control.object.clone(), control);
+            }
+            let mut navigation = node("navigation", "list", "Pages");
+            navigation.states.insert("showing".into());
+            navigation.children = vec![id("open-save")];
+            let mut choice = node("open-save", "list item", "Open/Save");
+            choice.states.extend(["showing".into(), "focusable".into()]);
+            let mut closed = node("closed-popup", "list", "");
+            closed.children = vec![id("button")];
+            state.nodes.get_mut(&id("root")).unwrap().children = vec![
+                page.object.clone(),
+                navigation.object.clone(),
+                closed.object.clone(),
+            ];
+            for info in [page, navigation, choice, closed] {
+                state.nodes.insert(info.object.clone(), info);
+            }
+        }
+        let window = fake.state.lock().unwrap().app.windows[0].clone();
+        let runtime = fake_runtime(fake);
+        let limits = SnapshotLimits {
+            text: 50,
+            nodes: 8,
+            depth: 64,
+        };
+        let concise = runtime
+            .traverse(
+                &window,
+                AccessibilityScope::Interactive,
+                limits,
+                MAX_CACHED_SNAPSHOT_STRING_BYTES,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            concise
+                .elements
+                .iter()
+                .any(|e| e.node.object == id("open-save"))
+        );
+        assert!(
+            concise.node_limit_reached,
+            "partial traversal must remain explicit"
+        );
+        for (scope, present) in [
+            (AccessibilityScope::Interactive, false),
+            (AccessibilityScope::Full, true),
+        ] {
+            let result = runtime
+                .traverse(
+                    &window,
+                    scope,
+                    SnapshotLimits {
+                        nodes: 100,
+                        ..limits
+                    },
+                    MAX_CACHED_SNAPSHOT_STRING_BYTES,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                result
+                    .elements
+                    .iter()
+                    .any(|e| e.node.object == id("button")),
+                present
+            );
+        }
+    }
+
+    #[test]
+    fn keybindings_are_native_bounded_metadata_and_empty_focus_panels_are_not_controls() {
+        let mut snapshot = snapshot_for_target(42, "");
+        let mut control = node("shortcut", "button", "Save");
+        control.capabilities = inspected(ActionCapabilities::Inspected(vec![ActionInfo {
+            name: "press".into(),
+            description: String::new(),
+            keybinding: ";;Ctrl+S".into(),
+        }]));
+        snapshot.elements[0].node = control;
+        let info = &snapshot.elements[0];
+        let (projected, truncated) =
+            element_capabilities_for_snapshot_with_limit(&snapshot, 0, info, 100);
+        assert!(!truncated);
+        assert_eq!(projected["keybinding"], ";;Ctrl+S");
+        assert!(
+            element_text_line(&snapshot, 0, info, 100)
+                .0
+                .contains("keybinding=\";;Ctrl+S\"")
+        );
+        assert!(element_capabilities_for_snapshot_with_limit(&snapshot, 0, info, 3).1);
+        let mut panel = node("empty-panel", "panel", "");
+        panel.states.insert("focusable".into());
+        let panel = ElementSnapshot {
+            depth: 0,
+            node: panel,
+        };
+        assert!(!is_interactive(&panel));
+        assert!(element_is_presented_with_query(
+            AccessibilityScope::Full,
+            None,
+            &panel
+        ));
+        let mut actionable = panel;
+        actionable.node.capabilities = inspected(ActionCapabilities::Inspected(vec![ActionInfo {
+            name: "Show Menu".into(),
+            description: String::new(),
+            keybinding: String::new(),
+        }]));
+        assert!(is_interactive(&actionable));
+    }
+
+    #[tokio::test]
+    async fn traversal_preserves_tree_order_after_bounded_priority_selection() {
         let fake = FakeAdapter::tree();
         {
             let mut state = fake.state.lock().unwrap();
@@ -8102,6 +9712,265 @@ pub(crate) mod tests {
         assert!(snapshot.node_limit_reached);
         assert!(snapshot.depth_limit_reached);
         assert_eq!(snapshot.elements[1].node.window_frame.unwrap().x, 10);
+    }
+
+    #[tokio::test]
+    async fn controls_after_large_collections_survive_small_output_budgets() {
+        let fake = FakeAdapter::tree();
+        let window = fake.state.lock().unwrap().app.windows[0].clone();
+        {
+            let mut state = fake.state.lock().unwrap();
+            let mut list = node("large-list", "list", "Items");
+            list.states.insert("showing".into());
+            for index in 0..2_000 {
+                let mut row = node(
+                    &format!("row-{index}"),
+                    "list item",
+                    &format!("Item {index}"),
+                );
+                row.states.insert("showing".into());
+                list.children.push(row.object.clone());
+                state.nodes.insert(row.object.clone(), row);
+            }
+            let mut footer = node("footer", "push button", "Finish");
+            footer.states.insert("showing".into());
+            state.nodes.insert(footer.object.clone(), footer);
+            state.nodes.get_mut(&window.object).unwrap().children =
+                vec![list.object.clone(), id("footer")];
+            state.nodes.insert(list.object.clone(), list);
+        }
+        let runtime = fake_runtime(fake);
+        let traversal = runtime
+            .traverse(
+                &window,
+                AccessibilityScope::Full,
+                SnapshotLimits {
+                    text: 50,
+                    nodes: 40,
+                    depth: 64,
+                },
+                MAX_CACHED_SNAPSHOT_STRING_BYTES,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(traversal.elements.len(), 40);
+        assert!(
+            traversal
+                .elements
+                .iter()
+                .any(|element| element.node.object == id("footer"))
+        );
+        assert_eq!(traversal.elements.last().unwrap().node.name, "Finish");
+        assert!(traversal.evidence.truncated);
+        assert!(traversal.evidence.visited_nodes <= 160);
+
+        // The public output has a separate byte budget after traversal. Rows
+        // must not displace the retained footer again at either projection.
+        runtime
+            .snapshot_text("Editor".into(), None, Some(40), None)
+            .await
+            .unwrap();
+        let snapshot = current_snapshot(&runtime);
+        let text = format_snapshot_with_budget(&snapshot, 1_200);
+        assert!(text.text.contains("Finish"));
+        assert!(text.text.len() <= 1_200);
+        let structured = build_observation_structured(
+            &snapshot,
+            false,
+            Some("not requested"),
+            None,
+            None,
+            &ObservationView {
+                crop: &CropReport::monitor(),
+                window_crop: None,
+            },
+            3_000,
+        );
+        assert!(json_size(&structured) <= 3_000);
+        assert_eq!(structured["truncated"], true);
+        assert_eq!(
+            structured["elements"].as_array().unwrap().last().unwrap()["name"],
+            "Finish"
+        );
+
+        let mut snapshot = (*snapshot).clone();
+        for element in &mut snapshot.elements {
+            if element.node.role == "list item" {
+                element.node.value = Some("verbose collection metadata ".repeat(100));
+            }
+        }
+        let mut routed = observation_output(
+            &snapshot,
+            false,
+            Some("not requested"),
+            None,
+            None,
+            None,
+            &ObservationView {
+                crop: &CropReport::monitor(),
+                window_crop: None,
+            },
+        )
+        .into_mcp_result();
+        let retained = routed.structured_content.as_ref().unwrap()["elements"].clone();
+        crate::runtime::annotate_mcp_result(
+            &mut routed,
+            "Desktop: background session=session-0000000000000001\n",
+            json!({"desktop":"background", "session_id":"session-0000000000000001"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let routed = routed.structured_content.unwrap();
+        assert_eq!(
+            routed["elements"], retained,
+            "Routing must not compact selected controls again"
+        );
+        assert_eq!(
+            routed["elements"].as_array().unwrap().last().unwrap()["name"],
+            "Finish"
+        );
+        assert!(json_size(&routed) <= crate::runtime::MAX_MODEL_STRUCTURED_BYTES);
+    }
+
+    #[tokio::test]
+    async fn targeted_search_reports_exact_role_conjunction_and_incomplete_misses() {
+        let fake = FakeAdapter::tree();
+        let window = fake.state.lock().unwrap().app.windows[0].clone();
+        let runtime = fake_runtime(fake);
+        let limits = SnapshotLimits {
+            text: 50,
+            nodes: 40,
+            depth: 64,
+        };
+        let mut search = AccessibilitySearch {
+            name: Some("bUtToN".into()),
+            role: Some("button".into()),
+            exact: true,
+            limit: 20,
+            max_nodes: 500,
+            timeout_ms: 2000,
+        };
+        let found = runtime
+            .traverse(
+                &window,
+                AccessibilityScope::Full,
+                limits,
+                MAX_CACHED_SNAPSHOT_STRING_BYTES,
+                Some(&search),
+            )
+            .await
+            .unwrap();
+        assert_eq!(found.elements.len(), 1);
+        assert_eq!(found.elements[0].node.object, id("button"));
+        assert!(!found.evidence.truncated);
+        search.name = Some("But".into());
+        let exact_miss = runtime
+            .traverse(
+                &window,
+                AccessibilityScope::Full,
+                limits,
+                MAX_CACHED_SNAPSHOT_STRING_BYTES,
+                Some(&search),
+            )
+            .await
+            .unwrap();
+        assert!(exact_miss.elements.is_empty());
+        assert!(!exact_miss.evidence.truncated);
+        search.max_nodes = 1;
+        let bounded = runtime
+            .traverse(
+                &window,
+                AccessibilityScope::Full,
+                limits,
+                MAX_CACHED_SNAPSHOT_STRING_BYTES,
+                Some(&search),
+            )
+            .await
+            .unwrap();
+        assert!(bounded.elements.is_empty());
+        assert_eq!(bounded.evidence.stop_reason, Some("scan_limit"));
+        search.max_nodes = 500;
+        search.name = Some("Button".into());
+        search.limit = 1;
+        let limited = runtime
+            .traverse(
+                &window,
+                AccessibilityScope::Full,
+                limits,
+                MAX_CACHED_SNAPSHOT_STRING_BYTES,
+                Some(&search),
+            )
+            .await
+            .unwrap();
+        assert_eq!(limited.evidence.stop_reason, Some("result_limit"));
+        search.role = Some("entry".into());
+        let wrong_role = runtime
+            .traverse(
+                &window,
+                AccessibilityScope::Full,
+                limits,
+                MAX_CACHED_SNAPSHOT_STRING_BYTES,
+                Some(&search),
+            )
+            .await
+            .unwrap();
+        assert!(wrong_role.elements.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn search_deadline_and_hidden_subtrees_never_prove_absence() {
+        let fake = FakeAdapter::tree();
+        let window = fake.state.lock().unwrap().app.windows[0].clone();
+        {
+            let mut state = fake.state.lock().unwrap();
+            let mut hidden = node("hidden-doc", "document", "Hidden");
+            hidden.children = vec![id("button")];
+            state.nodes.get_mut(&window.object).unwrap().children = vec![hidden.object.clone()];
+            state.nodes.insert(hidden.object.clone(), hidden);
+        }
+        let runtime = fake_runtime(fake.clone());
+        let search = AccessibilitySearch {
+            name: Some("Missing".into()),
+            role: None,
+            exact: true,
+            limit: 20,
+            max_nodes: 500,
+            timeout_ms: 1,
+        };
+        let limits = SnapshotLimits {
+            text: 50,
+            nodes: 40,
+            depth: 64,
+        };
+        let result = runtime
+            .traverse(
+                &window,
+                AccessibilityScope::Visible,
+                limits,
+                MAX_CACHED_SNAPSHOT_STRING_BYTES,
+                Some(&search),
+            )
+            .await
+            .unwrap();
+        assert!(result.elements.is_empty());
+        assert_eq!(result.evidence.stop_reason, Some("scope_omitted"));
+        fake.state.lock().unwrap().block_reads = true;
+        assert!(
+            runtime
+                .traverse(
+                    &window,
+                    AccessibilityScope::Full,
+                    limits,
+                    MAX_CACHED_SNAPSHOT_STRING_BYTES,
+                    Some(&search)
+                )
+                .await
+                .unwrap_err()
+                .message
+                .contains("timed out")
+        );
     }
 
     #[tokio::test]
@@ -8214,6 +10083,7 @@ pub(crate) mod tests {
             capabilities.actions = ActionCapabilities::Inspected(vec![ActionInfo {
                 name: "default".into(),
                 description: "Default".into(),
+                keybinding: String::new(),
             }]);
         }
 
@@ -8308,6 +10178,184 @@ pub(crate) mod tests {
         let fresh = runtime.fresh_for_action(&snapshot).await.unwrap();
         assert_eq!(fresh.window.object, snapshot.window.object);
         assert_eq!(fresh.window.title, "Main");
+        runtime.refresh_window_catalog().await.unwrap();
+        let target = fresh.target_ref.as_ref().unwrap();
+        assert_eq!(
+            runtime.post_action_entry(&fresh, target).unwrap().target,
+            *target,
+            "A pre-existing active sibling must not steal the replacement observation"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_action_modal_transitions_use_exact_app_objects_and_reject_ambiguity() {
+        let fake = FakeAdapter::tree();
+        let runtime = fake_runtime(fake.clone());
+        let source = requested_snapshot(&runtime, ObserveView::Accessibility, None).await;
+        let original = source.target_ref.as_ref().unwrap().clone();
+        {
+            let mut state = fake.state.lock().unwrap();
+            state.app.windows[0].states.remove("active");
+            let mut dialog = window("Dialog", &["active", "showing"]);
+            dialog.object = id("dialog-root");
+            state.app.windows.push(dialog);
+            state
+                .nodes
+                .insert(id("dialog-root"), node("dialog-root", "dialog", "Dialog"));
+        }
+        runtime.refresh_window_catalog().await.unwrap();
+        let selected = runtime.post_action_entry(&source, &original).unwrap();
+        assert_eq!(selected.target.app_instance_id, original.app_instance_id);
+        assert_ne!(
+            selected.target.window_instance_id,
+            original.window_instance_id
+        );
+        let mut filtered = (*source).clone();
+        filtered.element_query = Some("Old window menu item".into());
+        let apps = fake.discover().await.unwrap();
+        let replacement = runtime
+            .replacement_snapshot(&filtered, &selected.target, &selected, &apps)
+            .await
+            .unwrap();
+        assert_eq!(replacement.element_query, None);
+        assert!(
+            replacement
+                .elements
+                .iter()
+                .any(|element| element.node.name == "Dialog")
+        );
+        let dialog = runtime
+            .requested_target_snapshot(
+                &selected.target,
+                ObserveView::Accessibility,
+                None,
+                ObserveCrop::Monitor,
+            )
+            .await
+            .unwrap();
+        let dialog_look = runtime
+            .requested_target_snapshot(
+                &selected.target,
+                ObserveView::Screenshot,
+                None,
+                ObserveCrop::Monitor,
+            )
+            .await
+            .unwrap();
+        assert!(!dialog_look.requires_atspi_revalidation);
+        // While its window exists, a visual-only source never moves.
+        assert_eq!(
+            runtime
+                .post_action_entry(&dialog_look, &selected.target)
+                .unwrap()
+                .target,
+            selected.target
+        );
+        {
+            let mut state = fake.state.lock().unwrap();
+            state.app.windows.pop();
+            state.app.windows[0].states.insert("active".into());
+            state.nodes.remove(&id("dialog-root"));
+        }
+        runtime.refresh_window_catalog().await.unwrap();
+        // A click that closed the dialog reads back the window that remains,
+        // whether the source was an accessibility or a screenshot observation.
+        for source in [&dialog, &dialog_look] {
+            assert_eq!(
+                runtime
+                    .post_action_entry(source, &selected.target)
+                    .unwrap()
+                    .target,
+                original
+            );
+        }
+        {
+            let mut state = fake.state.lock().unwrap();
+            state.app.windows[0].states.remove("active");
+            state.app.windows.push(window("Other", &["showing"]));
+        }
+        runtime.refresh_window_catalog().await.unwrap();
+        for source in [&dialog, &dialog_look] {
+            assert!(
+                runtime.post_action_entry(source, &selected.target).is_err(),
+                "Ambiguous survivors are not a replacement target"
+            );
+        }
+        fake.state.lock().unwrap().app.object = id("different-application-same-pid");
+        runtime.refresh_window_catalog().await.unwrap();
+        assert!(
+            runtime.post_action_entry(&source, &original).is_err(),
+            "PID/title never join different exact applications"
+        );
+        assert!(
+            fake.state.lock().unwrap().actions.is_empty(),
+            "Returning observation authority must not retarget or emit input"
+        );
+    }
+
+    #[test]
+    fn compact_projection_retains_decision_states_and_noninteractive_status() {
+        let mut snapshot = snapshot_for_target(1, "");
+        snapshot.view = AccessibilityScope::Interactive;
+        let mut checkbox = node("checkbox", "check box", "Express delivery");
+        checkbox.states.insert("showing".into());
+        checkbox.text = Some(checkbox.name.clone());
+        let mut status = node("status", "label", "Task complete");
+        status.states.insert("showing".into());
+        snapshot.elements = vec![
+            ElementSnapshot {
+                depth: 0,
+                node: checkbox,
+            },
+            ElementSnapshot {
+                depth: 1,
+                node: status,
+            },
+        ];
+        snapshot.element_ids = vec!["e-0000000000000001".into(), "e-0000000000000002".into()];
+        let text = format_snapshot_with_budget(&snapshot, 2_000).text;
+        assert!(text.contains("checked=false"));
+        assert!(
+            !text.contains("value="),
+            "Identical noneditable name/value is redundant"
+        );
+        assert!(text.contains("Visible text (fresh AT-SPI readback): [\"Task complete\"]"));
+        snapshot.elements[0].node.states.insert("checked".into());
+        assert!(
+            format_snapshot_with_budget(&snapshot, 2_000)
+                .text
+                .contains("checked=true")
+        );
+        snapshot.elements[1].node.states.remove("showing");
+        assert!(
+            contextual_labels(&snapshot).is_empty(),
+            "Do not present hidden labels as visible status"
+        );
+    }
+
+    #[test]
+    fn context_labels_bound_escaped_json_bytes_without_hiding_later_small_labels() {
+        let mut snapshot = snapshot_for_target(1, "");
+        snapshot.view = AccessibilityScope::Interactive;
+        snapshot.elements.clear();
+        snapshot.element_ids.clear();
+        for index in 0..9 {
+            let name = if index == 8 {
+                "Task complete".to_owned()
+            } else {
+                format!("{index}{}", "🙂\"\\\n".repeat(200))
+            };
+            let mut label = node(&format!("status-{index}"), "label", &name);
+            label.states.insert("showing".into());
+            snapshot.elements.push(ElementSnapshot {
+                depth: 1,
+                node: label,
+            });
+            snapshot.element_ids.push(format!("e-{index:016x}"));
+        }
+        let labels = contextual_labels(&snapshot);
+        assert_eq!(labels, ["Task complete"]);
+        assert!(json!(labels).to_string().len() <= MAX_MODEL_CONTEXT_BYTES);
     }
 
     #[test]
@@ -8728,11 +10776,11 @@ pub(crate) mod tests {
         fake.state.lock().unwrap().app.pid = 11;
         let error = runtime
             .execute_call(ToolCall::Act {
-                target,
-                source: ObservationRef {
+                target: Some(target),
+                source: Some(ObservationRef {
                     observation_id,
                     frame_id: None,
-                },
+                }),
                 operation: ActOperation::Semantic {
                     element_id,
                     action: ElementAction::Invoke,
@@ -9276,6 +11324,30 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn declined_atspi_activation_is_settled_by_one_fresh_read() {
+        let fake = inactive_hunt_fake();
+        fake.state.lock().unwrap().widget_fault = FakeWidgetFault::ActivateDeclined;
+        // A hunt would switch desktops; a declined request must not start one.
+        let (bus, switches) = DesktopTestBus::with_three_desktops("id-1");
+        let runtime =
+            SemanticRuntime::with_screenshot_provider(fake.clone(), NoScreenshots, test_config())
+                .with_virtual_desktop_provider(VirtualDesktopProvider::custom(Arc::new(bus)));
+        let target = hunt_target(&runtime).await;
+        let call = || ToolCall::ActivateWindow {
+            target: target.clone(),
+            action: WindowAction::Activate,
+        };
+        let declined = runtime.execute_call(call()).await.unwrap_err();
+        assert_eq!(declined.code, "capability_unavailable");
+        // Verified not active, so the outcome is known rather than uncertain.
+        assert_eq!(declined.outcome, ToolOutcome::Completed);
+        assert!(!declined.retryable);
+        assert!(declined.recovery.contains("kde-plasma-window-management"));
+        assert_eq!(fake.state.lock().unwrap().activation_calls.len(), 1);
+        assert!(switches.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn atspi_hunt_verifies_on_the_right_desktop() {
         let fake = inactive_hunt_fake();
         let (mut bus, switches) = DesktopTestBus::with_three_desktops("id-1");
@@ -9553,7 +11625,9 @@ pub(crate) mod tests {
         );
     }
 
-    pub(crate) fn oversized_observation_fixture() -> (Snapshot, ScreenshotMapping, ToolOutput) {
+    pub(crate) fn oversized_observation_fixture(
+        structured_budget: usize,
+    ) -> (Snapshot, ScreenshotMapping, ToolOutput) {
         let mut elements = Vec::new();
         for index in 0..240 {
             let mut node = node(
@@ -9572,6 +11646,7 @@ pub(crate) mod tests {
                     .map(|action| ActionInfo {
                         name: format!("action-{action}-{}", "n".repeat(100)),
                         description: format!("description-{}", "d".repeat(400)),
+                        keybinding: String::new(),
                     })
                     .collect(),
             ));
@@ -9588,6 +11663,8 @@ pub(crate) mod tests {
             view: AccessibilityScope::Full,
             element_query: None,
             app: app("A", 1, "Main"),
+            search: None,
+            traversal: TraversalEvidence::default(),
             window: window("Main", &["active"]),
             generation: 7,
             elements,
@@ -9607,7 +11684,7 @@ pub(crate) mod tests {
             crop: ObserveCrop::Monitor,
         };
         let mapping = test_screenshot_mapping(&snapshot, "/session/worst", None);
-        let observation = observation_output(
+        let mut observation = observation_output(
             &snapshot,
             true,
             None,
@@ -9619,12 +11696,25 @@ pub(crate) mod tests {
                 window_crop: None,
             },
         );
+        observation.structured_content = Some(build_observation_structured(
+            &snapshot,
+            true,
+            None,
+            Some(mapping.output_size),
+            Some(&mapping.source),
+            &ObservationView {
+                crop: &CropReport::monitor(),
+                window_crop: None,
+            },
+            structured_budget,
+        ));
         (snapshot, mapping, observation)
     }
 
     #[test]
     fn worst_case_observation_and_replacement_are_explicitly_truncated() {
-        let (mut snapshot, mapping, observation) = oversized_observation_fixture();
+        let (mut snapshot, mapping, observation) =
+            oversized_observation_fixture(MAX_MODEL_STRUCTURED_BYTES);
         let target = snapshot.target_ref.clone().unwrap();
         assert!(observation.text.len() <= MAX_MODEL_TEXT_BYTES);
         let rendered_ids: Vec<_> = observation
@@ -9733,6 +11823,475 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn opened_window_readback_stays_inside_the_response_budget() {
+        let adapter = FakeAdapter::tree();
+        let runtime = SemanticRuntime::with_config(adapter.clone(), test_config());
+        let snapshot = requested_snapshot(&runtime, ObserveView::Accessibility, None).await;
+        let button = snapshot
+            .elements
+            .iter()
+            .position(|element| element.node.object == id("button"))
+            .map(|index| snapshot.element_ids[index].clone())
+            .unwrap();
+        {
+            let mut state = adapter.state.lock().unwrap();
+            let mut popup = window("Long menu", &["showing"]);
+            popup.object = id("popup-root");
+            let mut root = node("popup-root", "window", "Long menu");
+            let mut nodes = Vec::new();
+            for index in 0..OPENED_WINDOW_READBACK_NODES {
+                let key = format!("item-{index}");
+                let mut item = node(&key, "menu item", &format!("{index} {}", "x".repeat(2_000)));
+                item.capabilities = inspected(ActionCapabilities::Inspected(vec![ActionInfo {
+                    name: "click".into(),
+                    description: String::new(),
+                    keybinding: String::new(),
+                }]));
+                item.states.insert("showing".into());
+                root.children.push(id(&key));
+                nodes.push(item);
+            }
+            nodes.insert(0, root);
+            state.opens_on_action = Some((popup, nodes));
+        }
+        let acted = runtime
+            .execute_call(ToolCall::Act {
+                target: None,
+                source: None,
+                operation: ActOperation::Semantic {
+                    element_id: button,
+                    action: ElementAction::Invoke,
+                },
+            })
+            .await
+            .unwrap();
+        assert!(
+            acted.text.len() <= MAX_MODEL_TEXT_BYTES,
+            "{}",
+            acted.text.len()
+        );
+        let structured = acted.structured_content.as_ref().unwrap();
+        assert!(json_size(structured) <= MAX_MODEL_STRUCTURED_BYTES);
+        // The window is named with its routable target, and the cut is explicit.
+        assert_eq!(structured["opened_windows"].as_array().unwrap().len(), 1);
+        assert!(
+            acted.text.contains("Opened window \"Long menu\""),
+            "{}",
+            acted.text
+        );
+        assert!(
+            acted.text.ends_with("(more elements; observe it)"),
+            "{}",
+            acted.text
+        );
+        // Lines the caller never received are not remembered as shown.
+        let cache = runtime.lock_cache().unwrap();
+        let unlisted: Vec<&String> = acted
+            .element_ids
+            .iter()
+            .filter(|id| !acted.text.contains(id.as_str()))
+            .collect();
+        assert!(!unlisted.is_empty());
+        assert!(
+            unlisted
+                .iter()
+                .all(|id| !cache.shown_lines.contains_key(id.as_str()))
+        );
+    }
+
+    #[tokio::test]
+    async fn action_readback_reports_windows_the_action_opened_with_their_elements() {
+        let adapter = FakeAdapter::tree();
+        let runtime = SemanticRuntime::with_config(adapter.clone(), test_config());
+        let listed = runtime
+            .execute_call(ToolCall::ListDesktop {
+                scope: DesktopScope::Windows,
+                limit: DEFAULT_DESKTOP_PAGE_SIZE,
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        let target_value = listed.structured_content.unwrap()["windows"][0]["target"].clone();
+        let target = TargetRef {
+            app_instance_id: target_value["app_instance_id"].as_str().unwrap().into(),
+            window_instance_id: target_value["window_instance_id"].as_str().unwrap().into(),
+        };
+        let observed = runtime
+            .execute_call(ToolCall::Observe {
+                target: target.clone(),
+                view: ObserveView::Accessibility,
+                accessibility: None,
+                crop: ObserveCrop::Monitor,
+            })
+            .await
+            .unwrap();
+        let button: String = observed.structured_content.as_ref().unwrap()["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|element| element["name"] == "Button")
+            .unwrap()["element_id"]
+            .as_str()
+            .unwrap()
+            .into();
+        let invoke = |element_id: &str, target: Option<TargetRef>| ToolCall::Act {
+            target,
+            source: None,
+            operation: ActOperation::Semantic {
+                element_id: element_id.into(),
+                action: ElementAction::Invoke,
+            },
+        };
+        // A context menu is an inactive, untitled toplevel of the same
+        // application: the acted-on window stays the replacement target.
+        {
+            let mut state = adapter.state.lock().unwrap();
+            let mut popup = window("", &["showing"]);
+            popup.object = id("popup-root");
+            let mut root = node("popup-root", "window", "");
+            root.children = vec![id("archive")];
+            let mut archive = node("archive", "menu item", "Archive item");
+            archive.capabilities = inspected(ActionCapabilities::Inspected(vec![ActionInfo {
+                name: "click".into(),
+                description: String::new(),
+                keybinding: String::new(),
+            }]));
+            archive.states.insert("showing".into());
+            state.opens_on_action = Some((popup, vec![root, archive]));
+        }
+        let acted = runtime.execute_call(invoke(&button, None)).await.unwrap();
+        let structured = acted.structured_content.as_ref().unwrap();
+        assert_eq!(
+            structured["replacement_observation"]["target"],
+            target_value
+        );
+        let opened = structured["opened_windows"].as_array().unwrap();
+        assert_eq!(opened.len(), 1, "{}", acted.text);
+        assert_eq!(
+            opened[0]["target"]["app_instance_id"],
+            target_value["app_instance_id"]
+        );
+        assert_ne!(
+            opened[0]["target"]["window_instance_id"],
+            target_value["window_instance_id"]
+        );
+        let popup_target = TargetRef {
+            app_instance_id: opened[0]["target"]["app_instance_id"]
+                .as_str()
+                .unwrap()
+                .into(),
+            window_instance_id: opened[0]["target"]["window_instance_id"]
+                .as_str()
+                .unwrap()
+                .into(),
+        };
+        let header = format!(
+            "Opened window \"\" target=app_instance_id={} window_instance_id={}",
+            popup_target.app_instance_id, popup_target.window_instance_id
+        );
+        let after = acted.text.split_once(&header).expect(&acted.text).1;
+        let (item, _) = after
+            .lines()
+            .filter_map(shown_element_line)
+            .next()
+            .expect(&acted.text);
+        assert!(
+            after.contains("menu item name=\"Archive item\""),
+            "{}",
+            acted.text
+        );
+        assert!(
+            acted.element_ids.iter().any(|id| id == item),
+            "opened-window element IDs must reach the broker's routing manifest"
+        );
+        // The listed element is immediately actionable on its own window, and
+        // the original window's target is not silently substituted for it.
+        assert!(
+            runtime
+                .execute_call(invoke(item, Some(target.clone())))
+                .await
+                .is_err()
+        );
+        runtime
+            .execute_call(invoke(item, Some(popup_target)))
+            .await
+            .unwrap();
+        assert_eq!(
+            adapter.state.lock().unwrap().actions.last().unwrap().0,
+            id("archive")
+        );
+        // Nothing opened: nothing reported.
+        let again = runtime.execute_call(invoke(&button, None)).await.unwrap();
+        assert!(!again.text.contains("Opened window"), "{}", again.text);
+        assert!(
+            again
+                .structured_content
+                .unwrap()
+                .get("opened_windows")
+                .is_none()
+        );
+        // An untitled toplevel without interactive elements (a tooltip) is noise.
+        {
+            let mut state = adapter.state.lock().unwrap();
+            let mut tooltip = window("", &["showing"]);
+            tooltip.object = id("tooltip-root");
+            state.opens_on_action = Some((tooltip, vec![node("tooltip-root", "tool tip", "Hint")]));
+        }
+        let hinted = runtime.execute_call(invoke(&button, None)).await.unwrap();
+        assert!(!hinted.text.contains("Opened window"), "{}", hinted.text);
+    }
+
+    #[tokio::test]
+    async fn action_readback_lists_only_elements_that_changed_since_last_shown() {
+        let adapter = FakeAdapter::tree();
+        let runtime = SemanticRuntime::with_config(adapter.clone(), test_config());
+        let list = || ToolCall::ListDesktop {
+            scope: DesktopScope::Windows,
+            limit: DEFAULT_DESKTOP_PAGE_SIZE,
+            cursor: None,
+        };
+        let listed = runtime.execute_call(list()).await.unwrap();
+        let target_value = listed.structured_content.unwrap()["windows"][0]["target"].clone();
+        let target = TargetRef {
+            app_instance_id: target_value["app_instance_id"].as_str().unwrap().into(),
+            window_instance_id: target_value["window_instance_id"].as_str().unwrap().into(),
+        };
+        let observe = || ToolCall::Observe {
+            target: target.clone(),
+            view: ObserveView::Accessibility,
+            accessibility: Some(AccessibilityRequest {
+                scope: AccessibilityScope::Full,
+                ..Default::default()
+            }),
+            crop: ObserveCrop::Monitor,
+        };
+        let observed = runtime.execute_call(observe()).await.unwrap();
+        let full_lines: Vec<&str> = observed
+            .text
+            .lines()
+            .filter(|line| shown_element_line(line).is_some())
+            .collect();
+        assert!(full_lines.len() >= 3, "{}", observed.text);
+        let element_id: String = observed.structured_content.as_ref().unwrap()["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|element| element["capabilities"]["invoke"] == true)
+            .unwrap()["element_id"]
+            .as_str()
+            .unwrap()
+            .into();
+        let act = || ToolCall::Act {
+            target: None,
+            source: None,
+            operation: ActOperation::Semantic {
+                element_id: element_id.clone(),
+                action: ElementAction::Invoke,
+            },
+        };
+        let acted = runtime.execute_call(act()).await.unwrap();
+        let listed_lines: Vec<&str> = acted
+            .text
+            .lines()
+            .filter(|line| shown_element_line(line).is_some())
+            .collect();
+        // Nothing changed in the fake tree: only the acted-on element is
+        // repeated, the rest is one count, and the action trailer survives.
+        assert_eq!(listed_lines.len(), 1, "{}", acted.text);
+        assert!(listed_lines[0].contains(&element_id));
+        assert!(acted.text.contains(&format!(
+            "Unchanged elements omitted: {} (",
+            full_lines.len() - 1
+        )));
+        assert!(acted.text.contains("Action: completed"), "{}", acted.text);
+        // Structured content is not reduced for programmatic consumers.
+        let structured = serde_json::to_string(acted.structured_content.as_ref().unwrap()).unwrap();
+        for line in &full_lines {
+            let (id, _) = shown_element_line(line).unwrap();
+            assert!(structured.contains(id), "{id} missing from {structured}");
+        }
+
+        // A changed element, a new element, and a vanished element are reported.
+        let (renamed, removed) = {
+            let mut state = adapter.state.lock().unwrap();
+            let root = id("root");
+            let children = state.nodes[&root].children.clone();
+            let acted_object = state
+                .nodes
+                .values()
+                .find(|node| node.role == "button")
+                .map(|node| node.object.clone());
+            let mut others = children
+                .iter()
+                .filter(|child| Some(*child) != acted_object.as_ref())
+                .cloned();
+            let renamed = others.next().unwrap();
+            let removed = others.next();
+            state.nodes.get_mut(&renamed).unwrap().name = "Renamed by the application".into();
+            if let Some(removed) = &removed {
+                state
+                    .nodes
+                    .get_mut(&root)
+                    .unwrap()
+                    .children
+                    .retain(|child| child != removed);
+            }
+            let mut fresh = node("fresh", "button", "Fresh");
+            fresh.states.insert("showing".into());
+            state
+                .nodes
+                .get_mut(&root)
+                .unwrap()
+                .children
+                .push(fresh.object.clone());
+            state.nodes.insert(fresh.object.clone(), fresh);
+            (renamed, removed)
+        };
+        let _ = renamed;
+        let changed = runtime.execute_call(act()).await.unwrap();
+        assert!(
+            changed.text.contains("Renamed by the application"),
+            "{}",
+            changed.text
+        );
+        assert!(changed.text.contains("name=\"Fresh\""), "{}", changed.text);
+        assert_eq!(
+            changed
+                .text
+                .contains("No longer listed (1 earlier elements): "),
+            removed.is_some(),
+            "{}",
+            changed.text
+        );
+
+        // An explicit observation is always complete, and rediscovery resets
+        // the memory so the next readback is complete as well.
+        let again = runtime.execute_call(observe()).await.unwrap();
+        assert!(!again.text.contains("Unchanged elements omitted"));
+        runtime.execute_call(list()).await.unwrap();
+        let reset = runtime.execute_call(act()).await.unwrap();
+        assert!(
+            !reset.text.contains("Unchanged elements omitted"),
+            "{}",
+            reset.text
+        );
+    }
+
+    #[tokio::test]
+    async fn element_bound_semantic_act_requires_exact_live_source_binding() {
+        let adapter = FakeAdapter::tree();
+        let runtime = SemanticRuntime::with_config(adapter.clone(), test_config());
+        let listed = runtime
+            .execute_call(ToolCall::ListDesktop {
+                scope: DesktopScope::Windows,
+                limit: DEFAULT_DESKTOP_PAGE_SIZE,
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        let target_value = listed.structured_content.unwrap()["windows"][0]["target"].clone();
+        let target = TargetRef {
+            app_instance_id: target_value["app_instance_id"].as_str().unwrap().into(),
+            window_instance_id: target_value["window_instance_id"].as_str().unwrap().into(),
+        };
+        let observed = runtime
+            .execute_call(ToolCall::Observe {
+                target: target.clone(),
+                view: ObserveView::Accessibility,
+                accessibility: Some(AccessibilityRequest {
+                    scope: AccessibilityScope::Full,
+                    ..Default::default()
+                }),
+                crop: ObserveCrop::Monitor,
+            })
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        let element_id = observed["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|element| element["capabilities"]["invoke"] == true)
+            .unwrap()["element_id"]
+            .as_str()
+            .unwrap()
+            .into();
+        let call = ToolCall::Act {
+            target: None,
+            source: None,
+            operation: ActOperation::Semantic {
+                element_id,
+                action: ElementAction::Invoke,
+            },
+        };
+        let mut mismatch = call.clone();
+        if let ToolCall::Act {
+            target: supplied, ..
+        } = &mut mismatch
+        {
+            *supplied = Some(TargetRef {
+                window_instance_id: "win-ffffffffffffffff".into(),
+                ..target.clone()
+            });
+        }
+        assert!(runtime.execute_call(mismatch).await.is_err());
+        assert!(adapter.state.lock().unwrap().actions.is_empty());
+        let acted = runtime
+            .execute_call(call.clone())
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(acted["target"], target_value);
+        assert_eq!(adapter.state.lock().unwrap().actions.len(), 1);
+        // The replacement readback keeps the stable ID bound to the same exact
+        // object, so a deliberate second call is a fresh revalidated action.
+        let replacement = runtime
+            .required_cached(acted["replacement_observation_id"].as_str().unwrap())
+            .unwrap();
+        assert!(replacement.element_ids.iter().any(|id| {
+            matches!(&call, ToolCall::Act { operation: ActOperation::Semantic { element_id, .. }, .. } if id == element_id)
+        }));
+        let acted_again = runtime
+            .execute_call(call.clone())
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(adapter.state.lock().unwrap().actions.len(), 2);
+
+        // Each act retains only its own replacement for the window.
+        let mut unbound = (*runtime
+            .required_cached(acted_again["replacement_observation_id"].as_str().unwrap())
+            .unwrap())
+        .clone();
+        unbound.target_ref = None;
+        let unbound = runtime.commit_snapshot(unbound).unwrap();
+        assert!(
+            runtime
+                .action_source(
+                    &ObservationRef {
+                        observation_id: observation_id_for_snapshot(&unbound),
+                        frame_id: None,
+                    },
+                    None
+                )
+                .is_err()
+        );
+        let unbound_act = ToolCall::Act {
+            target: None,
+            source: None,
+            operation: ActOperation::Semantic {
+                element_id: unbound.element_ids[0].clone(),
+                action: ElementAction::Invoke,
+            },
+        };
+        assert!(runtime.execute_call(unbound_act).await.is_err());
+        assert_eq!(adapter.state.lock().unwrap().actions.len(), 2);
+    }
+
+    #[tokio::test]
     async fn successful_public_act_projects_bounded_replacement_evidence() {
         struct SuccessfulScreenshots;
 
@@ -9808,8 +12367,8 @@ pub(crate) mod tests {
         };
         let output = runtime
             .execute_call(ToolCall::Act {
-                target,
-                source,
+                target: Some(target),
+                source: Some(source),
                 operation: ActOperation::Semantic {
                     element_id: element_id.into(),
                     action: ElementAction::Invoke,
@@ -10027,19 +12586,183 @@ pub(crate) mod tests {
 
         let retry = runtime
             .execute_call(semantic_call(
-                observation_id,
+                observation_id.clone(),
                 element_id,
                 ElementAction::Invoke,
             ))
             .await
             .unwrap_err();
-        assert_eq!(retry.code, "state_required");
+        assert_eq!(retry.code, "stale_state");
+        let recovery = error
+            .recovery_observation
+            .expect("fresh read-only recovery");
+        assert_ne!(
+            recovery.structured_content.as_ref().unwrap()["observation_id"],
+            observation_id
+        );
+        assert!(recovery.structured_content.as_ref().unwrap()["target"].is_object());
         assert_eq!(fake.state.lock().unwrap().actions.len(), 1);
+    }
+
+    #[test]
+    fn named_action_truncation_counts_only_advertised_supplementary_actions() {
+        let mut snapshot = snapshot_for_target(42, "");
+        let node = &mut snapshot.elements[0].node;
+        node.states.insert("focusable".into());
+        let mut actions = vec![
+            ActionInfo {
+                name: "click".into(),
+                description: String::new(),
+                keybinding: String::new(),
+            },
+            ActionInfo {
+                name: "Set Focus".into(),
+                description: String::new(),
+                keybinding: String::new(),
+            },
+        ];
+        actions.extend((0..MAX_MODEL_ACTIONS).map(|index| ActionInfo {
+            name: format!("Custom {index}"),
+            description: String::new(),
+            keybinding: String::new(),
+        }));
+        node.capabilities = NodeCapabilities::Inspected(InspectedCapabilities {
+            actions: ActionCapabilities::Inspected(actions),
+            component: true,
+            focus: true,
+            editable_text: false,
+            value: false,
+        });
+        for overflow in [false, true] {
+            if overflow
+                && let NodeCapabilities::Inspected(capabilities) =
+                    &mut snapshot.elements[0].node.capabilities
+            {
+                let ActionCapabilities::Inspected(actions) = &mut capabilities.actions else {
+                    unreachable!()
+                };
+                actions.push(ActionInfo {
+                    name: "Overflow".into(),
+                    description: String::new(),
+                    keybinding: String::new(),
+                });
+            }
+            let element = &snapshot.elements[0];
+            let (text, _) = element_text_line(&snapshot, 0, element, 1000);
+            let (structured, truncated) =
+                bounded_named_actions(element.node.capabilities.actions(), 1000, true);
+            assert_eq!(structured.len(), MAX_MODEL_ACTIONS);
+            assert_eq!(truncated, overflow);
+            assert_eq!(text.contains("named_actions_truncated=true"), overflow);
+        }
+    }
+
+    #[test]
+    fn named_action_projection_omits_only_redundant_primary_and_empty_descriptions() {
+        let actions = vec![
+            ActionInfo {
+                name: "click".into(),
+                description: "activate".into(),
+                keybinding: String::new(),
+            },
+            ActionInfo {
+                name: "Show Menu".into(),
+                description: String::new(),
+                keybinding: String::new(),
+            },
+            ActionInfo {
+                name: "Set Focus".into(),
+                description: "focus exactly".into(),
+                keybinding: String::new(),
+            },
+        ];
+        let (projected, truncated) = bounded_named_actions(&actions, 100, false);
+        assert!(!truncated);
+        assert_eq!(primary_action_index(&actions), Some(0));
+        assert_eq!(
+            projected,
+            vec![
+                json!({"name":"Show Menu"}),
+                json!({"name":"Set Focus","description":"focus exactly"})
+            ]
+        );
+        let previous = json!([
+            {"name":"click","description":"activate"},
+            {"name":"Show Menu","description":""},
+            {"name":"Set Focus","description":"focus exactly"}
+        ]);
+        assert!(
+            serde_json::to_vec(&projected).unwrap().len()
+                < serde_json::to_vec(&previous).unwrap().len()
+        );
+        let (custom, _) = bounded_named_actions(&actions[1..2], 100, false);
+        assert_eq!(custom, vec![json!({"name":"Show Menu"})]);
+        let (with_focus, _) = bounded_named_actions(&actions, 100, true);
+        assert_eq!(with_focus, vec![json!({"name":"Show Menu"})]);
+        assert_eq!(
+            focus_dispatch(&NodeInfo {
+                capabilities: inspected(ActionCapabilities::Inspected(actions)),
+                ..node("focus", "button", "Focus")
+            })
+            .unwrap(),
+            SemanticAction::InvokeAction(2)
+        );
+    }
+
+    #[test]
+    fn focus_chooses_one_explicit_action_and_refuses_ambiguous_or_unsupported_focus() {
+        let mut element = node("focus", "combo box", "Shipping");
+        if let NodeCapabilities::Inspected(capabilities) = &mut element.capabilities {
+            capabilities.component = true;
+            capabilities.actions = ActionCapabilities::Inspected(vec![ActionInfo {
+                name: "Set Focus".into(),
+                description: String::new(),
+                keybinding: String::new(),
+            }]);
+        }
+        assert_eq!(
+            focus_dispatch(&element).unwrap(),
+            SemanticAction::InvokeAction(0)
+        );
+        if let NodeCapabilities::Inspected(capabilities) = &mut element.capabilities {
+            capabilities.actions = ActionCapabilities::Inspected(vec![]);
+            capabilities.focus = false;
+            assert!(
+                capabilities.component,
+                "focus rejection must not erase geometry/text interfaces"
+            );
+        }
+        assert!(!element.supports_focus());
+        assert!(focus_dispatch(&element).is_err());
+        if let NodeCapabilities::Inspected(capabilities) = &mut element.capabilities {
+            capabilities.actions = ActionCapabilities::Inspected(vec![
+                ActionInfo {
+                    name: "Set Focus".into(),
+                    description: String::new(),
+                    keybinding: String::new(),
+                };
+                2
+            ]);
+        }
+        assert!(
+            focus_dispatch(&element)
+                .unwrap_err()
+                .message
+                .contains("ambiguous")
+        );
     }
 
     #[tokio::test]
     async fn semantic_replace_text_focuses_before_setting_and_verifies() {
         let fake = FakeAdapter::tree();
+        fake.state
+            .lock()
+            .unwrap()
+            .nodes
+            .get_mut(&id("edit"))
+            .unwrap()
+            .states
+            .remove("focused");
         let runtime = fake_runtime(fake.clone());
         runtime
             .snapshot_text("Editor".into(), None, None, None)
@@ -10063,6 +12786,7 @@ pub(crate) mod tests {
         assert_eq!(
             state.replace_steps,
             [
+                (id("edit"), "focus_verify"),
                 (id("edit"), "focus"),
                 (id("edit"), "set"),
                 (id("edit"), "verify"),
@@ -10165,7 +12889,7 @@ pub(crate) mod tests {
         assert_eq!(
             state.replace_steps,
             [
-                (id("edit"), "focus"),
+                (id("edit"), "focus_verify"),
                 (id("edit"), "set"),
                 (id("edit"), "verify"),
                 (id("edit"), "delete_insert"),
@@ -10179,7 +12903,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn semantic_replace_text_accepts_refused_focus_only_after_fresh_confirmation() {
+    async fn semantic_replace_text_does_not_repeat_focus_already_freshly_confirmed() {
         let fake = FakeAdapter::tree();
         fake.state.lock().unwrap().semantic_focus_succeeds = false;
         let runtime = fake_runtime(fake.clone());
@@ -10203,7 +12927,6 @@ pub(crate) mod tests {
         assert_eq!(
             state.replace_steps,
             [
-                (id("edit"), "focus"),
                 (id("edit"), "focus_verify"),
                 (id("edit"), "set"),
                 (id("edit"), "verify"),
@@ -10249,7 +12972,11 @@ pub(crate) mod tests {
         // No text write or readback ran after fresh state failed to confirm focus.
         assert_eq!(
             state.replace_steps,
-            [(id("edit"), "focus"), (id("edit"), "focus_verify")]
+            [
+                (id("edit"), "focus_verify"),
+                (id("edit"), "focus"),
+                (id("edit"), "focus_verify")
+            ]
         );
         assert!(!state.replace_texts.contains_key(&id("edit")));
     }
@@ -10365,6 +13092,144 @@ pub(crate) mod tests {
             .unwrap_err();
         assert_eq!(error.code, "stale_state");
         assert!(error.message.contains("is stale"));
+    }
+
+    #[test]
+    fn a_same_window_observation_supersedes_only_the_authority_it_carries() {
+        let target = test_target();
+        let elements = |text: &str| {
+            let mut snapshot = snapshot_for_target(1, text);
+            snapshot.target_ref = Some(target.clone());
+            snapshot.screenshot_requested = false;
+            snapshot
+        };
+        let frame_only = || {
+            let mut snapshot = snapshot_for_target(1, "");
+            snapshot.target_ref = Some(target.clone());
+            snapshot.elements.clear();
+            snapshot.requires_atspi_revalidation = false;
+            snapshot.screenshot_requested = true;
+            snapshot
+        };
+        let attach_frame = |cache: &mut Cache, snapshot: &Snapshot, name: &str| {
+            let position = cache.position(snapshot).unwrap();
+            let mapping = test_screenshot_mapping(snapshot, "/session/frame", Some(name));
+            cache.observations[position].screenshot_mapping = Some(mapping.clone());
+            crate::capture::frame_id(&mapping.source)
+        };
+        let retained = |cache: &Cache| {
+            cache
+                .observations
+                .iter()
+                .map(|cached| cached.snapshot.generation)
+                .collect::<Vec<_>>()
+        };
+        let mut cache = Cache::default();
+
+        // A screenshot-only look keeps the element snapshot as the semantic source.
+        let first = cache.insert(elements("one")).unwrap();
+        let element_id = first.element_ids[0].clone();
+        let look = cache.insert(frame_only()).unwrap();
+        let look_frame = attach_frame(&mut cache, &look, "look");
+        assert_eq!(retained(&cache), [first.generation, look.generation]);
+        assert_eq!(
+            cache.element_source(&element_id).unwrap().generation,
+            first.generation
+        );
+
+        // A later accessibility-only observation replaces the elements and
+        // keeps the still-valid frame; the stable ID now names the newest source.
+        let second = cache.insert(elements("two")).unwrap();
+        assert_eq!(second.element_ids[0], element_id);
+        assert_eq!(retained(&cache), [look.generation, second.generation]);
+        assert!(cache.frame_for_target(&target, Some(&look_frame)).is_ok());
+        assert_eq!(
+            cache.element_source(&element_id).unwrap().generation,
+            second.generation
+        );
+
+        // A newer frame supersedes the older frame but not the elements.
+        let relook = cache.insert(frame_only()).unwrap();
+        assert_eq!(retained(&cache), [second.generation, relook.generation]);
+        assert!(cache.frame_for_target(&target, Some(&look_frame)).is_err());
+        let relook_frame = attach_frame(&mut cache, &relook, "relook");
+
+        // Point input consumes its frame source; elements stay for revalidated use.
+        cache.invalidate_for_mutation(&relook).unwrap();
+        assert_eq!(retained(&cache), [second.generation]);
+        assert!(
+            cache
+                .frame_for_target(&target, Some(&relook_frame))
+                .is_err()
+        );
+
+        // An observation carrying both authorities replaces everything.
+        let mut both = elements("three");
+        both.screenshot_requested = true;
+        let both = cache.insert(both).unwrap();
+        assert_eq!(retained(&cache), [both.generation]);
+
+        // A narrow search must not strand IDs listed only by the wider
+        // observation; a later observation that lists them all replaces both.
+        let wide = |text: &str| {
+            let mut snapshot = elements(text);
+            snapshot.elements.push(ElementSnapshot {
+                depth: 0,
+                node: node("save", "button", "Save"),
+            });
+            snapshot
+        };
+        let mut cache = Cache::default();
+        let broad = cache.insert(wide("one")).unwrap();
+        let (content_id, save_id) = (broad.element_ids[0].clone(), broad.element_ids[1].clone());
+        let narrow = cache.insert(elements("one")).unwrap();
+        assert_eq!(narrow.element_ids, std::slice::from_ref(&content_id));
+        assert_eq!(retained(&cache), [broad.generation, narrow.generation]);
+        assert_eq!(
+            cache.element_source(&save_id).unwrap().generation,
+            broad.generation
+        );
+        assert_eq!(
+            cache.element_source(&content_id).unwrap().generation,
+            narrow.generation
+        );
+        // Acting through the narrow snapshot consumes only that source.
+        cache.invalidate_for_mutation(&narrow).unwrap();
+        assert_eq!(
+            cache.element_source(&save_id).unwrap().generation,
+            broad.generation
+        );
+        let again = cache.insert(elements("two")).unwrap();
+        assert_eq!(retained(&cache), [broad.generation, again.generation]);
+        let full = cache.insert(wide("two")).unwrap();
+        assert_eq!(retained(&cache), [full.generation]);
+    }
+
+    #[test]
+    fn registry_eviction_keeps_the_bindings_of_the_snapshot_that_triggered_it() {
+        let large = |prefix: &str| {
+            let mut snapshot = snapshot_for_target(1, "");
+            snapshot.target_ref = Some(test_target());
+            snapshot.elements = (0..=MAX_REGISTERED_ELEMENTS)
+                .map(|index| ElementSnapshot {
+                    depth: 0,
+                    node: node(&format!("{prefix}-{index}"), "table cell", "Row"),
+                })
+                .collect();
+            snapshot
+        };
+        let mut cache = Cache::default();
+        let first = cache.insert(large("old")).unwrap();
+        assert_eq!(cache.element_registry.len(), MAX_REGISTERED_ELEMENTS + 1);
+        let second = cache.insert(large("old")).unwrap();
+        assert_eq!(second.element_ids, first.element_ids);
+
+        // Only bindings last seen in older generations are forgotten.
+        let third = cache.insert(large("new")).unwrap();
+        assert_eq!(cache.element_registry.len(), MAX_REGISTERED_ELEMENTS + 1);
+        let fourth = cache.insert(large("new")).unwrap();
+        assert_eq!(fourth.element_ids, third.element_ids);
+        assert!(!third.element_ids.contains(&first.element_ids[0]));
     }
 
     #[test]
@@ -10901,11 +13766,11 @@ pub(crate) mod tests {
 
         let error = runtime
             .execute_call(ToolCall::Act {
-                target,
-                source: ObservationRef {
+                target: Some(target),
+                source: Some(ObservationRef {
                     observation_id,
                     frame_id: Some("frame-ffffffffffffffff".into()),
-                },
+                }),
                 operation: ActOperation::Keyboard {
                     focus: KeyboardFocus::Point(KeyboardPoint { x: 10.0, y: 20.0 }),
                     events: vec![KeyboardEvent::Press("Enter".into())],
@@ -10933,6 +13798,7 @@ pub(crate) mod tests {
         fail_cleanup_after_dispatch: bool,
         cleanups: AtomicUsize,
         deactivate_during_preparation: Option<FakeAdapter>,
+        preparation_error: Option<&'static str>,
     }
 
     impl Default for RecordingFocusedScreenshots {
@@ -10946,6 +13812,7 @@ pub(crate) mod tests {
                 fail_cleanup_after_dispatch: false,
                 cleanups: AtomicUsize::new(0),
                 deactivate_during_preparation: None,
+                preparation_error: None,
             }
         }
     }
@@ -10970,6 +13837,9 @@ pub(crate) mod tests {
             _action: &GeneratedInputAction,
         ) -> Result<(), String> {
             self.prepared.fetch_add(1, Ordering::AcqRel);
+            if let Some(error) = self.preparation_error {
+                return Err(error.into());
+            }
             if let Some(fake) = &self.deactivate_during_preparation {
                 let mut state = fake.state.lock().unwrap();
                 state.app.windows[0].states.remove("active");
@@ -10996,6 +13866,7 @@ pub(crate) mod tests {
             progress: Arc<ActionProgress>,
         ) -> Result<(), InputError> {
             self.actions.lock().unwrap().push(action);
+            progress.mark_started();
             if self.block_dispatch {
                 if self.complete_before_block {
                     progress.mark_completed();
@@ -11183,11 +14054,11 @@ pub(crate) mod tests {
         events: Vec<KeyboardEvent>,
     ) -> ToolCall {
         ToolCall::Act {
-            target: test_target(),
-            source: ObservationRef {
+            target: Some(test_target()),
+            source: Some(ObservationRef {
                 observation_id,
                 frame_id: None,
-            },
+            }),
             operation: ActOperation::Keyboard {
                 focus: KeyboardFocus::Semantic { element_id },
                 events,
@@ -11196,10 +14067,55 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn unrepresentable_text_refuses_before_semantic_focus_or_input() {
+        let fake = FakeAdapter::tree();
+        fake.state
+            .lock()
+            .unwrap()
+            .nodes
+            .get_mut(&id("edit"))
+            .unwrap()
+            .states
+            .remove("focused");
+        let runtime = SemanticRuntime::with_screenshot_provider(
+            fake.clone(),
+            RecordingFocusedScreenshots {
+                preparation_error: Some("active EIS keymap cannot represent keysym 0xe9"),
+                ..Default::default()
+            },
+            test_config(),
+        );
+        runtime.execute_call(observe_call()).await.unwrap();
+        let (element_id, _) = editable_element_id(&runtime);
+        let error = runtime
+            .execute_call(focused_keyboard_call(
+                current_observation_id(&runtime),
+                element_id,
+                vec![KeyboardEvent::Type("café".into())],
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "unsupported_input");
+        assert_eq!(error.outcome, ToolOutcome::NotStarted);
+        assert!(!error.retryable);
+        assert!(fake.state.lock().unwrap().actions.is_empty());
+        assert!(runtime.screenshots.actions.lock().unwrap().is_empty());
+        assert_eq!(runtime.screenshots.cleanups.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
     async fn semantic_focus_types_into_verified_element_without_pointer_or_mapping() {
         use std::sync::atomic::Ordering;
 
         let fake = FakeAdapter::tree();
+        fake.state
+            .lock()
+            .unwrap()
+            .nodes
+            .get_mut(&id("edit"))
+            .unwrap()
+            .states
+            .remove("focused");
         let runtime = SemanticRuntime::with_screenshot_provider(
             fake.clone(),
             RecordingFocusedScreenshots::default(),
@@ -11208,14 +14124,16 @@ pub(crate) mod tests {
         runtime.execute_call(observe_call()).await.unwrap();
         let (element_id, object) = editable_element_id(&runtime);
 
-        let output = runtime
-            .execute_call(focused_keyboard_call(
-                current_observation_id(&runtime),
-                element_id.clone(),
-                vec![KeyboardEvent::Press("Enter".into())],
-            ))
-            .await
-            .unwrap();
+        let mut call = focused_keyboard_call(
+            current_observation_id(&runtime),
+            element_id.clone(),
+            vec![KeyboardEvent::Press("Enter".into())],
+        );
+        if let ToolCall::Act { source, target, .. } = &mut call {
+            *source = None;
+            *target = None;
+        }
+        let output = runtime.execute_call(call).await.unwrap();
 
         // AT-SPI GrabFocus ran for the target element before any typing.
         assert!(
@@ -11269,6 +14187,106 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn omitted_focus_types_into_the_active_window_without_moving_focus() {
+        use std::sync::atomic::Ordering;
+
+        let fake = FakeAdapter::tree();
+        let runtime = SemanticRuntime::with_screenshot_provider(
+            fake.clone(),
+            RecordingFocusedScreenshots::default(),
+            test_config(),
+        );
+        runtime.execute_call(observe_call()).await.unwrap();
+        let target = current_snapshot(&runtime).target_ref.clone().unwrap();
+        let call = || ToolCall::Act {
+            target: Some(target.clone()),
+            source: None,
+            operation: ActOperation::Keyboard {
+                focus: KeyboardFocus::Window,
+                events: vec![KeyboardEvent::Press("ctrl+s".into())],
+            },
+        };
+
+        // A background window is refused before anything is invalidated or sent.
+        fake.state.lock().unwrap().app.windows[0]
+            .states
+            .remove("active");
+        let observation_id = current_observation_id(&runtime);
+        let refused = runtime.execute_call(call()).await.unwrap_err();
+        assert_eq!(refused.code, "target_unavailable");
+        assert_eq!(refused.outcome, ToolOutcome::NotStarted);
+        assert!(refused.recovery.contains("activate_window"));
+        assert!(runtime.screenshots.actions.lock().unwrap().is_empty());
+        assert!(runtime.required_cached(&observation_id).is_ok());
+
+        fake.state.lock().unwrap().app.windows[0]
+            .states
+            .insert("active".into());
+        let output = runtime.execute_call(call()).await.unwrap();
+        // No focus request of any kind: the window's own focus receives keys.
+        assert!(
+            !fake
+                .state
+                .lock()
+                .unwrap()
+                .actions
+                .iter()
+                .any(|(_, action)| matches!(action, SemanticAction::GrabFocus))
+        );
+        assert_eq!(runtime.screenshots.prepared.load(Ordering::Acquire), 1);
+        assert_eq!(
+            *runtime.screenshots.actions.lock().unwrap(),
+            [GeneratedInputAction::KeyboardTransaction {
+                focus: KeyboardFocus::Window,
+                events: vec![KeyboardEvent::Press("ctrl+s".into())],
+            }]
+        );
+        let structured = output.structured_content.unwrap();
+        assert_eq!(structured["focus"]["focus_kind"], "window");
+        assert_eq!(structured["focus"]["requested"], false);
+        assert_eq!(structured["focus"]["window_active"], true);
+        assert!(structured["focus"]["element_focused"].is_null());
+        assert_eq!(
+            structured["delivery"]["mechanism"],
+            "eis_type_into_active_window"
+        );
+        assert_eq!(structured["delivery"]["focus_verified"], false);
+        assert!(
+            output
+                .text
+                .contains("focus=window focus_verified=window_active")
+        );
+
+        // Naming no window binds the window this session last observed or
+        // acted on, under the same active-window refusal.
+        let unnamed = || ToolCall::Act {
+            target: None,
+            source: None,
+            operation: ActOperation::Keyboard {
+                focus: KeyboardFocus::Window,
+                events: vec![KeyboardEvent::Press("ctrl+s".into())],
+            },
+        };
+        let output = runtime.execute_call(unnamed()).await.unwrap();
+        assert_eq!(
+            output.structured_content.unwrap()["target"],
+            target.as_json()
+        );
+        assert_eq!(runtime.screenshots.actions.lock().unwrap().len(), 2);
+        fake.state.lock().unwrap().app.windows[0]
+            .states
+            .remove("active");
+        let refused = runtime.execute_call(unnamed()).await.unwrap_err();
+        assert_eq!(refused.code, "target_unavailable");
+        assert_eq!(runtime.screenshots.actions.lock().unwrap().len(), 2);
+        // With nothing retained there is no window to bind.
+        runtime.lock_cache().unwrap().invalidate_all();
+        let unbound = runtime.execute_call(unnamed()).await.unwrap_err();
+        assert_eq!(unbound.code, "stale_state");
+        assert_eq!(unbound.outcome, ToolOutcome::NotStarted);
+    }
+
+    #[tokio::test]
     async fn semantic_focus_refusal_types_nothing() {
         use std::sync::atomic::Ordering;
 
@@ -11306,7 +14324,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn already_focused_element_survives_idempotent_grab_focus_refusal() {
+    async fn already_focused_element_does_not_repeat_grab_focus() {
         use std::sync::atomic::Ordering;
 
         let fake = FakeAdapter::tree();
@@ -11334,7 +14352,8 @@ pub(crate) mod tests {
             true
         );
         assert!(
-            fake.state
+            !fake
+                .state
                 .lock()
                 .unwrap()
                 .actions
@@ -12080,6 +15099,9 @@ pub(crate) mod tests {
         /// dispatches without granting active state, so only the
         /// post-dispatch desktop hunt can verify it.
         ActivateWithoutActive,
+        /// Emulates a GTK3/Qt window on Wayland: the toolkit answers the
+        /// activation request with `false` and nothing changes.
+        ActivateDeclined,
     }
 
     impl FakeWidgetFault {
@@ -12104,6 +15126,8 @@ pub(crate) mod tests {
         discover_delay: Option<Duration>,
         block_reads: bool,
         fail_actions: bool,
+        // A window (and its root node) the next successful action opens.
+        opens_on_action: Option<(WindowInfo, Vec<NodeInfo>)>,
         semantic_focus_succeeds: bool,
         fail_discover: bool,
         // Sub-steps of the emulated ReplaceText contract (focus, then set,
@@ -12300,14 +15324,17 @@ pub(crate) mod tests {
                 ActionInfo {
                     name: "default".into(),
                     description: "Default".into(),
+                    keybinding: String::new(),
                 },
                 ActionInfo {
                     name: "activate".into(),
                     description: "Activate".into(),
+                    keybinding: String::new(),
                 },
                 ActionInfo {
                     name: "menu".into(),
                     description: "Show Menu".into(),
+                    keybinding: String::new(),
                 },
             ]));
             button.window_frame = Some(Rect {
@@ -12321,6 +15348,7 @@ pub(crate) mod tests {
             edit.capabilities = NodeCapabilities::Inspected(InspectedCapabilities {
                 actions: ActionCapabilities::Unsupported,
                 component: true,
+                focus: true,
                 editable_text: true,
                 value: false,
             });
@@ -12331,6 +15359,7 @@ pub(crate) mod tests {
             slider.capabilities = NodeCapabilities::Inspected(InspectedCapabilities {
                 actions: ActionCapabilities::Unsupported,
                 component: false,
+                focus: false,
                 editable_text: false,
                 value: true,
             });
@@ -12351,6 +15380,7 @@ pub(crate) mod tests {
                     discover_delay: None,
                     block_reads: false,
                     fail_actions: false,
+                    opens_on_action: None,
                     semantic_focus_succeeds: true,
                     fail_discover: false,
                     replace_steps: Vec::new(),
@@ -12422,6 +15452,12 @@ pub(crate) mod tests {
             if state.fail_actions {
                 return Err(operational_error("fake semantic action failure"));
             }
+            if let Some((window, nodes)) = state.opens_on_action.take() {
+                state.app.windows.push(window);
+                for node in nodes {
+                    state.nodes.insert(node.object.clone(), node);
+                }
+            }
             if focus && !state.grab_focus(object)? {
                 return Err(operational_error(
                     "AT-SPI GrabFocus not granted by the fake component",
@@ -12430,14 +15466,131 @@ pub(crate) mod tests {
             Ok(())
         }
 
-        async fn activate(&self, object: &ObjectId) -> Result<(), RuntimeError> {
+        async fn activate(&self, object: &ObjectId) -> Result<bool, RuntimeError> {
             let mut state = self.state.lock().unwrap();
             state.activation_calls.push(object.clone());
-            if state.widget_fault != FakeWidgetFault::ActivateWithoutActive {
-                state.app.windows[0].states.insert("active".into());
+            match state.widget_fault {
+                FakeWidgetFault::ActivateDeclined => return Ok(false),
+                FakeWidgetFault::ActivateWithoutActive => {}
+                _ => {
+                    state.app.windows[0].states.insert("active".into());
+                }
             }
-            Ok(())
+            Ok(true)
         }
+    }
+
+    #[derive(Clone)]
+    struct SelectiveAdapter {
+        inner: FakeAdapter,
+        detailed: Arc<Mutex<Vec<ObjectId>>>,
+    }
+
+    impl AccessibilityAdapter for SelectiveAdapter {
+        async fn discover(&self) -> Result<Vec<AppInfo>, RuntimeError> {
+            self.inner.discover().await
+        }
+
+        async fn read_node<'a>(
+            &'a self,
+            object: &'a ObjectId,
+            limit: usize,
+        ) -> Result<NodeInfo, RuntimeError> {
+            self.detailed.lock().unwrap().push(object.clone());
+            self.inner.read_node(object, limit).await
+        }
+
+        async fn read_summary<'a>(
+            &'a self,
+            object: &'a ObjectId,
+            limit: usize,
+            children: usize,
+        ) -> Result<NodeSummary, RuntimeError> {
+            let mut node = self.inner.read_node(object, limit).await?;
+            node.value = None;
+            node.text = None;
+            node.selected_text = None;
+            node.capabilities = NodeCapabilities::InspectionFailed;
+            let children_truncated = node.children.len() > children;
+            node.children.truncate(children);
+            Ok(NodeSummary {
+                node,
+                details_ready: false,
+                children_truncated,
+            })
+        }
+
+        async fn act<'a>(
+            &'a self,
+            object: &'a ObjectId,
+            action: SemanticAction,
+        ) -> Result<(), RuntimeError> {
+            self.inner.act(object, action).await
+        }
+    }
+
+    #[tokio::test]
+    async fn selective_discovery_enriches_only_retained_matches_with_fresh_details() {
+        let inner = FakeAdapter::tree();
+        let button = id("button");
+        inner
+            .state
+            .lock()
+            .unwrap()
+            .nodes
+            .get_mut(&button)
+            .unwrap()
+            .value = Some("before".into());
+        let adapter = SelectiveAdapter {
+            inner: inner.clone(),
+            detailed: Arc::default(),
+        };
+        let reads = adapter.detailed.clone();
+        let runtime = SemanticRuntime::with_config(adapter, test_config());
+        let window = inner.state.lock().unwrap().app.windows[0].clone();
+        let search = AccessibilitySearch {
+            name: Some("Button".into()),
+            role: Some("button".into()),
+            exact: true,
+            limit: 20,
+            max_nodes: 64,
+            timeout_ms: 2000,
+        };
+        let limits = SnapshotLimits {
+            text: 50,
+            nodes: 40,
+            depth: 64,
+        };
+        for expected in ["before", "after"] {
+            inner
+                .state
+                .lock()
+                .unwrap()
+                .nodes
+                .get_mut(&button)
+                .unwrap()
+                .value = Some(expected.into());
+            let result = runtime
+                .traverse(
+                    &window,
+                    AccessibilityScope::Full,
+                    limits,
+                    MAX_CACHED_SNAPSHOT_STRING_BYTES,
+                    Some(&search),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.elements.len(), 1);
+            assert_eq!(result.elements[0].node.value.as_deref(), Some(expected));
+            assert!(matches!(
+                result.elements[0].node.capabilities,
+                NodeCapabilities::Inspected { .. }
+            ));
+            assert_eq!(result.evidence.detailed_nodes, 1);
+            assert!(result.evidence.visited_nodes > result.evidence.detailed_nodes);
+            assert!(!result.evidence.truncated);
+        }
+        assert_eq!(*reads.lock().unwrap(), [button.clone(), button]);
     }
 
     fn fake_runtime(fake: FakeAdapter) -> SemanticRuntime<FakeAdapter> {
@@ -12477,6 +15630,7 @@ pub(crate) mod tests {
                     nodes: runtime.config.default_max_nodes,
                     depth: runtime.config.default_max_depth,
                 },
+                None,
             )
             .await
             .unwrap();
@@ -12505,11 +15659,11 @@ pub(crate) mod tests {
         action: ElementAction,
     ) -> ToolCall {
         ToolCall::Act {
-            target: test_target(),
-            source: ObservationRef {
+            target: Some(test_target()),
+            source: Some(ObservationRef {
                 observation_id,
                 frame_id: None,
-            },
+            }),
             operation: ActOperation::Semantic { element_id, action },
         }
     }
@@ -12524,11 +15678,11 @@ pub(crate) mod tests {
 
     fn spatial_call(observation_id: String, frame_id: String, operation: ActOperation) -> ToolCall {
         ToolCall::Act {
-            target: test_target(),
-            source: ObservationRef {
+            target: Some(test_target()),
+            source: Some(ObservationRef {
                 observation_id,
                 frame_id: Some(frame_id),
-            },
+            }),
             operation,
         }
     }
@@ -12539,11 +15693,11 @@ pub(crate) mod tests {
         events: Vec<KeyboardEvent>,
     ) -> ToolCall {
         ToolCall::Act {
-            target: test_target(),
-            source: ObservationRef {
+            target: Some(test_target()),
+            source: Some(ObservationRef {
                 observation_id,
                 frame_id: Some("frame-0000000000000000".into()),
-            },
+            }),
             operation: ActOperation::Keyboard { focus, events },
         }
     }
@@ -12562,6 +15716,8 @@ pub(crate) mod tests {
             view: AccessibilityScope::Full,
             element_query: None,
             app: app(&format!("App {pid}"), pid, "Main"),
+            search: None,
+            traversal: TraversalEvidence::default(),
             window: window("Main", &["active", "showing"]),
             generation: 0,
             elements: vec![ElementSnapshot {
@@ -12638,6 +15794,7 @@ pub(crate) mod tests {
         NodeCapabilities::Inspected(InspectedCapabilities {
             actions,
             component: false,
+            focus: false,
             editable_text: false,
             value: false,
         })

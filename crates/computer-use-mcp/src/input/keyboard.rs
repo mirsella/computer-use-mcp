@@ -108,7 +108,12 @@ fn parse_token(value: &str) -> Result<(u32, bool), String> {
                 return unicode_keysym(character.to_ascii_lowercase())
                     .map(|keysym| (keysym, false));
             }
-            return Err(format!("unknown key name {value:?}"));
+            // X keysym names as used by xdotool: comma, period, semicolon, Print, Menu…
+            let keysym = xkb::keysym_from_name(value, xkb::KEYSYM_CASE_INSENSITIVE);
+            if keysym.raw() == 0 {
+                return Err(format!("unknown key name {value:?}"));
+            }
+            return Ok((keysym.raw(), is_modifier_keysym(keysym)));
         }
     };
     let keysym = xkb::keysym_from_name(xkb_name, xkb::KEYSYM_CASE_INSENSITIVE).raw();
@@ -116,6 +121,27 @@ fn parse_token(value: &str) -> Result<(u32, bool), String> {
         return Err(format!("XKB does not recognize key name {xkb_name:?}"));
     }
     Ok((keysym, modifier))
+}
+
+fn is_modifier_keysym(keysym: xkb::Keysym) -> bool {
+    use xkb::Keysym;
+    matches!(
+        keysym,
+        Keysym::Shift_L
+            | Keysym::Shift_R
+            | Keysym::Control_L
+            | Keysym::Control_R
+            | Keysym::Alt_L
+            | Keysym::Alt_R
+            | Keysym::Meta_L
+            | Keysym::Meta_R
+            | Keysym::Super_L
+            | Keysym::Super_R
+            | Keysym::Hyper_L
+            | Keysym::Hyper_R
+            | Keysym::ISO_Level3_Shift
+            | Keysym::ISO_Level5_Shift
+    )
 }
 
 fn function_key(name: &str) -> Option<&'static str> {
@@ -148,6 +174,27 @@ mod tests {
         assert_eq!(chord.key, xkb::Keysym::KP_0.raw());
         assert!(parse_chord("ctrl+wat").unwrap_err().contains("unknown"));
         assert_eq!(parse_chord("Ctrl+L").unwrap().key, xkb::Keysym::l.raw());
+        // xdotool-style X keysym names resolve; "+" itself is spelled plus.
+        assert_eq!(
+            parse_chord("ctrl+shift+comma").unwrap(),
+            parse_chord("ctrl+shift+,").unwrap()
+        );
+        assert_eq!(
+            parse_chord("period").unwrap().key,
+            xkb::Keysym::period.raw()
+        );
+        assert_eq!(
+            parse_chord("ctrl+plus").unwrap().key,
+            xkb::Keysym::plus.raw()
+        );
+        assert_eq!(parse_chord("Menu").unwrap().key, xkb::Keysym::Menu.raw());
+        let alt_r = parse_chord("Alt_R+F4").unwrap();
+        assert_eq!(alt_r.modifiers, vec![xkb::Keysym::Alt_R.raw()]);
+        assert!(
+            parse_chord("ctrl+Shift_R")
+                .unwrap_err()
+                .contains("non-modifier")
+        );
         for direction in ["Left", "Right", "Up", "Down"] {
             let alias = format!("Arrow{direction}");
             assert_eq!(

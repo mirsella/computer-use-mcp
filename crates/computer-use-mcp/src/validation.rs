@@ -15,7 +15,8 @@ pub const MAX_DRAG_POINTS: usize = 32;
 pub const MAX_KEYBOARD_EVENTS: usize = 8;
 pub const MAX_KEYBOARD_TRANSACTION_TEXT: usize = 4_096;
 pub const MAX_KEYBOARD_MODIFIERS: usize = 4;
-pub const MAX_KEYBOARD_EXPANDED_ACTIONS: usize = 4_096;
+pub const MAX_KEYBOARD_EXPANDED_ACTIONS: usize =
+    MAX_KEYBOARD_TRANSACTION_TEXT + MAX_KEYBOARD_EVENTS - 1;
 pub const MAX_WAIT_TIMEOUT_MS: u64 = 5_000;
 pub const MAX_HUMAN_IDLE_TIMEOUT_MS: u64 = 120_000;
 // The stable interval must fit inside the default wait deadline while still
@@ -277,7 +278,30 @@ impl Default for AccessibilityLimits {
 pub struct AccessibilityRequest {
     pub scope: AccessibilityScope,
     pub query: Option<String>,
+    pub search: Option<AccessibilitySearch>,
     pub limits: AccessibilityLimits,
+}
+
+/// A bounded native-name/role search, not a persistent element selector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessibilitySearch {
+    pub name: Option<String>,
+    pub role: Option<String>,
+    pub exact: bool,
+    pub limit: usize,
+    pub max_nodes: usize,
+    pub timeout_ms: u64,
+}
+
+impl AccessibilitySearch {
+    pub fn as_json(&self) -> Value {
+        serde_json::json!({"name": self.name, "role": self.role, "exact": self.exact,
+            "limit": self.limit, "max_nodes": self.max_nodes, "timeout_ms": self.timeout_ms})
+    }
+
+    pub fn string_bytes(&self) -> usize {
+        self.name.as_ref().map_or(0, String::len) + self.role.as_ref().map_or(0, String::len)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,7 +319,12 @@ pub struct KeyboardPoint {
 #[derive(Debug, Clone, PartialEq)]
 pub enum KeyboardFocus {
     Point(KeyboardPoint),
-    Semantic { element_id: String },
+    Semantic {
+        element_id: String,
+    },
+    /// Whatever currently holds keyboard focus in the target window, which
+    /// must be the active window. No focus click and no GrabFocus is sent.
+    Window,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -392,6 +421,37 @@ pub enum WaitCondition {
     },
 }
 
+impl ActOperation {
+    pub(crate) fn source_element_id(&self) -> Option<&str> {
+        match self {
+            Self::Semantic { element_id, .. }
+            | Self::Keyboard {
+                focus: KeyboardFocus::Semantic { element_id },
+                ..
+            }
+            | Self::Paste {
+                focus: KeyboardFocus::Semantic { element_id },
+                ..
+            } => Some(element_id),
+            _ => None,
+        }
+    }
+
+    /// Keyboard or paste aimed at the target window's current focus.
+    pub(crate) fn window_focus(&self) -> bool {
+        matches!(
+            self,
+            Self::Keyboard {
+                focus: KeyboardFocus::Window,
+                ..
+            } | Self::Paste {
+                focus: KeyboardFocus::Window,
+                ..
+            }
+        )
+    }
+}
+
 impl ToolCall {
     pub const fn requires_visual_session(&self) -> bool {
         match self {
@@ -475,8 +535,8 @@ pub enum ToolCall {
         crop: ObserveCrop,
     },
     Act {
-        target: TargetRef,
-        source: ObservationRef,
+        target: Option<TargetRef>,
+        source: Option<ObservationRef>,
         operation: ActOperation,
     },
     WaitFor {
@@ -490,11 +550,42 @@ pub fn validate_call(
     name: &str,
     mut arguments: JsonObject<String, Value>,
 ) -> Result<ToolCall, RuntimeError> {
+    if name == "act" && arguments.contains_key("operations") {
+        return invalid(
+            "act applies one \"operation\" object per call, not an \"operations\" array; send each operation in its own call",
+        );
+    }
+    if name == "act" && arguments.contains_key("element_id") {
+        return invalid(
+            "element_id belongs inside operation, not beside it: {\"operation\":{\"type\":\"semantic\",\"element_id\":\"EL\",\"action\":{\"type\":\"invoke\"}}}",
+        );
+    }
+    if name == "wait_for" && arguments.contains_key("duration_ms") {
+        return invalid(
+            "wait_for is condition-driven: supply condition and timeout_ms, not duration_ms; request help for wait_for",
+        );
+    }
+    // Bare window IDs beside the other arguments mean the target; fold them
+    // into the documented object. Both IDs are still required and checked.
+    if matches!(name, "activate_window" | "observe" | "act" | "wait_for")
+        && !arguments.contains_key("target")
+        && arguments.contains_key("app_instance_id")
+        && arguments.contains_key("window_instance_id")
+    {
+        let mut target = JsonObject::new();
+        for key in ["app_instance_id", "window_instance_id"] {
+            if let Some(value) = arguments.remove(key) {
+                target.insert(key.into(), value);
+            }
+        }
+        arguments.insert("target".into(), Value::Object(target));
+    }
     let call = match name {
         "list_desktop" => {
-            let scope = match required_string(&mut arguments, "scope")?.as_str() {
-                "windows" => DesktopScope::Windows,
-                "applications" => DesktopScope::Applications,
+            let scope = match arguments.remove("scope") {
+                None => DesktopScope::Windows,
+                Some(Value::String(value)) if value == "windows" => DesktopScope::Windows,
+                Some(Value::String(value)) if value == "applications" => DesktopScope::Applications,
                 _ => return invalid("scope must be \"windows\" or \"applications\""),
             };
             let limit = match arguments.remove("limit") {
@@ -537,11 +628,39 @@ pub fn validate_call(
             accessibility: optional_accessibility(&mut arguments, "accessibility")?,
             crop: optional_observe_crop(&mut arguments, "crop")?,
         },
-        "act" => ToolCall::Act {
-            target: required_target(&mut arguments, "target")?,
-            source: required_observation_ref(&mut arguments, "source_observation")?,
-            operation: act_operation(required_object(&mut arguments, "operation")?)?,
-        },
+        "act" => {
+            // A bare observation_id/frame_id beside operation means the source
+            // observation; fold it into the documented object shape.
+            if !arguments.contains_key("source_observation")
+                && let Some(observation_id) = arguments.remove("observation_id")
+            {
+                let mut source = JsonObject::new();
+                source.insert("observation_id".into(), observation_id);
+                if let Some(frame_id) = arguments.remove("frame_id") {
+                    source.insert("frame_id".into(), frame_id);
+                }
+                arguments.insert("source_observation".into(), Value::Object(source));
+            }
+            // The same object nested inside operation is hoisted beside it.
+            if !arguments.contains_key("source_observation")
+                && let Some(Value::Object(operation)) = arguments.get_mut("operation")
+                && let Some(source) = operation.remove("source_observation")
+            {
+                arguments.insert("source_observation".into(), source);
+            }
+            ToolCall::Act {
+                target: optional_target(&mut arguments, "target")?,
+                source: if arguments.contains_key("source_observation") {
+                    Some(required_observation_ref(
+                        &mut arguments,
+                        "source_observation",
+                    )?)
+                } else {
+                    None
+                },
+                operation: act_operation(required_object(&mut arguments, "operation")?)?,
+            }
+        }
         "wait_for" => {
             let condition = wait_condition(required_object(&mut arguments, "condition")?)?;
             let target = optional_target(&mut arguments, "target")?;
@@ -572,6 +691,13 @@ fn validate_action_source(call: &ToolCall) -> Result<(), RuntimeError> {
     else {
         return Ok(());
     };
+    // Keyboard/paste without focus needs no source here: the runtime binds it
+    // to the named window, or to the window last observed or acted on.
+    if source.is_none() && operation.source_element_id().is_none() && !operation.window_focus() {
+        return invalid(
+            "source_observation is required except for exact retained semantic elements/focus",
+        );
+    }
     let needs_frame = match operation {
         ActOperation::Pointer { .. } => true,
         ActOperation::Keyboard { focus, .. } | ActOperation::Paste { focus, .. } => {
@@ -582,9 +708,13 @@ fn validate_action_source(call: &ToolCall) -> Result<(), RuntimeError> {
     if !needs_frame {
         return Ok(());
     }
-    if source.frame_id.is_none() {
+    if source
+        .as_ref()
+        .and_then(|source| source.frame_id.as_ref())
+        .is_none()
+    {
         return invalid(
-            "source_observation.frame_id is required for pointer, keyboard, and paste operations",
+            "source_observation.frame_id is required for pointer and point-focused keyboard/paste operations",
         );
     }
     Ok(())
@@ -726,6 +856,53 @@ fn optional_accessibility(
         }
         Some(_) => return invalid("accessibility.query must be a string"),
     };
+    let search = match object.remove("search") {
+        None => None,
+        Some(Value::Object(mut search)) => {
+            if query.is_some() {
+                return invalid("accessibility.query and search are mutually exclusive");
+            }
+            let mut field = |key| -> Result<Option<String>, RuntimeError> {
+                match search.remove(key) {
+                    None => Ok(None),
+                    Some(Value::String(value))
+                        if !value.trim().is_empty()
+                            && value.chars().count() <= MAX_QUERY_LENGTH =>
+                    {
+                        Ok(Some(value))
+                    }
+                    _ => invalid(
+                        "search name/role must be nonblank strings of at most 1000 characters",
+                    ),
+                }
+            };
+            let name = field("name")?;
+            let role = field("role")?;
+            if name.is_none() && role.is_none() {
+                return invalid("search requires name and/or role");
+            }
+            let exact = match search.remove("exact") {
+                None => false,
+                Some(Value::Bool(value)) => value,
+                _ => return invalid("search.exact must be boolean"),
+            };
+            let limit = optional_bounded(&mut search, "limit", 100)?.unwrap_or(20);
+            let max_nodes =
+                optional_bounded(&mut search, "max_nodes", MAX_TREE_NODES)?.unwrap_or(500);
+            let timeout_ms =
+                optional_bounded(&mut search, "timeout_ms", 2_000_u64)?.unwrap_or(2_000);
+            reject_unknown(search)?;
+            Some(AccessibilitySearch {
+                name,
+                role,
+                exact,
+                limit,
+                max_nodes,
+                timeout_ms,
+            })
+        }
+        Some(_) => return invalid("accessibility.search must be an object"),
+    };
     let limits = match object.remove("limits") {
         None => AccessibilityLimits::default(),
         Some(Value::Object(mut limits)) => {
@@ -761,6 +938,7 @@ fn optional_accessibility(
     Ok(Some(AccessibilityRequest {
         scope,
         query,
+        search,
         limits,
     }))
 }
@@ -805,6 +983,24 @@ fn is_opaque_id(value: &str, prefix: &str) -> bool {
 }
 
 fn act_operation(mut object: JsonObject<String, Value>) -> Result<ActOperation, RuntimeError> {
+    // A semantic action named as the operation type, with its element, is the
+    // semantic operation; its fields are validated exactly as usual.
+    if let Some(Value::String(kind)) = object.get("type")
+        && matches!(kind.as_str(), "invoke" | "set_value" | "named" | "focus")
+        && object.contains_key("element_id")
+    {
+        if !object.contains_key("action") {
+            let mut action = JsonObject::new();
+            action.insert("type".into(), Value::String(kind.clone()));
+            for key in ["value", "name"] {
+                if let Some(value) = object.remove(key) {
+                    action.insert(key.into(), value);
+                }
+            }
+            object.insert("action".into(), Value::Object(action));
+        }
+        object.insert("type".into(), Value::String("semantic".into()));
+    }
     let operation = match required_string(&mut object, "type")?.as_str() {
         "pointer" => ActOperation::Pointer {
             action: act_pointer_action(required_object(&mut object, "action")?)?,
@@ -814,11 +1010,11 @@ fn act_operation(mut object: JsonObject<String, Value>) -> Result<ActOperation, 
             action: element_action(required_object(&mut object, "action")?)?,
         },
         "keyboard" => ActOperation::Keyboard {
-            focus: keyboard_focus_target(required_object(&mut object, "focus")?)?,
+            focus: keyboard_focus(&mut object)?,
             events: keyboard_events(&mut object)?,
         },
         "paste" => ActOperation::Paste {
-            focus: keyboard_focus_target(required_object(&mut object, "focus")?)?,
+            focus: keyboard_focus(&mut object)?,
             text: paste_text(required_string(&mut object, "text")?)?,
         },
         _ => return invalid("operation.type must be pointer, semantic, keyboard, or paste"),
@@ -930,6 +1126,15 @@ fn act_pointer_action(
     Ok(action)
 }
 
+/// An omitted `focus` means the target window's current keyboard focus.
+fn keyboard_focus(object: &mut JsonObject<String, Value>) -> Result<KeyboardFocus, RuntimeError> {
+    if object.contains_key("focus") {
+        keyboard_focus_target(required_object(object, "focus")?)
+    } else {
+        Ok(KeyboardFocus::Window)
+    }
+}
+
 fn keyboard_focus_target(
     mut object: JsonObject<String, Value>,
 ) -> Result<KeyboardFocus, RuntimeError> {
@@ -941,8 +1146,17 @@ fn keyboard_focus_target(
         "semantic" => KeyboardFocus::Semantic {
             element_id: required_opaque_id(&mut object, "element_id", "e")?,
         },
-        "element" => return invalid("keyboard focus must be a point in the source screenshot PNG"),
-        _ => return invalid("keyboard focus.type must be point or semantic"),
+        "window" | "current" | "active" => {
+            return invalid(
+                "omit \"focus\" to type into the target window's current focus; focus.type is semantic or point",
+            );
+        }
+        "element" => {
+            return invalid(
+                "keyboard focus.type \"element\" does not exist; use {\"type\":\"semantic\",\"element_id\":…}",
+            );
+        }
+        _ => return invalid("keyboard focus.type must be semantic or point"),
     };
     reject_unknown(object)?;
     Ok(focus)
@@ -960,28 +1174,7 @@ fn keyboard_events(
             "keyboard events must contain 1 through {MAX_KEYBOARD_EVENTS} events"
         ));
     }
-    let (mut type_count, mut press_count) = (0, 0);
-    for kind in values.iter().filter_map(|value| {
-        value
-            .as_object()
-            .and_then(|object| object.get("type"))
-            .and_then(Value::as_str)
-    }) {
-        match kind {
-            "type" => type_count += 1,
-            "press" => press_count += 1,
-            _ => {}
-        }
-    }
-    if type_count > 0 && (type_count != 1 || press_count != 0 || values.len() != 1) {
-        return invalid(
-            "keyboard events must be either press-only or exactly one non-empty type event; mixed press/type transactions are rejected",
-        );
-    }
-    if type_count == 0 && press_count != values.len() {
-        return invalid("keyboard event.type must be press or type");
-    }
-    values
+    let events: Vec<_> = values
         .into_iter()
         .map(|value| {
             let mut event = match value {
@@ -1000,6 +1193,12 @@ fn keyboard_events(
                             "keyboard chords may contain at most {MAX_KEYBOARD_MODIFIERS} modifiers"
                         ));
                     }
+                    // Reject unknown key names before any state is consumed.
+                    crate::input::keyboard::parse_chord(&key).map_err(|error| {
+                        RuntimeError::invalid_arguments(format!(
+                            "{error}; use modifiers ctrl/alt/shift/super plus one key such as a, F2, Return, comma or period"
+                        ))
+                    })?;
                     KeyboardEvent::Press(key)
                 }
                 "type" => {
@@ -1022,7 +1221,20 @@ fn keyboard_events(
             reject_unknown(event)?;
             Ok(result)
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    let text_count: usize = events
+        .iter()
+        .map(|event| match event {
+            KeyboardEvent::Type(text) => text.chars().count(),
+            KeyboardEvent::Press(_) => 0,
+        })
+        .sum();
+    if text_count > MAX_KEYBOARD_TRANSACTION_TEXT {
+        return invalid(format!(
+            "keyboard transaction text must contain at most {MAX_KEYBOARD_TRANSACTION_TEXT} Unicode scalar values in total"
+        ));
+    }
+    Ok(events)
 }
 
 fn wait_condition(mut object: JsonObject<String, Value>) -> Result<WaitCondition, RuntimeError> {
@@ -1064,7 +1276,11 @@ fn wait_condition(mut object: JsonObject<String, Value>) -> Result<WaitCondition
         "window_closed" => WaitCondition::WindowClosed {
             window_instance_id: required_opaque_id(&mut object, "window_instance_id", "win")?,
         },
-        _ => return invalid("condition.type is not a supported wait condition"),
+        _ => {
+            return invalid(
+                "condition.type must be frame_advanced, frame_changed, frame_stable, accessibility_advanced, element_state, element_value, window_opened, window_closed or human_idle; for a plain pause use frame_stable with for_ms",
+            );
+        }
     };
     reject_unknown(object)?;
     Ok(condition)
@@ -1087,9 +1303,17 @@ fn required_timeout(
 }
 
 fn element_action(mut object: JsonObject<String, Value>) -> Result<ElementAction, RuntimeError> {
+    // The rendering advertises `named_actions`, so its singular is a common
+    // spelling of the name field.
+    if !object.contains_key("name")
+        && let Some(name) = object.remove("named_action")
+    {
+        object.insert("name".into(), name);
+    }
     let action = match required_string(&mut object, "type")?.as_str() {
-        "invoke" => ElementAction::Invoke,
-        "named" => {
+        // invoke with a name is the named action; invoke alone is the primary.
+        "invoke" if !object.contains_key("name") => ElementAction::Invoke,
+        "invoke" | "named" => {
             let name = bounded_text(
                 required_string(&mut object, "name")?,
                 "name",

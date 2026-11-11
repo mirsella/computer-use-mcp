@@ -391,7 +391,7 @@ fn request_summary(call: &ToolCall) -> Value {
                     json!({"type":"paste","text_chars":text.chars().count()})
                 }
             };
-            json!({"target":target.as_json(),"observation_id":source.observation_id,"frame_id":source.frame_id,"operation":operation})
+            json!({"target":target.as_ref().map(|target| target.as_json()),"observation_id":source.as_ref().map(|source| &source.observation_id),"frame_id":source.as_ref().and_then(|source| source.frame_id.as_ref()),"operation":operation})
         }
         ToolCall::WaitFor {
             target,

@@ -44,6 +44,8 @@ pub struct RuntimeError {
     pub retryable: bool,
     pub recovery: String,
     pub action_progress: Option<serde_json::Value>,
+    /// Fresh read-only evidence after an uncertain mutation, never proof of its effect.
+    pub recovery_observation: Option<Box<crate::runtime::ToolOutput>>,
 }
 
 impl RuntimeError {
@@ -95,6 +97,7 @@ impl RuntimeError {
             retryable,
             recovery: recovery.into(),
             action_progress: None,
+            recovery_observation: None,
         }
     }
 

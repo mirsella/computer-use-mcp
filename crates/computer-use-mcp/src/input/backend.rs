@@ -51,7 +51,19 @@ pub enum InputEvent {
 pub struct KeyboardKey {
     pub device_id: u64,
     pub resume_generation: u64,
-    pub keycode: u32,
+    pub keycode: KeyCode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum KeyCode {
+    Physical(u32),
+    /// The physical keyboard remains the seat/modifier authority. This exact
+    /// resumed Text device delivers a keysym, not clipboard/input-method text.
+    Text {
+        device_id: u64,
+        resume_generation: u64,
+        keysym: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -374,7 +386,7 @@ mod tests {
         KeyboardKey {
             device_id: 1,
             resume_generation: 1,
-            keycode,
+            keycode: KeyCode::Physical(keycode),
         }
     }
 }

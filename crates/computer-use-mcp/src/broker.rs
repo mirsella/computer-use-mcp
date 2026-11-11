@@ -27,7 +27,7 @@ use tokio::{
 };
 
 use crate::{
-    contract::{TOOL_NAMES, compact_tool_definitions, tool_definitions},
+    contract::{TOOL_NAMES, action_reference, compact_tool_definitions, tool_definitions},
     errors::{CliError, RuntimeError, ToolOutcome},
     history::{CallHistory, CallRecord},
     runtime::{DesktopRuntime, tool_error_result},
@@ -724,7 +724,8 @@ impl ServerHandler for McpServer {
                     record.action(&tool.name);
                 }
                 let text = match action {
-                    Some(tool) => serde_json::to_string(tool).expect("tool schema serializes"),
+                    Some(tool) => action_reference(&tool.name)
+                        .expect("every advertised action has a compact reference"),
                     None => json!({"actions": TOOL_NAMES}).to_string(),
                 };
                 // One text copy: hosts may also serialize structuredContent into context.
@@ -1021,7 +1022,9 @@ for line in sys.stdin:
     #[tokio::test]
     async fn text_only_element_ids_route_after_independent_projection_truncation() {
         fn spawn(desktop: Desktop, generation: u64) -> io::Result<Worker> {
-            let (_, _, output) = crate::accessibility::tests::oversized_observation_fixture();
+            // Exercise independent production projection budgets deliberately,
+            // not incidental loss from broker annotation's generic fallback.
+            let (_, _, output) = crate::accessibility::tests::oversized_observation_fixture(2_500);
             let mut command = fixture_command(desktop);
             command.env(
                 "OBSERVATION_FIXTURE",
@@ -1080,8 +1083,6 @@ for line in sys.stdin:
             &broker,
             "act",
             json!({
-                "target":structured["target"],
-                "source_observation":{"observation_id":structured["observation_id"]},
                 "operation":{"type":"semantic","element_id":id,"action":{"type":"invoke"}}
             }),
         )
@@ -1093,6 +1094,8 @@ for line in sys.stdin:
         )
         .unwrap();
         assert_eq!(received["operation"]["element_id"], local);
+        assert!(received.get("target").is_none());
+        assert!(received.get("source_observation").is_none());
         assert!(broker.foreground.lock().await.is_none());
         assert!(text.len() <= crate::runtime::MAX_MODEL_TEXT_BYTES);
         assert!(

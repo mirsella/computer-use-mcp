@@ -1,10 +1,14 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use computer_use_mcp::{
     accessibility::{MAX_MODEL_STRUCTURED_BYTES, MAX_MODEL_TEXT_BYTES},
-    contract::{SERVER_INSTRUCTIONS, TOOL_NAMES, compact_tool_definitions, tool_definitions},
+    contract::{
+        SERVER_INSTRUCTIONS, TOOL_NAMES, action_reference, compact_tool_definitions,
+        tool_definitions,
+    },
     encoder::MAX_PNG_BYTES,
     input::keyboard::parse_chord,
     runtime::ToolOutput,
+    validation::{validate_call, validate_routed_call},
 };
 use rmcp::model::{ListToolsResult, NumberOrString, ServerJsonRpcMessage, ServerResult};
 use serde_json::{Value, json};
@@ -84,6 +88,136 @@ fn compact_tools_advertise_only_real_desktop_actions() {
 }
 
 #[test]
+fn compact_starter_templates_use_the_real_native_argument_contract() {
+    fn substitute(value: &mut Value) {
+        match value {
+            Value::String(name) if name == "APP" => *name = "app-0000000000000001".into(),
+            Value::String(name) if name == "WIN" => *name = "win-0000000000000002".into(),
+            Value::String(name) if name == "OBS" => *name = "obs-0000000000000003".into(),
+            Value::String(name) if name == "EL" => *name = "e-0000000000000004".into(),
+            Value::Object(object) => object.values_mut().for_each(substitute),
+            Value::Array(values) => values.iter_mut().for_each(substitute),
+            _ => {}
+        }
+    }
+    let description = compact_tool_definitions()[1].description.as_ref().unwrap();
+    let mut checked = Vec::new();
+    for line in description.lines() {
+        let Some((operation, template)) = line.split_once(' ') else {
+            continue;
+        };
+        if !TOOL_NAMES.contains(&operation) {
+            continue;
+        }
+        let mut arguments: Value = serde_json::from_str(template).unwrap();
+        substitute(&mut arguments);
+        validate_call(operation, arguments.as_object().unwrap().clone()).unwrap();
+        if operation == "act" {
+            arguments["operation"]["action"] = json!({"type":"set_value","value":"café Δ 42"});
+            validate_call(operation, arguments.as_object().unwrap().clone()).unwrap();
+        }
+        checked.push(operation);
+    }
+    assert_eq!(checked, ["list_desktop", "observe", "act"]);
+}
+
+#[test]
+fn compact_help_references_are_valid_complete_and_small() {
+    fn substitute(value: &mut Value) {
+        match value {
+            Value::String(name) => {
+                let replacement = match name.as_str() {
+                    "APP" => "app-0000000000000001",
+                    "WIN" => "win-0000000000000002",
+                    "OBS" => "obs-0000000000000003",
+                    "EL" => "e-0000000000000004",
+                    "FRAME" => "frame-0000000000000005",
+                    _ => return,
+                };
+                *name = replacement.into();
+            }
+            Value::Object(object) => object.values_mut().for_each(substitute),
+            Value::Array(values) => values.iter_mut().for_each(substitute),
+            _ => {}
+        }
+    }
+    // Every field name, enum/const value, and numeric maximum of the JSON
+    // Schema must be named by the compact reference.
+    fn vocabulary(schema: &Value, words: &mut Vec<String>) {
+        match schema {
+            Value::Object(object) => {
+                for (key, value) in object {
+                    match (key.as_str(), value) {
+                        ("properties", Value::Object(properties)) => {
+                            words.extend(properties.keys().cloned());
+                        }
+                        ("enum", Value::Array(values)) => words.extend(
+                            values
+                                .iter()
+                                .filter_map(|value| value.as_str().map(str::to_owned)),
+                        ),
+                        ("const", Value::String(value)) => words.push(value.clone()),
+                        ("maximum" | "maxItems", Value::Number(value)) => {
+                            words.push(value.to_string());
+                        }
+                        _ => {}
+                    }
+                    vocabulary(value, words);
+                }
+            }
+            Value::Array(values) => values.iter().for_each(|value| vocabulary(value, words)),
+            _ => {}
+        }
+    }
+
+    let mut reference_bytes = 0;
+    let mut schema_bytes = 0;
+    for name in TOOL_NAMES {
+        let tool = tool_definitions()
+            .iter()
+            .find(|tool| tool.name == name)
+            .unwrap();
+        let reference = action_reference(name).unwrap();
+        assert!(reference.starts_with(tool.description.as_deref().unwrap()));
+        let mut templates = 0;
+        for line in reference.lines() {
+            let Some(template) = line.strip_prefix(&format!("{name} {{")) else {
+                continue;
+            };
+            let mut arguments: Value = serde_json::from_str(&format!("{{{template}"))
+                .unwrap_or_else(|error| panic!("{name} template is not JSON: {error}: {line}"));
+            substitute(&mut arguments);
+            validate_routed_call(name, arguments.as_object().unwrap().clone())
+                .unwrap_or_else(|error| panic!("{name} template rejected: {error}: {line}"));
+            templates += 1;
+        }
+        assert!(templates >= 1, "{name} has no validated template");
+        let mut words = Vec::new();
+        vocabulary(&Value::Object((*tool.input_schema).clone()), &mut words);
+        for word in words {
+            assert!(
+                reference.contains(&word),
+                "{name} reference omits schema word {word:?}"
+            );
+        }
+        reference_bytes += reference.len();
+        schema_bytes += serde_json::to_vec(tool).unwrap().len();
+    }
+    // The act reference is what agents fetch before pointer or keyboard input.
+    let act = action_reference("act").unwrap();
+    assert!(act.len() <= 1_900, "act reference: {}", act.len());
+    assert!(
+        reference_bytes * 100 <= schema_bytes * 45,
+        "references {reference_bytes} vs schemas {schema_bytes}"
+    );
+    assert!(action_reference("dispatch").is_none());
+    println!(
+        "help references={reference_bytes}; JSON schemas={schema_bytes}; act={}",
+        act.len()
+    );
+}
+
+#[test]
 fn compact_startup_and_on_demand_workflow_have_bounded_context() {
     let wire = ServerJsonRpcMessage::response(
         ServerResult::ListToolsResult(ListToolsResult::with_all_items(
@@ -94,14 +228,15 @@ fn compact_startup_and_on_demand_workflow_have_bounded_context() {
     let compact_bytes = serde_json::to_vec(&wire).unwrap().len();
     let direct_bytes = serde_json::to_vec(&tool_definitions()).unwrap().len();
     assert!(
-        compact_bytes <= 1_200,
+        compact_bytes <= 1_800,
         "compact tools/list: {compact_bytes}"
     );
     assert!(
-        compact_bytes * 10 < direct_bytes,
-        "compact tool definitions must save at least 90%"
+        compact_bytes * 100 < direct_bytes * 15,
+        "compact catalog plus inline starter templates must save at least 85%"
     );
-    // A representative accessibility workflow loads three schemas, each once.
+    // Common semantic workflows need no help calls; advanced use can still
+    // load these three authoritative schemas once without exceeding eager cost.
     let workflow_bytes: usize = tool_definitions()
         .iter()
         .filter(|tool| ["list_desktop", "observe", "act"].contains(&tool.name.as_ref()))
@@ -164,7 +299,8 @@ fn inputs_use_exact_opaque_targets_and_bounded_operations() {
     };
 
     let list = schema("list_desktop");
-    assert_eq!(list["required"], json!(["scope"]));
+    assert_eq!(list["required"], json!([]));
+    assert_eq!(list["properties"]["scope"]["default"], "windows");
     assert_eq!(
         list["properties"]["scope"]["enum"],
         json!(["windows", "applications"])
@@ -204,6 +340,7 @@ fn inputs_use_exact_opaque_targets_and_bounded_operations() {
     assert_eq!(activate["properties"]["action"]["default"], "activate");
 
     let observe = schema("observe");
+    assert_eq!(schema("act")["required"], json!(["operation"]));
     assert_eq!(observe["required"], json!(["target", "view"]));
     assert_eq!(
         observe["properties"]["view"]["enum"],
@@ -255,11 +392,11 @@ fn inputs_use_exact_opaque_targets_and_bounded_operations() {
         32
     );
     assert_eq!(
-        act["properties"]["operation"]["oneOf"][2]["properties"]["events"]["oneOf"][0]["maxItems"],
+        act["properties"]["operation"]["oneOf"][2]["properties"]["events"]["maxItems"],
         8
     );
-    let key_schema = &act["properties"]["operation"]["oneOf"][2]["properties"]["events"]["oneOf"]
-        [0]["items"]["properties"]["key"];
+    let key_schema = &act["properties"]["operation"]["oneOf"][2]["properties"]["events"]["items"]["oneOf"]
+        [0]["properties"]["key"];
     let key_pattern = key_schema["pattern"].as_str().expect("key pattern");
     assert_eq!(
         key_pattern,
@@ -281,21 +418,17 @@ fn inputs_use_exact_opaque_targets_and_bounded_operations() {
         );
     }
     assert_eq!(
-        act["properties"]["operation"]["oneOf"][2]["properties"]["events"]["oneOf"][1]["maxItems"],
-        1
-    );
-    assert_eq!(
-        act["properties"]["operation"]["oneOf"][2]["properties"]["events"]["oneOf"][1]["items"]["properties"]
+        act["properties"]["operation"]["oneOf"][2]["properties"]["events"]["items"]["oneOf"][1]["properties"]
             ["text"]["maxLength"],
         4_096
     );
     assert_eq!(
-        act["properties"]["operation"]["oneOf"][2]["properties"]["events"]["oneOf"][1]["items"]["properties"]
+        act["properties"]["operation"]["oneOf"][2]["properties"]["events"]["items"]["oneOf"][1]["properties"]
             ["text"]["minLength"],
         1
     );
     assert_eq!(
-        act["properties"]["operation"]["oneOf"][2]["properties"]["events"]["oneOf"][1]["items"]["properties"]
+        act["properties"]["operation"]["oneOf"][2]["properties"]["events"]["items"]["oneOf"][1]["properties"]
             ["text"]["pattern"],
         "^[^\\u0000]+$"
     );
@@ -329,7 +462,8 @@ fn inputs_use_exact_opaque_targets_and_bounded_operations() {
     assert_eq!(paste["properties"]["text"]["minLength"], 1);
     assert_eq!(paste["properties"]["text"]["maxLength"], 100_000);
     assert_eq!(paste["properties"]["text"]["pattern"], "^[^\\u0000]+$");
-    assert_eq!(paste["required"], json!(["type", "focus", "text"]));
+    // Omitted focus means the active target window's current focus.
+    assert_eq!(paste["required"], json!(["type", "text"]));
     let wait = schema("wait_for");
     assert_eq!(
         discriminants(&wait["properties"]["condition"]),
@@ -449,8 +583,8 @@ fn inputs_use_exact_opaque_targets_and_bounded_operations() {
         ),
         (
             "keyboard text",
-            &act["properties"]["operation"]["oneOf"][2]["properties"]["events"]["oneOf"][1]["items"]
-                ["properties"]["text"]["maxLength"],
+            &act["properties"]["operation"]["oneOf"][2]["properties"]["events"]["items"]["oneOf"]
+                [1]["properties"]["text"]["maxLength"],
             4_096,
         ),
         (
